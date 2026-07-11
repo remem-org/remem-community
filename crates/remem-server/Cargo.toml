@@ -1,0 +1,82 @@
+[package]
+name = "remem-server"
+version = "0.1.0"
+edition = "2021"
+description = "Remem backend server — memory services, REST API, background tasks"
+license = "FSL-1.1-ALv2"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# HTTP API
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+utoipa = { version = "4", features = ["axum_extras", "uuid", "chrono"] }
+
+# Embeddings (ONNX runtime, supports all-MiniLM-L6-v2)
+fastembed = "3"
+# Pin ort-sys to the same RC as ort (rc.4) to avoid API mismatch with rc.12 which added
+# TLS requirements and removed size_t — ort 2.0.0-rc.4 expects ort-sys 2.0.0-rc.4 API
+ort-sys = { version = "=2.0.0-rc.4" }
+
+# LRU cache for embeddings
+lru = "0.12"
+
+# Config & CLI
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+
+# Rate limiting
+tower_governor = "0.4"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+bytes = "1"
+parking_lot = "0.12"
+
+# Graph database (optional feature)
+kuzu = { version = "0.11", optional = true }
+
+# Storage engine deps (previously in remem-storage)
+bincode = "1"
+crc32fast = "1"
+zstd = "0.13"
+memmap2 = "0.9"
+crossbeam-skiplist = "0.1"
+ordered-float = "4"
+half = "2"
+rand = "0.8"
+
+[features]
+default = []
+# Business edition: Prometheus metrics endpoint + HTTP instrumentation layer.
+# Set as default in the business edition repo via the release script.
+kuzu = ["dep:kuzu"]
+
+[[bin]]
+name = "download-model"
+path = "src/bin/download_model.rs"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

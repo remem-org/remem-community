@@ -1,0 +1,62 @@
+# config/remem-server.toml
+# Configuration for remem-server (Rust backend: REST API + storage + background tasks)
+
+# =============================================================================
+# HTTP Server
+# =============================================================================
+
+[server]
+port = 8001
+host = "0.0.0.0"
+api_key = ""           # empty = auth disabled (dev mode); set in production
+
+# =============================================================================
+# Storage Engine (remem-storage, embedded in-process)
+# =============================================================================
+
+[storage]
+data_dir = "/var/lib/remem"
+sync_writes = true
+checkpoint_interval_secs = 300     # flush indexes to disk every 5 minutes
+max_wal_size_mb = 256              # trigger checkpoint when WAL exceeds this
+
+# =============================================================================
+# Vector Index (HNSW)
+# IMPORTANT: dimension MUST match the embedding model below
+# =============================================================================
+
+[vector]
+dimension = 384                    # all-MiniLM-L6-v2 output dimension
+hnsw_m = 16                        # connections per node (16–64 recommended)
+hnsw_ef_construction = 200         # build quality (100–400 recommended)
+hnsw_ef_search = 50                # search quality (40–200 recommended)
+
+# =============================================================================
+# Embedding Service (fastembed-rs, ONNX Runtime)
+# =============================================================================
+
+[embedding]
+model = "all-MiniLM-L6-v2"
+cache_size = 10000                 # number of embeddings to keep in LRU cache
+
+# =============================================================================
+# Connection Auto-Discovery
+# =============================================================================
+
+[connections]
+auto_discovery_threshold = 0.7     # minimum similarity to create a SimilarTo edge
+auto_discovery_top_k = 5           # maximum connections created per new memory
+
+# =============================================================================
+# Background Task Intervals & Worker Configuration
+# =============================================================================
+
+[tasks]
+expire_short_term_secs = 300        # 5 min
+apply_importance_decay_secs = 86400  # daily
+active_forgetting_secs = 86400
+consolidate_similar_secs = 604800   # weekly
+cleanup_archived_secs = 2592000     # monthly (30 days)
+discover_connections_secs = 3600    # hourly
+discovery_workers = 2
+discovery_queue_size = 10000

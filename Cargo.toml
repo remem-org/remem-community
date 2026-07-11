@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/remem-server",
+    "crates/remem-mcp",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "FSL-1.1-ALv2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
