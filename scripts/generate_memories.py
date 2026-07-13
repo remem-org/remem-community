@@ -6,7 +6,7 @@ Usage:
     python scripts/generate_memories.py [--url URL] [--count N] [--concurrency C]
 
 Defaults:
-    --url         http://localhost:8001/api/v1/memories
+    --url         http://localhost:4545/api/v1/memories
     --count       100000
     --concurrency 100
 """
@@ -222,8 +222,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--url",
-        default="http://localhost:8001/api/v1/memories",
-        help="remem-server memories endpoint (default: http://localhost:8001/api/v1/memories)",
+        default="http://localhost:4545/api/v1/memories",
+        help="remem-server memories endpoint (default: http://localhost:4545/api/v1/memories)",
     )
     parser.add_argument(
         "--count",

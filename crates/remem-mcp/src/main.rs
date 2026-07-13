@@ -19,7 +19,7 @@ use crate::client::RememClient;
 #[command(name = "remem-mcp", about = "Remem MCP server (stdio and SSE transports)")]
 struct Args {
     /// URL of the remem-server REST API.
-    #[arg(long, env = "REMEM_SERVER_URL", default_value = "http://localhost:8001")]
+    #[arg(long, env = "REMEM_SERVER_URL", default_value = "http://localhost:4545")]
     server_url: String,
 
     /// Transport to use: "stdio" or "sse".
@@ -31,7 +31,7 @@ struct Args {
     host: String,
 
     /// Port for the SSE HTTP server.
-    #[arg(long, env = "MCP_PORT", default_value_t = 8000)]
+    #[arg(long, env = "MCP_PORT", default_value_t = 4546)]
     port: u16,
 
     /// API key for authenticating with remem-server. Empty = no auth header (dev only).

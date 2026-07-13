@@ -10,17 +10,20 @@ services:
         EDITION_FEATURES: ""  # community: no business Rust features
     container_name: remem-server
     ports:
-      - "8001:8001"
+      - "4545:4545"
     volumes:
       - ./data/remem:/var/lib/remem:Z
       - ./config/remem-server.toml:/etc/remem/config.toml:ro,Z
     environment:
       - RUST_LOG=info
       - REMEM_API_KEY=${REMEM_API_KEY:-}
+      - REMEM_ALLOW_AUTH_DISABLED=${REMEM_ALLOW_AUTH_DISABLED:-false}
       - OMP_NUM_THREADS=4
       - ORT_NUM_INTRA_THREADS=4
+      - REMEM_RATE_LIMIT_RPS=${REMEM_RATE_LIMIT_RPS:-0}
+      - REMEM_RATE_LIMIT_BURST=${REMEM_RATE_LIMIT_BURST:-50}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:4545/api/v1/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -38,18 +41,18 @@ services:
       dockerfile: docker/remem-mcp.Dockerfile
     container_name: remem-mcp-server
     ports:
-      - "8000:8000"
+      - "4546:4546"
     environment:
-      - REMEM_SERVER_URL=http://remem-server:8001
+      - REMEM_SERVER_URL=http://remem-server:4545
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0
-      - MCP_PORT=8000
+      - MCP_PORT=4546
       - REMEM_API_KEY=${REMEM_API_KEY:-}
     depends_on:
       remem-server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:4546/health"]
       interval: 30s
       timeout: 10s
       retries: 3

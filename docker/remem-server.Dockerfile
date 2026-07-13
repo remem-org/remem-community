@@ -104,9 +104,9 @@ COPY --from=release-builder /workspace/target/release/remem-server /usr/local/bi
 # Point fastembed at the pre-baked model cache
 ENV FASTEMBED_CACHE_PATH=/var/lib/fastembed
 
-EXPOSE 8001
+EXPOSE 4545
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8001/api/v1/health || exit 1
+    CMD curl -f http://localhost:4545/api/v1/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["remem-server", "--config", "/etc/remem/config.toml"]

@@ -13,7 +13,7 @@ Usage:
     python scripts/check_duplicate_connections.py [--url URL]
 
 Defaults:
-    --url   http://localhost:8001/api/v1
+    --url   http://localhost:4545/api/v1
 """
 
 import argparse
@@ -53,7 +53,7 @@ def fetch_all_memories(base_url: str) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check remem for duplicate/dangling connections")
-    parser.add_argument("--url", default="http://localhost:8001/api/v1")
+    parser.add_argument("--url", default="http://localhost:4545/api/v1")
     args = parser.parse_args()
     base = args.url.rstrip("/")
 

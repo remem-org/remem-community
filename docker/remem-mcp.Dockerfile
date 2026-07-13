@@ -28,12 +28,12 @@ COPY --from=builder /build/target/release/remem-mcp /usr/local/bin/remem-mcp
 
 ENV MCP_TRANSPORT=sse
 ENV MCP_HOST=0.0.0.0
-ENV MCP_PORT=8000
-ENV REMEM_SERVER_URL=http://remem-server:8001
+ENV MCP_PORT=4546
+ENV REMEM_SERVER_URL=http://remem-server:4545
 
-EXPOSE 8000
+EXPOSE 4546
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:4546/health || exit 1
 
 CMD ["remem-mcp"]

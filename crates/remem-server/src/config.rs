@@ -102,7 +102,7 @@ impl Default for FileServerConfig {
     fn default() -> Self {
         Self {
             host: "0.0.0.0".into(),
-            port: 8001,
+            port: 4545,
             api_key: String::new(),
         }
     }
@@ -332,7 +332,7 @@ mod tests {
     fn default_server_config() {
         let cfg = load(&default_args()).unwrap();
         assert_eq!(cfg.server.host, "0.0.0.0");
-        assert_eq!(cfg.server.port, 8001);
+        assert_eq!(cfg.server.port, 4545);
         assert_eq!(cfg.server.api_key, "");
     }
 

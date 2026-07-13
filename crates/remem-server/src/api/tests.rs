@@ -64,7 +64,7 @@ async fn make_test_app() -> (axum::Router, tempfile::TempDir) {
     let cfg = Config {
         server: ServerConfig {
             host: "127.0.0.1".into(),
-            port: 8001,
+            port: 4545,
             api_key: String::new(), // auth disabled
             allow_auth_disabled: true,
             allowed_origins: vec![],
@@ -521,7 +521,7 @@ async fn auth_required_when_api_key_set() {
     let cfg = Config {
         server: ServerConfig {
             host: "127.0.0.1".into(),
-            port: 8001,
+            port: 4545,
             api_key: "test-secret".into(), // auth enabled
             allow_auth_disabled: false,
             allowed_origins: vec![],
@@ -620,7 +620,7 @@ async fn misconfigured_server_returns_500() {
     let cfg = Config {
         server: ServerConfig {
             host: "127.0.0.1".into(),
-            port: 8001,
+            port: 4545,
             api_key: String::new(),
             allow_auth_disabled: false,
             allowed_origins: vec![],

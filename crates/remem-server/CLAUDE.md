@@ -1,6 +1,6 @@
 # remem-server
 
-REST API + embedded storage engine. Axum on port 8001.
+REST API + embedded storage engine. Axum on port 4545.
 
 ## Source Layout
 
@@ -128,5 +128,5 @@ ort-sys rc.4 downloads ONNX Runtime 1.18.1 at build time. Dockerfile pre-downloa
 # Generate 100,000 test memories
 pip install httpx
 python ../../scripts/generate_memories.py
-python ../../scripts/generate_memories.py --url http://localhost:8001/api/v1/memories --count 100000 --concurrency 100
+python ../../scripts/generate_memories.py --url http://localhost:4545/api/v1/memories --count 100000 --concurrency 100
 ```

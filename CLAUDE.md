@@ -56,6 +56,11 @@ src/business/
 
 The script rsyncs relevant files (per `.editions/<edition>.exclude`), patches `Cargo.toml` feature defaults, copies edition-specific `docker-compose.yml` and `ci.yml`, then creates a squashed commit + tag in the target repo.
 
+This publishes a **source snapshot** only. The Docker images that `DEVELOPER_GUIDE.md`
+tells users to `docker pull` (`rememorg/remem-community:server-latest`,
+`rememorg/remem-community:mcp-latest`) are a separate, currently-manual step — see
+[`docs/DOCKER_HUB_PUBLISHING.md`](docs/DOCKER_HUB_PUBLISHING.md).
+
 ### Importing community PRs
 
 ```bash
@@ -74,19 +79,27 @@ Community PRs apply cleanly because community repo files are byte-identical to d
 ### Edition tooling files
 
 ```
+docker-compose.community.yml   # remem-server + remem-mcp only, no backoffice
+docker-compose.business.yml    # community + backoffice + observability
+
 .editions/
 ├── community.toml          # Edition metadata + template pointers
 ├── business.toml
 ├── community.exclude       # rsync exclude list for community release
 ├── business.exclude        # rsync exclude list for business release
 └── templates/
-    ├── docker-compose.community.yml   # Core services only (no backoffice)
+    ├── README.community.md
     └── ci.community.yml               # Rust lint + test only (no backoffice CI)
 
 scripts/
 ├── release-edition.sh      # Publish snapshot to an edition repo
 └── import-community-pr.sh  # Apply a community PR to the dev repo
 ```
+
+`release-edition.sh` copies whichever edition's compose file it is, verbatim, to a
+plain `docker-compose.yml` in the target repo — split-out repos never see the
+`.community`/`.business` suffix, and never see the sibling edition's file (both are
+excluded from `rsync` per `.editions/<edition>.exclude`).
 
 ## Project Overview
 
@@ -96,7 +109,7 @@ Remem is a persistent memory system for LLMs and AI agents. It provides semantic
 
 ```
 ┌──────────────────────────────────────────────┐
-│        remem-mcp  (port 8000)                │
+│        remem-mcp  (port 4546)                │
 │  MCP Server — stdio / SSE transport          │
 │  8 tools | 3 resources | JSON-RPC 2.0        │
 │  crates/remem-mcp/  (Rust)                   │
@@ -104,7 +117,7 @@ Remem is a persistent memory system for LLMs and AI agents. It provides semantic
 └──────────────────────────────────────────────┘
                       │  HTTP
 ┌──────────────────────────────────────────────┐
-│        remem-server  (port 8001)             │
+│        remem-server  (port 4545)             │
 │  REST API (Axum) + embedded storage engine   │
 │  HNSW | CSR Graph | BTree | InvertedTag | LSM│
 │  crates/remem-server/  (Rust)                │
@@ -141,7 +154,8 @@ remem/
 │   ├── generate_memories.py         # Generate 100k test memories
 │   ├── release-edition.sh           # Publish snapshot to an edition repo
 │   └── import-community-pr.sh      # Apply a community PR to this repo
-└── docker-compose.yml
+├── docker-compose.community.yml
+└── docker-compose.business.yml
 ```
 
 ## Technology Stack
@@ -159,8 +173,8 @@ remem/
 
 | Service | Port | Description |
 |---------|------|-------------|
-| remem-mcp | 8000 | MCP server (stdio + SSE) |
-| remem-server | 8001 | REST API + embedded storage |
+| remem-mcp | 4546 | MCP server (stdio + SSE) |
+| remem-server | 4545 | REST API + embedded storage |
 | backoffice-frontend | 3000 | React SPA |
 | backoffice-backend | 8002 | FastAPI proxy |
 | backoffice-postgres | 5433 | Backoffice DB (host port) |
@@ -176,27 +190,27 @@ cargo build --release -p remem-mcp
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 
-# Start all services
-docker compose up -d
+# Start all services (business edition: everything, or use ./run-business)
+docker compose -f docker-compose.business.yml up -d
 
-# Core services only
-docker compose up -d remem-server remem-mcp
+# Community edition only (remem-server + remem-mcp, or use ./run-community)
+docker compose -f docker-compose.community.yml up -d
 
-# Backoffice services
-docker compose up -d backoffice-postgres backoffice-backend backoffice-frontend
+# Backoffice services only (business edition)
+docker compose -f docker-compose.business.yml up -d backoffice-postgres backoffice-backend backoffice-frontend
 
 # Logs
-docker compose logs -f remem-server
-docker compose logs -f remem-mcp
-docker compose logs -f backoffice-backend
+docker compose -f docker-compose.business.yml logs -f remem-server
+docker compose -f docker-compose.business.yml logs -f remem-mcp
+docker compose -f docker-compose.business.yml logs -f backoffice-backend
 
 # Health checks
-curl http://localhost:8001/api/v1/health
-curl http://localhost:8000/health
+curl http://localhost:4545/api/v1/health
+curl http://localhost:4546/health
 curl http://localhost:8002/api/v1/health
 
 # Clean slate
-docker compose down -v
+docker compose -f docker-compose.business.yml down -v
 ```
 
 ## Environment Variables (`.env`)
@@ -204,7 +218,7 @@ docker compose down -v
 ```bash
 REMEM_API_KEY=          # Optional; leave empty to disable auth
 RUST_LOG=info
-REMEM_SERVER_URL=http://remem-server:8001
+REMEM_SERVER_URL=http://remem-server:4545
 MCP_TRANSPORT=sse
 JWT_SECRET_KEY=<generate with: openssl rand -hex 32>
 REMEM_CORS_ORIGINS=     # Required in production compose

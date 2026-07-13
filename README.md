@@ -20,13 +20,13 @@ Remem is a high-performance memory system designed for Large Language Models (LL
 
 ```
 ┌──────────────────────────────────────────────┐
-│        remem-mcp  (port 8000)                │
+│        remem-mcp  (port 4546)                │
 │  MCP Server — stdio / SSE transport          │
 │  8 tools | 3 resources | JSON-RPC 2.0        │
 └──────────────────────────────────────────────┘
                       │  HTTP
 ┌──────────────────────────────────────────────┐
-│        remem-server  (port 8001)             │
+│        remem-server  (port 4545)             │
 │  REST API (Axum)                             │
 │  Memory Manager | Search Engine              │
 │  Connection Manager | Lifecycle Manager      │
@@ -64,7 +64,21 @@ Lifecycle management runs as Tokio tasks inside remem-server — no separate wor
 - Docker and Docker Compose
 - 2GB+ RAM
 
-### Run
+### Up in 30 seconds
+
+Prebuilt images live in one Docker Hub repo, split by tag prefix:
+
+```bash
+docker pull rememorg/remem-community:server-latest
+docker pull rememorg/remem-community:mcp-latest
+docker compose up -d
+
+# Prebuilt binaries: coming soon
+```
+
+See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for a ready-to-use compose file.
+
+### Run from source
 
 ```bash
 git clone https://github.com/yourusername/remem.git
@@ -77,8 +91,8 @@ Services started:
 
 | Service | Port | Description |
 |---------|------|--------------|
-| remem-server | 8001 | REST API + storage engine |
-| remem-mcp | 8000 | MCP server (SSE transport) |
+| remem-server | 4545 | REST API + storage engine |
+| remem-mcp | 4546 | MCP server (SSE transport) |
 
 ### Verify
 
@@ -86,10 +100,10 @@ Services started:
 docker compose ps
 
 # Core API
-curl http://localhost:8001/api/v1/health
+curl http://localhost:4545/api/v1/health
 
 # MCP server
-curl http://localhost:8000/health
+curl http://localhost:4546/health
 ```
 
 ## MCP Tools
@@ -124,22 +138,22 @@ MCP resources: `memory://stats`, `memory://collections/recent`, `memory://collec
 
 ## REST API
 
-Base URL: `http://localhost:8001`
-Interactive docs: `http://localhost:8001/docs`
+Base URL: `http://localhost:4545`
+Interactive docs: `http://localhost:4545/docs`
 
 ```bash
 # Store a memory
-curl -X POST http://localhost:8001/api/v1/memories \
+curl -X POST http://localhost:4545/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"content": "User prefers Rust for backend", "tags": ["preferences"], "importance": 0.8}'
 
 # Semantic search
-curl -X POST http://localhost:8001/api/v1/memories/search \
+curl -X POST http://localhost:4545/api/v1/memories/search \
   -H "Content-Type: application/json" \
   -d '{"query": "programming language preferences", "search_type": "hybrid", "limit": 5}'
 
 # Find related memories
-curl "http://localhost:8001/api/v1/memories/{id}/related?depth=2"
+curl "http://localhost:4545/api/v1/memories/{id}/related?depth=2"
 ```
 
 Endpoints:

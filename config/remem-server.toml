@@ -6,7 +6,7 @@
 # =============================================================================
 
 [server]
-port = 8001
+port = 4545
 host = "0.0.0.0"
 api_key = ""           # empty = auth disabled (dev mode); set in production
 

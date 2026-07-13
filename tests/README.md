@@ -65,8 +65,8 @@ For LLM-in-the-loop E2E testing (equivalent to the old `tests/mcp/` scenarios), 
 Docker Compose stack with a real MCP client:
 
 ```bash
-docker compose up -d
-# Then connect Claude Desktop or any MCP client to port 8000
+docker compose -f docker-compose.community.yml up -d
+# Then connect Claude Desktop or any MCP client to port 4546
 ```
 
 The old Python MCP scenario tests (`store_memory`, `search_memories`) verified LLM

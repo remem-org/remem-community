@@ -1,6 +1,6 @@
 # remem-mcp
 
-MCP server bridging LLM clients to remem-server. Supports stdio and SSE transports. Port 8000 (SSE).
+MCP server bridging LLM clients to remem-server. Supports stdio and SSE transports. Port 4546 (SSE).
 
 ## Source Layout
 
@@ -51,7 +51,7 @@ src/
 ## Environment Variables
 
 ```bash
-REMEM_SERVER_URL=http://remem-server:8001   # remem-server endpoint
+REMEM_SERVER_URL=http://remem-server:4545   # remem-server endpoint
 REMEM_API_KEY=                               # forwarded as Bearer token (optional)
 MCP_TRANSPORT=sse                            # sse | stdio
 ```
@@ -59,5 +59,5 @@ MCP_TRANSPORT=sse                            # sse | stdio
 ## Transport Notes
 
 - **stdio**: Single client, no port needed. Used with Claude Desktop / Claude Code MCP config.
-- **SSE**: Multi-client, binds port 8000. Events streamed as `text/event-stream`.
+- **SSE**: Multi-client, binds port 4546. Events streamed as `text/event-stream`.
 - Transport selected at startup via `--transport` flag or `MCP_TRANSPORT` env var.

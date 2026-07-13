@@ -13,13 +13,13 @@ features — those ship in the Business Edition.
 
 ```
 ┌──────────────────────────────────────────────┐
-│        remem-mcp   (port 8000)               │
+│        remem-mcp   (port 4546)               │
 │  MCP Server — stdio / SSE transport          │
 │  8 tools | 3 resources | JSON-RPC 2.0        │
 └──────────────────────────────────────────────┘
                       │  HTTP
 ┌──────────────────────────────────────────────┐
-│        remem-server   (port 8001)            │
+│        remem-server   (port 4545)            │
 │  REST API (Axum)                             │
 │  Memory Manager | Search Engine              │
 │  Connection Manager | Lifecycle Manager      │
@@ -78,9 +78,12 @@ this promotion only happens at creation time — raising `arousal` past `0.8` vi
 
 ### 1. Pull the images
 
+Both images live in a single Docker Hub repository, `rememorg/remem-community`,
+distinguished by tag prefix (`server-*` / `mcp-*`):
+
 ```bash
-docker pull remem/remem-server:latest
-docker pull remem/remem-mcp:latest
+docker pull rememorg/remem-community:server-latest
+docker pull rememorg/remem-community:mcp-latest
 ```
 
 ### 2. Create a compose file
@@ -89,10 +92,10 @@ docker pull remem/remem-mcp:latest
 # docker-compose.yml
 services:
   remem-server:
-    image: remem/remem-server:latest
+    image: rememorg/remem-community:server-latest
     container_name: remem-server
     ports:
-      - "8001:8001"
+      - "4545:4545"
     volumes:
       - ./data/remem:/var/lib/remem
       - ./config/remem-server.toml:/etc/remem/config.toml:ro
@@ -101,7 +104,7 @@ services:
       - REMEM_API_KEY=${REMEM_API_KEY:-}
       - REMEM_ALLOW_AUTH_DISABLED=true   # dev only — remove once REMEM_API_KEY is set
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:4545/api/v1/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -109,12 +112,12 @@ services:
     restart: unless-stopped
 
   remem-mcp:
-    image: remem/remem-mcp:latest
+    image: rememorg/remem-community:mcp-latest
     container_name: remem-mcp-server
     ports:
-      - "8000:8000"
+      - "4546:4546"
     environment:
-      - REMEM_SERVER_URL=http://remem-server:8001
+      - REMEM_SERVER_URL=http://remem-server:4545
       - MCP_TRANSPORT=sse
       - REMEM_API_KEY=${REMEM_API_KEY:-}
     depends_on:
@@ -140,18 +143,18 @@ model loads on first boot; give it a minute before expecting `healthy`.
 ### 4. Verify
 
 ```bash
-curl http://localhost:8001/api/v1/health
-curl http://localhost:8000/health
+curl http://localhost:4545/api/v1/health
+curl http://localhost:4546/health
 ```
 
 ### 5. Store and search a memory
 
 ```bash
-curl -X POST http://localhost:8001/api/v1/memories \
+curl -X POST http://localhost:4545/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"content": "User prefers Rust for backend services", "tags": ["preferences"], "importance": 0.8}'
 
-curl -X POST http://localhost:8001/api/v1/memories/search \
+curl -X POST http://localhost:4545/api/v1/memories/search \
   -H "Content-Type: application/json" \
   -d '{"query": "programming language preferences", "search_type": "hybrid", "limit": 5}'
 ```
@@ -175,7 +178,7 @@ Claude Code, exec into the running container over stdio:
 }
 ```
 
-For a client that speaks SSE directly, point it at `http://localhost:8000` instead —
+For a client that speaks SSE directly, point it at `http://localhost:4546` instead —
 no exec needed.
 
 ### MCP tools
@@ -224,7 +227,7 @@ never thrown as JSON-RPC protocol errors, so check `success` in the result body.
 
 ## REST API reference
 
-Base URL: `http://localhost:8001`. The full OpenAPI 3 spec is served at
+Base URL: `http://localhost:4545`. The full OpenAPI 3 spec is served at
 `GET /api/v1/openapi.json` (no UI is bundled — point any Swagger/Redoc/Postman
 client at that URL, or import it directly).
 
@@ -259,7 +262,7 @@ asynchronously; the response returns before discovery finishes.
 storage failure.
 
 ```bash
-curl -X POST http://localhost:8001/api/v1/memories \
+curl -X POST http://localhost:4545/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{
     "content": "User prefers Rust for backend services",
@@ -312,7 +315,7 @@ it. `200` with `{"success": true, "message": "memory deleted"}`, `404` if not fo
 `422` on empty query or unknown `search_type`.
 
 ```bash
-curl -X POST http://localhost:8001/api/v1/memories/search \
+curl -X POST http://localhost:4545/api/v1/memories/search \
   -H "Content-Type: application/json" \
   -d '{"query": "programming language preferences", "search_type": "hybrid", "limit": 5}'
 ```
@@ -330,7 +333,7 @@ managed directly:
 | `GET /api/v1/memories/{id}/related?depth=1&relationship_types=&limit=20` | Graph traversal from a memory. `depth` max 5, `limit` max 100, `relationship_types` comma-separated filter → `200` with `{"memory_id", "related": [{"memory": Memory, "connection": Connection}]}` |
 
 ```bash
-curl "http://localhost:8001/api/v1/memories/{id}/related?depth=2"
+curl "http://localhost:4545/api/v1/memories/{id}/related?depth=2"
 ```
 
 ### Lifecycle
@@ -422,14 +425,14 @@ and the active-forgetting task under [Background tasks](#background-tasks).
 | `REMEM_ALLOW_AUTH_DISABLED` | `false` | Set `true` to explicitly allow running with no API key (development only). |
 | `REMEM_CORS_ORIGINS` | _(empty)_ | Comma-separated allowed CORS origins. |
 | `RUST_LOG` | `info` | Log filter: `trace`/`debug`/`info`/`warn`/`error`. |
-| `REMEM_SERVER_URL` | `http://remem-server:8001` | `remem-mcp` → `remem-server` endpoint. |
+| `REMEM_SERVER_URL` | `http://remem-server:4545` | `remem-mcp` → `remem-server` endpoint. |
 | `MCP_TRANSPORT` | `sse` | `stdio` or `sse`. |
 
 ### `config/remem-server.toml`
 
 ```toml
 [server]
-port = 8001
+port = 4545
 host = "0.0.0.0"
 api_key = ""                        # empty = auth disabled (dev only)
 
