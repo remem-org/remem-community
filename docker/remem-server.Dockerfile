@@ -13,11 +13,20 @@ WORKDIR /workspace
 
 # Download ONNX Runtime 1.18.1 (required by ort-sys 2.0.0-rc.4) so the build
 # script uses this local copy instead of trying to download it itself.
-RUN mkdir -p /ort-libs && \
-    curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v1.18.1/onnxruntime-linux-x64-1.18.1.tgz \
+# TARGETARCH is set automatically by buildx per platform in a multi-platform
+# build (amd64 or arm64) — must map to ONNX Runtime's own asset naming
+# (x64 / aarch64), or an arm64 build links a foreign-arch .so and breaks silently.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+        amd64) ORT_ARCH=x64 ;; \
+        arm64) ORT_ARCH=aarch64 ;; \
+        *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    mkdir -p /ort-libs && \
+    curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v1.18.1/onnxruntime-linux-${ORT_ARCH}-1.18.1.tgz" \
         -o /tmp/onnxruntime.tgz && \
     tar -xzf /tmp/onnxruntime.tgz -C /tmp && \
-    cp /tmp/onnxruntime-linux-x64-1.18.1/lib/libonnxruntime.so.1.18.1 /ort-libs/ && \
+    cp "/tmp/onnxruntime-linux-${ORT_ARCH}-1.18.1/lib/libonnxruntime.so.1.18.1" /ort-libs/ && \
     ln -sf libonnxruntime.so.1.18.1 /ort-libs/libonnxruntime.so && \
     rm -rf /tmp/onnxruntime*
 

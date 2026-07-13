@@ -16,7 +16,7 @@ The community edition contains:
 - `docker/remem-server.Dockerfile`, `docker/remem-mcp.Dockerfile`
 - `docker-compose.yml` — core services only
 - `tests/durability/` — durability and correctness tests
-- `scripts/generate_memories.py`, `scripts/check_duplicate_connections.py`
+- `scripts/generate_memories.py`
 
 **Not in this repo** (business edition only):
 

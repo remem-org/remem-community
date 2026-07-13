@@ -54,11 +54,13 @@ src/business/
 ./scripts/release-edition.sh business v1.2.0 ../remem-business
 ```
 
-The script rsyncs relevant files (per `.editions/<edition>.exclude`), patches `Cargo.toml` feature defaults, copies edition-specific `docker-compose.yml` and `ci.yml`, then creates a squashed commit + tag in the target repo.
+The script rsyncs relevant files (per `.editions/<edition>.exclude`), patches `Cargo.toml` feature defaults, copies the edition-specific `docker-compose.yml`, then creates a squashed commit + tag in the target repo. `.github/` is always stripped from the target — edition repos are source snapshots only, no CI/CD runs there.
 
 This publishes a **source snapshot** only. The Docker images that `DEVELOPER_GUIDE.md`
 tells users to `docker pull` (`rememorg/remem-community:server-latest`,
-`rememorg/remem-community:mcp-latest`) are a separate, currently-manual step — see
+`rememorg/remem-community:mcp-latest`) are published from **this** dev repo via
+[`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
+(manual `workflow_dispatch` only) — see
 [`docs/DOCKER_HUB_PUBLISHING.md`](docs/DOCKER_HUB_PUBLISHING.md).
 
 ### Importing community PRs
@@ -88,8 +90,7 @@ docker-compose.business.yml    # community + backoffice + observability
 ├── community.exclude       # rsync exclude list for community release
 ├── business.exclude        # rsync exclude list for business release
 └── templates/
-    ├── README.community.md
-    └── ci.community.yml               # Rust lint + test only (no backoffice CI)
+    └── README.community.md
 
 scripts/
 ├── release-edition.sh      # Publish snapshot to an edition repo
