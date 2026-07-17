@@ -53,7 +53,20 @@ impl IntoResponse for AppError {
             | AppError::Serialization(_)
             | AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = Json(ErrorResponse { detail: self.to_string() });
+
+        // 4xx variants are client-facing by design (not found / bad input /
+        // conflict) and carry no internal detail, so it's safe to return
+        // `self.to_string()` verbatim. 5xx variants can wrap storage paths,
+        // io errors, and serde messages (e.g. StorageError::Corruption{file}) —
+        // those are logged server-side only; the client gets a generic body.
+        let detail = if status.is_server_error() {
+            tracing::error!(error = %self, status = %status, "internal error");
+            "internal server error".to_string()
+        } else {
+            self.to_string()
+        };
+
+        let body = Json(ErrorResponse { detail });
         (status, body).into_response()
     }
 }

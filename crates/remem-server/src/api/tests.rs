@@ -24,7 +24,7 @@ use tower::ServiceExt as _;
 use crate::{
     api::{build_router, AppState},
     config::{
-        Config, ConnectionConfig, EmbeddingConfig, ServerConfig, TaskConfig,
+        Config, ConnectionConfig, EmbeddingConfig, Environment, ServerConfig, TaskConfig,
         StorageConfig as CfgStorage, VectorConfig as CfgVector,
     },
     engine::storage::engine::{
@@ -66,10 +66,12 @@ async fn make_test_app() -> (axum::Router, tempfile::TempDir) {
             host: "127.0.0.1".into(),
             port: 4545,
             api_key: String::new(), // auth disabled
+            api_key_secondary: String::new(),
             allow_auth_disabled: true,
             allowed_origins: vec![],
             rate_limit_rps: 0,
             rate_limit_burst: 50,
+            env: Environment::Development,
         },
         storage: CfgStorage {
             data_dir: tmpdir.path().to_path_buf(),
@@ -523,10 +525,12 @@ async fn auth_required_when_api_key_set() {
             host: "127.0.0.1".into(),
             port: 4545,
             api_key: "test-secret".into(), // auth enabled
+            api_key_secondary: String::new(),
             allow_auth_disabled: false,
             allowed_origins: vec![],
             rate_limit_rps: 0,
             rate_limit_burst: 50,
+            env: Environment::Development,
         },
         storage: CfgStorage {
             data_dir: tmpdir.path().to_path_buf(),
@@ -622,10 +626,12 @@ async fn misconfigured_server_returns_500() {
             host: "127.0.0.1".into(),
             port: 4545,
             api_key: String::new(),
+            api_key_secondary: String::new(),
             allow_auth_disabled: false,
             allowed_origins: vec![],
             rate_limit_rps: 0,
             rate_limit_burst: 50,
+            env: Environment::Development,
         },
         storage: CfgStorage {
             data_dir: tmpdir.path().to_path_buf(),

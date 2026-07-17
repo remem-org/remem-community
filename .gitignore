@@ -225,6 +225,12 @@ storage/Cargo.lock
 .env.local
 .env.*.local
 
+# Docker Hub push credentials for scripts/publish-docker-community.sh —
+# deliberately kept out of the shared .env (that one gets loaded by docker
+# compose for the running app stack; a registry push token has no business
+# being reachable from there).
+.env.docker-publish
+
 # IDEs
 .idea/
 .vscode/

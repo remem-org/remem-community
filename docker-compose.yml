@@ -16,11 +16,14 @@ services:
       - ./config/remem-server.toml:/etc/remem/config.toml:ro,Z
     environment:
       - RUST_LOG=info
+      - REMEM_ENV=${REMEM_ENV:-development}
       - REMEM_API_KEY=${REMEM_API_KEY:-}
+      - REMEM_API_KEY_SECONDARY=${REMEM_API_KEY_SECONDARY:-}
       - REMEM_ALLOW_AUTH_DISABLED=${REMEM_ALLOW_AUTH_DISABLED:-false}
+      - REMEM_CORS_ORIGINS=${REMEM_CORS_ORIGINS:-http://localhost:3000}
       - OMP_NUM_THREADS=4
       - ORT_NUM_INTRA_THREADS=4
-      - REMEM_RATE_LIMIT_RPS=${REMEM_RATE_LIMIT_RPS:-0}
+      - REMEM_RATE_LIMIT_RPS=${REMEM_RATE_LIMIT_RPS:-100}
       - REMEM_RATE_LIMIT_BURST=${REMEM_RATE_LIMIT_BURST:-50}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4545/api/v1/ready"]

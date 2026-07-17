@@ -270,7 +270,7 @@ All storage embedded in remem-server: HNSW (vector search), CSR Graph (relations
 
 ## Project Status
 
-**Current state**: Rust rewrite complete, backoffice phases 1–11 complete. Phase 12 (Polish, Testing & Deployment) complete.
+**Current state**: Rust rewrite complete, backoffice phases 1–11 complete. Phase 12 (Polish, Testing & Deployment) complete. Phases 13–15 (graph extraction, emotional memory layer, active forgetting) are also implemented — see below; the roadmap table under-reported this for a while, so verify against code before trusting phase numbers on sight.
 
 | Component | Status |
 |-----------|--------|
@@ -283,7 +283,7 @@ All storage embedded in remem-server: HNSW (vector search), CSR Graph (relations
 | Backoffice backend (FastAPI) | ✅ Phases 1–3, 9–11 |
 | Backoffice frontend (React) | ✅ Phases 2, 4–11 |
 | CI/CD (GitHub Actions, workflow_dispatch) | ✅ |
-| Rate limiting (tower_governor, global, opt-in env var) | ✅ |
+| Rate limiting (tower_governor, global, on by default — 100 rps/burst 50; `REMEM_RATE_LIMIT_RPS=0` to disable) | ✅ |
 | Observability (Prometheus + Grafana, opt-in profile) | ✅ |
 | Frontend skeleton loaders (Dashboard, MemoryBrowser) | ✅ |
 | A11y (Input/Modal/MemoryEditor label linkage + focus trap) | ✅ |
@@ -291,17 +291,23 @@ All storage embedded in remem-server: HNSW (vector search), CSR Graph (relations
 | User preferences (refresh interval, sidebar state, persisted) | ✅ |
 | E2E suite wired into CI (Playwright, Chromium) | ✅ |
 | Production deployment guide | ✅ |
+| Graph extraction (`graph_extraction` on `store_memory`) | ✅ Phase 13 |
+| Emotional memory layer (`emotional_valence`, `arousal`, flashbulb) | ✅ Phase 14 |
+| Active forgetting (`health` score, daily decay) | ✅ Phase 15 |
 
-**Next**: Phase 13 — Intelligent Graph Extraction.
+**Next**: Phase 16 — LLM-Powered Background Intelligence. See
+[docs/PROJECT_REVIEW.md](docs/PROJECT_REVIEW.md) for the current backlog
+(security, durability, product, performance) ordered into an implementation
+roadmap — Phase 0 of that roadmap is in progress.
 
 ## Roadmap
 
 | Phase | Title | Scope |
 |-------|-------|-------|
 | 12 | Polish, Testing & Deployment | ✅ **Complete.** CI/CD, rate limiting, Prometheus+Grafana, frontend skeletons, a11y, keyboard shortcuts, user preferences, E2E CI job, deployment guide |
-| 13 | Intelligent Graph Extraction | Enhanced `store_memory` with optional `graph_extraction` field; background `discover_connections` task; typed relationship types as first-class metadata |
-| 14 | Emotional Memory Layer | `valence` (−1.0…1.0) and `arousal` (0.0…1.0) fields; flashbulb effect — high-arousal memories auto-promoted and decay-immune |
-| 15 | Active Forgetting | `health` score (0–100); daily decay; retrieval boosts health (LTP); hard delete at health=0 |
+| 13 | Intelligent Graph Extraction | ✅ **Complete.** `store_memory` accepts optional `graph_extraction` (entities + relationships); `discover_connections` background task; typed relationship types as first-class metadata |
+| 14 | Emotional Memory Layer | ✅ **Complete.** `emotional_valence` (−1.0…1.0) and `arousal` (0.0…1.0) fields; flashbulb effect — arousal ≥ 0.8 auto-promotes to long-term and grants 30-day decay immunity |
+| 15 | Active Forgetting | ✅ **Complete.** `health` score (0–100); daily decay in `lifecycle_manager::active_forgetting`; retrieval boosts health; hard delete at health=0 (see docs/PROJECT_REVIEW.md §2.1 #11 — hard-delete-on-heuristic is flagged for a default-to-archive change) |
 | 16 | LLM-Powered Background Intelligence | Dreaming cycle; constructive retrieval (`narrative` mode); requires LLM API key or local Ollama |
 | 17 | Associative Wandering | Background task walks memory graph; creates `REALIZATION` memories; new MCP resource `memory://insights/pending` |
 

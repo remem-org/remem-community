@@ -46,6 +46,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // REMEM_ENV=production enforces the security bar that dev-friendly
+    // defaults (auth disabled, permissive CORS, placeholder keys) would
+    // otherwise silently violate — refuse to boot rather than serve
+    // insecurely, since these are exactly the defaults .env.example ships.
+    if cfg.server.env.is_production() {
+        let violations = config::validate_production_config(&cfg);
+        if !violations.is_empty() {
+            for v in &violations {
+                tracing::error!("REMEM_ENV=production refused to start: {v}");
+            }
+            anyhow::bail!(
+                "{} production security violation(s); see errors above. \
+                 Fix the configuration or unset REMEM_ENV to run in development mode.",
+                violations.len()
+            );
+        }
+        tracing::info!("REMEM_ENV=production: security validation passed");
+    }
+
     // ── Storage engine ───────────────────────────────────────────────────────
     let engine_cfg = EngineConfig {
         data_dir: cfg.storage.data_dir.clone(),

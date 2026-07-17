@@ -13,15 +13,46 @@ pub struct Config {
     pub tasks: TaskConfig,
 }
 
+/// Deployment environment, controlling whether dev-only conveniences
+/// (auth disabled, permissive CORS) are permitted. Defaults to
+/// `Development` so the out-of-box quickstart keeps working; production
+/// deployments must set `REMEM_ENV=production` explicitly, which then
+/// enforces the guards checked by `validate_production_config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Environment {
+    Development,
+    Production,
+}
+
+impl Environment {
+    fn from_env() -> Self {
+        match std::env::var("REMEM_ENV") {
+            Ok(v) if v.eq_ignore_ascii_case("production") || v.eq_ignore_ascii_case("prod") => {
+                Environment::Production
+            }
+            _ => Environment::Development,
+        }
+    }
+
+    pub fn is_production(&self) -> bool {
+        matches!(self, Environment::Production)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     /// Empty string means auth disabled (development mode).
     pub api_key: String,
+    /// Optional secondary key accepted alongside `api_key`, so a key can be
+    /// rotated by adding the new key here first, updating callers, then
+    /// promoting it to `api_key` — no downtime window with zero valid keys.
+    pub api_key_secondary: String,
     /// When true, an empty api_key is allowed (unauthenticated access).
     /// Must be explicitly opted-in via REMEM_ALLOW_AUTH_DISABLED=true.
-    /// Never set this in production.
+    /// Never set this in production — enforced by `validate_production_config`
+    /// when `env` is `Production`.
     pub allow_auth_disabled: bool,
     /// Comma-separated allowed CORS origins. Empty = permissive (dev mode).
     pub allowed_origins: Vec<String>,
@@ -29,6 +60,8 @@ pub struct ServerConfig {
     pub rate_limit_rps: u32,
     /// Burst allowance on top of the per-second rate.
     pub rate_limit_burst: u32,
+    /// Deployment environment (`REMEM_ENV`); gates dev-only conveniences.
+    pub env: Environment,
 }
 
 #[derive(Debug, Clone)]
@@ -219,13 +252,19 @@ pub struct Args {
     /// Override API key (empty = disabled).
     #[arg(long, env = "REMEM_API_KEY")]
     pub api_key: Option<String>,
+
+    /// Optional secondary API key, accepted alongside the primary key during
+    /// rotation. Set the new key here, roll out callers, then promote it to
+    /// --api-key and drop this.
+    #[arg(long, env = "REMEM_API_KEY_SECONDARY")]
+    pub api_key_secondary: Option<String>,
 }
 
 // ─── Loader ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 pub fn args_default() -> Args {
-    Args { config: None, data_dir: None, port: None, api_key: None }
+    Args { config: None, data_dir: None, port: None, api_key: None, api_key_secondary: None }
 }
 
 pub fn load(args: &Args) -> anyhow::Result<Config> {
@@ -248,6 +287,11 @@ pub fn load(args: &Args) -> anyhow::Result<Config> {
     if let Some(k) = &args.api_key {
         file.server.api_key = k.clone();
     }
+    let api_key_secondary = args
+        .api_key_secondary
+        .clone()
+        .or_else(|| std::env::var("REMEM_API_KEY_SECONDARY").ok())
+        .unwrap_or_default();
 
     // REMEM_ALLOW_AUTH_DISABLED is intentionally env-only (not TOML) so it
     // cannot be accidentally committed into a config file.
@@ -264,25 +308,32 @@ pub fn load(args: &Args) -> anyhow::Result<Config> {
         })
         .unwrap_or_default();
 
+    // Rate limiting defaults ON (100 rps, burst 50) so a fresh deployment
+    // isn't wide open to cheap CPU exhaustion via the embedding endpoints.
+    // Set REMEM_RATE_LIMIT_RPS=0 to explicitly disable.
     let rate_limit_rps = std::env::var("REMEM_RATE_LIMIT_RPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+        .unwrap_or(100);
 
     let rate_limit_burst = std::env::var("REMEM_RATE_LIMIT_BURST")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(50);
 
+    let env = Environment::from_env();
+
     Ok(Config {
         server: ServerConfig {
             host: file.server.host,
             port: file.server.port,
             api_key: file.server.api_key,
+            api_key_secondary,
             allow_auth_disabled,
             allowed_origins,
             rate_limit_rps,
             rate_limit_burst,
+            env,
         },
         storage: StorageConfig {
             data_dir: PathBuf::from(file.storage.data_dir),
@@ -316,6 +367,46 @@ pub fn load(args: &Args) -> anyhow::Result<Config> {
     })
 }
 
+/// Known placeholder secrets that must never survive into a production
+/// deployment. Anyone can read these out of `.env.example` or the compose
+/// files, so treat them as public.
+const PLACEHOLDER_API_KEYS: &[&str] = &["change-this-secret-key-in-production", "dev", "test"];
+
+/// Validate `cfg` against the production security bar. Returns a list of
+/// human-readable violations; empty means the config is safe to boot with
+/// `REMEM_ENV=production`. Called from `main` — any violation refuses startup
+/// rather than degrading silently, since these are exactly the defaults a
+/// copied `.env.example` ships with.
+pub fn validate_production_config(cfg: &Config) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    if cfg.server.allow_auth_disabled {
+        violations.push(
+            "REMEM_ALLOW_AUTH_DISABLED=true is not permitted with REMEM_ENV=production".into(),
+        );
+    }
+    if cfg.server.api_key.is_empty() {
+        violations.push("REMEM_API_KEY must be set with REMEM_ENV=production".into());
+    } else if cfg.server.api_key.len() < 16
+        || PLACEHOLDER_API_KEYS.contains(&cfg.server.api_key.as_str())
+    {
+        violations.push(
+            "REMEM_API_KEY looks like a placeholder or is too short (need >= 16 chars) for \
+             REMEM_ENV=production"
+                .into(),
+        );
+    }
+    if cfg.server.allowed_origins.is_empty() {
+        violations.push(
+            "REMEM_CORS_ORIGINS must be set (permissive CORS is not permitted) with \
+             REMEM_ENV=production"
+                .into(),
+        );
+    }
+
+    violations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,7 +414,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn default_args() -> Args {
-        Args { config: None, data_dir: None, port: None, api_key: None }
+        Args { config: None, data_dir: None, port: None, api_key: None, api_key_secondary: None }
     }
 
     // ── Defaults ──────────────────────────────────────────────────────────────
@@ -514,6 +605,7 @@ auto_discovery_top_k = 5
             port: Some(8888),
             api_key: Some("cli-key".into()),
             data_dir: None,
+            api_key_secondary: None,
         };
         let cfg = load(&args).unwrap();
 
@@ -583,12 +675,21 @@ api_key = ""
 
     #[test]
     #[allow(deprecated)]
-    fn default_rate_limit_disabled() {
+    fn default_rate_limit_enabled() {
         std::env::remove_var("REMEM_RATE_LIMIT_RPS");
         std::env::remove_var("REMEM_RATE_LIMIT_BURST");
         let cfg = load(&default_args()).unwrap();
-        assert_eq!(cfg.server.rate_limit_rps, 0);
+        assert_eq!(cfg.server.rate_limit_rps, 100);
         assert_eq!(cfg.server.rate_limit_burst, 50);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn rate_limit_can_be_disabled_explicitly() {
+        std::env::set_var("REMEM_RATE_LIMIT_RPS", "0");
+        let cfg = load(&default_args()).unwrap();
+        std::env::remove_var("REMEM_RATE_LIMIT_RPS");
+        assert_eq!(cfg.server.rate_limit_rps, 0);
     }
 
     #[test]
@@ -601,5 +702,72 @@ api_key = ""
         std::env::remove_var("REMEM_RATE_LIMIT_BURST");
         assert_eq!(cfg.server.rate_limit_rps, 200);
         assert_eq!(cfg.server.rate_limit_burst, 100);
+    }
+
+    // ── Environment gate / production validation ────────────────────────────
+
+    #[test]
+    #[allow(deprecated)]
+    fn env_defaults_to_development() {
+        std::env::remove_var("REMEM_ENV");
+        let cfg = load(&default_args()).unwrap();
+        assert!(!cfg.server.env.is_production());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn env_production_recognised() {
+        std::env::set_var("REMEM_ENV", "production");
+        let cfg = load(&default_args()).unwrap();
+        std::env::remove_var("REMEM_ENV");
+        assert!(cfg.server.env.is_production());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn validate_production_config_flags_all_dev_defaults() {
+        std::env::remove_var("REMEM_CORS_ORIGINS");
+        std::env::remove_var("REMEM_ALLOW_AUTH_DISABLED");
+        let cfg = load(&default_args()).unwrap();
+        let violations = validate_production_config(&cfg);
+        // Empty api_key, empty origins, both flagged.
+        assert!(violations.iter().any(|v| v.contains("REMEM_API_KEY")));
+        assert!(violations.iter().any(|v| v.contains("REMEM_CORS_ORIGINS")));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn validate_production_config_flags_placeholder_key() {
+        let args = Args {
+            api_key: Some("change-this-secret-key-in-production".into()),
+            ..default_args()
+        };
+        std::env::remove_var("REMEM_CORS_ORIGINS");
+        let cfg = load(&args).unwrap();
+        let violations = validate_production_config(&cfg);
+        assert!(violations.iter().any(|v| v.contains("REMEM_API_KEY")));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn validate_production_config_flags_auth_disabled() {
+        std::env::set_var("REMEM_ALLOW_AUTH_DISABLED", "true");
+        let cfg = load(&default_args()).unwrap();
+        std::env::remove_var("REMEM_ALLOW_AUTH_DISABLED");
+        let violations = validate_production_config(&cfg);
+        assert!(violations.iter().any(|v| v.contains("REMEM_ALLOW_AUTH_DISABLED")));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn validate_production_config_passes_with_proper_secrets() {
+        std::env::set_var("REMEM_CORS_ORIGINS", "https://app.example.com");
+        let args = Args {
+            api_key: Some("a-sufficiently-long-random-production-key".into()),
+            ..default_args()
+        };
+        let cfg = load(&args).unwrap();
+        std::env::remove_var("REMEM_CORS_ORIGINS");
+        assert!(validate_production_config(&cfg).is_empty());
     }
 }

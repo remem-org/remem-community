@@ -24,12 +24,18 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
+# No bind mounts here (unlike remem-server), so no root-owned volume to chown
+# at container start — safe to switch to a non-root user directly.
+RUN useradd -m -u 1000 remem
+
 COPY --from=builder /build/target/release/remem-mcp /usr/local/bin/remem-mcp
 
 ENV MCP_TRANSPORT=sse
 ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=4546
 ENV REMEM_SERVER_URL=http://remem-server:4545
+
+USER remem
 
 EXPOSE 4546
 

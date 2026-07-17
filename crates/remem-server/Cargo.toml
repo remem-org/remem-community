@@ -45,6 +45,9 @@ tower_governor = "0.4"
 thiserror = "1"
 anyhow = "1"
 
+# Constant-time comparisons (API key auth)
+subtle = "2"
+
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -68,8 +71,7 @@ rand = "0.8"
 [features]
 default = []
 # Business edition: Prometheus metrics endpoint + HTTP instrumentation layer.
-# Not implemented in this edition; declared empty so #[cfg(feature = "business")]
-# in main.rs / api/mod.rs remains a known cfg value (avoids unexpected_cfgs warnings).
+# Set as default in the business edition repo via the release script.
 business = []
 kuzu = ["dep:kuzu"]
 
