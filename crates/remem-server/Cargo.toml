@@ -68,7 +68,9 @@ rand = "0.8"
 [features]
 default = []
 # Business edition: Prometheus metrics endpoint + HTTP instrumentation layer.
-# Set as default in the business edition repo via the release script.
+# Not implemented in this edition; declared empty so #[cfg(feature = "business")]
+# in main.rs / api/mod.rs remains a known cfg value (avoids unexpected_cfgs warnings).
+business = []
 kuzu = ["dep:kuzu"]
 
 [[bin]]
