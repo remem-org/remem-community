@@ -283,6 +283,17 @@ impl MemTable {
     pub fn current_timestamp(&self) -> u64 {
         self.next_timestamp.load(Ordering::Relaxed)
     }
+
+    /// Atomically reserve the next timestamp for this MemTable's write
+    /// sequence, without inserting anything. Callers use this to assign a
+    /// timestamp *before* releasing the WAL lock, so the WAL's on-disk
+    /// order for a key always matches the order `insert_with_timestamp`/
+    /// `delete_with_timestamp` will apply it in — unlike `current_timestamp()`,
+    /// which only peeks the counter and lets a later, unlocked
+    /// `insert()`/`delete()` assign the real value.
+    pub fn reserve_timestamp(&self) -> u64 {
+        self.next_timestamp.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 impl Default for MemTable {

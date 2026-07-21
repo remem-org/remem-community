@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::engine::error::{Result, StorageError};
+use crate::engine::storage::durable_rename::durable_rename;
 
 /// Metadata for one sealed chunk file.
 #[derive(Debug, Clone)]
@@ -180,8 +181,9 @@ impl SegmentManifest {
         }
 
         w.flush()?;
+        w.get_ref().sync_all()?;
         drop(w);
-        std::fs::rename(&tmp, &path)?;
+        durable_rename(&tmp, &path)?;
         Ok(())
     }
 

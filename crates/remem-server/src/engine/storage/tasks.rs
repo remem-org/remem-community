@@ -152,7 +152,11 @@ pub(super) fn start_background_tasks(
     let immutable_cp = Arc::clone(&immutable_memtables);
     let compaction_cp = Arc::clone(&compaction);
     tokio::spawn(async move {
-        let mut last_checkpoint = std::time::Instant::now();
+        // tokio::time::Instant, not std::time::Instant: this loop already
+        // runs on tokio::time::sleep, and using tokio's clock here means
+        // tokio::time::pause/advance (used by tests) actually affects this
+        // elapsed-time check instead of silently ignoring it.
+        let mut last_checkpoint = tokio::time::Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -177,12 +181,17 @@ pub(super) fn start_background_tasks(
                 );
 
                 let data_dir = &config.data_dir;
+                let mut all_saves_ok = true;
 
                 if let Some(index) = &hnsw_index {
                     if index.is_dirty() {
                         let hnsw_dir = data_dir.join("index");
                         if let Err(e) = index.save_dirty_chunks(&hnsw_dir) {
                             tracing::error!("Failed to save HNSW index chunks: {}", e);
+                            all_saves_ok = false;
+                        } else if let Err(e) = index.save_deleted_nodes(&hnsw_dir) {
+                            tracing::error!("Failed to save HNSW deleted-node set: {}", e);
+                            all_saves_ok = false;
                         }
                     }
                 }
@@ -192,6 +201,7 @@ pub(super) fn start_background_tasks(
                     if is_dirty {
                         if let Err(e) = index.write().save_if_dirty() {
                             tracing::error!("Failed to save segmented graph index: {}", e);
+                            all_saves_ok = false;
                         }
                     }
                 }
@@ -201,6 +211,7 @@ pub(super) fn start_background_tasks(
                     if is_dirty {
                         if let Err(e) = index.write().save_if_dirty() {
                             tracing::error!("Failed to save segmented time-series index: {}", e);
+                            all_saves_ok = false;
                         }
                     }
                     // Compaction: merge small chunks if needed
@@ -216,6 +227,7 @@ pub(super) fn start_background_tasks(
                     if is_dirty {
                         if let Err(e) = index.write().save_if_dirty() {
                             tracing::error!("Failed to save segmented tag index: {}", e);
+                            all_saves_ok = false;
                         }
                     }
                     // Compaction: merge segments if deletion ratio is high or too many segments
@@ -226,53 +238,81 @@ pub(super) fn start_background_tasks(
                     }
                 }
 
-                // Flush the active memtable + any pending immutable memtables to
-                // SSTables BEFORE truncating the WAL. Without this step, KV records
-                // that are only in memory would lose their WAL entries and vanish on
-                // the next restart.
-                let kv_flush_ok = 'kv_flush: {
-                    // Rotate active memtable → immutable (if non-empty).
-                    let newly_immutable = {
-                        let mut mt = memtable_cp.write();
-                        if mt.is_empty() {
-                            None
-                        } else {
-                            let old = std::mem::replace(
-                                &mut *mt,
-                                MemTable::with_capacity(config.memtable_size),
-                            );
-                            Some(Arc::new(ImmutableMemTable::from_memtable(old)))
-                        }
-                    };
-                    if let Some(new_imm) = newly_immutable {
-                        immutable_cp.write().push(Arc::clone(&new_imm));
-                    }
+                // Only reset the retry clock once the cycle actually
+                // completes end to end (index saves, KV flush, WAL
+                // truncate all succeed). Otherwise a persistent failure
+                // (e.g. a permissions error) would still only get retried
+                // once per `checkpoint_interval` -- the same cadence as a
+                // healthy checkpoint -- rather than promptly on the very
+                // next poll once the underlying problem clears up.
+                let checkpoint_succeeded = if all_saves_ok {
+                    // Hold the WAL lock across the flush+truncate span so no
+                    // write can append a WAL record that isn't reflected in
+                    // either the indexes we just saved or the memtables
+                    // we're about to flush -- otherwise a crash right after
+                    // truncate() would erase that write's only durable
+                    // record while its data lives only in memory. This
+                    // briefly stalls new writes (their first step is always
+                    // wal.lock()).
+                    let mut wal_guard = wal.lock();
 
-                    // Flush every immutable memtable to an SSTable.
-                    let to_flush: Vec<_> = immutable_cp.read().clone();
-                    for imm in to_flush {
-                        if let Err(e) = flush_memtable(&imm, &compaction_cp, &config) {
-                            tracing::error!(
-                                "Pre-checkpoint KV flush failed: {}; WAL truncation skipped \
-                                 to preserve durability",
-                                e
-                            );
-                            break 'kv_flush false;
+                    let kv_flush_ok = 'kv_flush: {
+                        let newly_immutable = {
+                            let mut mt = memtable_cp.write();
+                            if mt.is_empty() {
+                                None
+                            } else {
+                                let old = std::mem::replace(
+                                    &mut *mt,
+                                    MemTable::with_capacity(config.memtable_size),
+                                );
+                                Some(Arc::new(ImmutableMemTable::from_memtable(old)))
+                            }
+                        };
+                        if let Some(new_imm) = newly_immutable {
+                            immutable_cp.write().push(Arc::clone(&new_imm));
                         }
-                        immutable_cp.write().retain(|m| !Arc::ptr_eq(m, &imm));
+
+                        let to_flush: Vec<_> = immutable_cp.read().clone();
+                        for imm in to_flush {
+                            if let Err(e) = flush_memtable(&imm, &compaction_cp, &config) {
+                                tracing::error!(
+                                    "Pre-checkpoint KV flush failed: {}; WAL truncation skipped \
+                                     to preserve durability",
+                                    e
+                                );
+                                break 'kv_flush false;
+                            }
+                            immutable_cp.write().retain(|m| !Arc::ptr_eq(m, &imm));
+                        }
+                        true
+                    };
+
+                    if kv_flush_ok {
+                        match wal_guard.truncate() {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::error!("Failed to truncate WAL: {}", e);
+                                false
+                            }
+                        }
+                    } else {
+                        false
                     }
-                    true
+                } else {
+                    tracing::warn!(
+                        "Skipping WAL truncation this cycle: one or more index saves failed"
+                    );
+                    false
                 };
 
-                if kv_flush_ok {
-                    let mut wal = wal.lock();
-                    if let Err(e) = wal.truncate() {
-                        tracing::error!("Failed to truncate WAL: {}", e);
-                    }
+                if checkpoint_succeeded {
+                    last_checkpoint = tokio::time::Instant::now();
                 }
-
-                last_checkpoint = std::time::Instant::now();
-                tracing::info!("Background checkpoint complete");
+                tracing::info!(
+                    "Background checkpoint complete (succeeded={})",
+                    checkpoint_succeeded
+                );
             }
         }
     });

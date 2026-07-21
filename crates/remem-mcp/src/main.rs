@@ -37,6 +37,16 @@ struct Args {
     /// API key for authenticating with remem-server. Empty = no auth header (dev only).
     #[arg(long, env = "REMEM_API_KEY", default_value = "")]
     api_key: String,
+
+    /// Maximum concurrent SSE sessions before new connections are refused
+    /// with 503 (SSE transport only).
+    #[arg(long, env = "MCP_MAX_SSE_SESSIONS", default_value_t = 1000)]
+    max_sse_sessions: usize,
+
+    /// Idle timeout in seconds for SSE sessions — a session with no
+    /// `/messages` activity for this long is evicted (SSE transport only).
+    #[arg(long, env = "MCP_SSE_IDLE_TIMEOUT_SECS", default_value_t = 1800)]
+    sse_idle_timeout_secs: u64,
 }
 
 fn build_http_client(api_key: &str) -> anyhow::Result<reqwest::Client> {
@@ -78,7 +88,16 @@ async fn main() -> anyhow::Result<()> {
 
     match args.transport.as_str() {
         "stdio" => run_stdio(remem).await,
-        "sse" => sse::run(remem, &args.host, args.port).await,
+        "sse" => {
+            sse::run(
+                remem,
+                &args.host,
+                args.port,
+                args.max_sse_sessions,
+                std::time::Duration::from_secs(args.sse_idle_timeout_secs),
+            )
+            .await
+        }
         other => anyhow::bail!("unknown transport '{other}'; use 'stdio' or 'sse'"),
     }
 }

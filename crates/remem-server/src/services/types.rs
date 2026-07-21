@@ -127,6 +127,15 @@ pub struct StoredMetadata {
     pub flashbulb_until: Option<u64>,
     /// TTL in seconds. None for long-term.
     pub ttl: Option<u64>,
+    /// Last time apply_importance_decay touched this memory. Kept separate
+    /// from `updated_at` so the decay task's own periodic touch doesn't
+    /// masquerade as a content edit or a reinforcement signal.
+    #[serde(default)]
+    pub last_decay_at: Option<u64>,
+    /// Last time active_forgetting touched this memory's health. Kept
+    /// separate from `updated_at` for the same reason.
+    #[serde(default)]
+    pub last_health_check_at: Option<u64>,
 }
 
 /// A memory as returned to API callers — timestamps converted to ISO-8601.
@@ -194,6 +203,14 @@ pub fn ms_to_dt(ms: u64) -> DateTime<Utc> {
 
 pub fn memory_key(id: Uuid) -> String {
     format!("memory:{id}")
+}
+
+/// Inverse of `memory_key` — parses the memory id out of a raw KV key. Used
+/// by lifecycle scan loops to lock by id *before* loading the record, so
+/// there's no window between "index scan finds this key" and "we know
+/// which id to lock."
+pub fn parse_memory_id(key: &[u8]) -> Option<Uuid> {
+    std::str::from_utf8(key).ok()?.strip_prefix("memory:")?.parse().ok()
 }
 
 pub fn default_memory_health() -> f32 {
@@ -379,6 +396,8 @@ mod tests {
                 last_recalled_at: None,
                 flashbulb_until: None,
                 ttl,
+                last_decay_at: None,
+                last_health_check_at: None,
             },
             archived: false,
         }
@@ -445,6 +464,8 @@ mod tests {
                 last_recalled_at: Some(now),
                 flashbulb_until: None,
                 ttl: None,
+                last_decay_at: None,
+                last_health_check_at: None,
             },
             archived: false,
         };
@@ -492,6 +513,8 @@ mod tests {
                 last_recalled_at: None,
                 flashbulb_until: None,
                 ttl: Some(3600),
+                last_decay_at: None,
+                last_health_check_at: None,
             },
             archived: false,
         };
@@ -499,6 +522,22 @@ mod tests {
         let api = stored.into_api(vec![]);
         assert!(api.connections.is_empty());
         assert_eq!(api.metadata.ttl, Some(3600));
+    }
+
+    // ── parse_memory_id ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_memory_id_roundtrips_with_memory_key() {
+        let id = Uuid::new_v4();
+        let key = memory_key(id);
+        assert_eq!(parse_memory_id(key.as_bytes()), Some(id));
+    }
+
+    #[test]
+    fn parse_memory_id_rejects_wrong_prefix() {
+        assert_eq!(parse_memory_id(b"tag:abc"), None);
+        assert_eq!(parse_memory_id(b"memory:not-a-uuid"), None);
+        assert_eq!(parse_memory_id(b""), None);
     }
 }
 

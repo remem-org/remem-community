@@ -108,6 +108,8 @@ impl MemoryManager {
                     MemoryType::ShortTerm => opts.ttl.or(Some(3600)),
                     MemoryType::LongTerm => None,
                 },
+                last_decay_at: None,
+                last_health_check_at: None,
             },
             archived: false,
         };
@@ -137,6 +139,8 @@ impl MemoryManager {
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Memory> {
+        let _guard = self.repo.lock(id).await;
+
         let mut stored = self
             .repo
             .load(id)
@@ -159,6 +163,8 @@ impl MemoryManager {
     }
 
     pub async fn update(&self, id: Uuid, patch: UpdatePatch) -> Result<Memory> {
+        let _guard = self.repo.lock(id).await;
+
         let mut stored = self
             .repo
             .load(id)
@@ -223,6 +229,8 @@ impl MemoryManager {
     }
 
     pub async fn delete(&self, id: Uuid, hard: bool) -> Result<()> {
+        let _guard = self.repo.lock(id).await;
+
         if hard {
             self.repo.delete(id).await?;
         } else {
@@ -393,6 +401,8 @@ mod tests {
                 last_recalled_at: None,
                 flashbulb_until: None,
                 ttl: None,
+                last_decay_at: None,
+                last_health_check_at: None,
             },
             archived: false,
         }

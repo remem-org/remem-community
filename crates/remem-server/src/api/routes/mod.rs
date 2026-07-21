@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod connections;
 pub mod health;
 pub mod lifecycle;

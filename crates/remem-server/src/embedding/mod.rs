@@ -78,6 +78,19 @@ impl EmbeddingService {
         Ok(Self { tx, cache })
     }
 
+    /// Lightweight constructor for unit tests that exercise service-layer
+    /// code paths not requiring real embeddings (e.g.
+    /// `LifecycleManager::active_forgetting`). Does not load the ONNX model
+    /// or spawn batch workers -- calling `embed()` on the result will hang
+    /// forever since nothing drains the channel.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let (tx, _rx) = mpsc::channel::<PendingEmbed>(1);
+        let capacity = NonZeroUsize::new(1).unwrap();
+        let cache = Arc::new(Mutex::new(LruCache::new(capacity)));
+        Self { tx, cache }
+    }
+
     /// Embed a single text, using the in-process LRU cache.
     ///
     /// The request is queued to the background workers, which coalesce

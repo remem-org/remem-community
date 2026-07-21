@@ -9,6 +9,7 @@ license = "FSL-1.1-ALv2"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+tokio-stream = "0.1"
 
 # HTTP API
 axum = { version = "0.7", features = ["macros"] }
@@ -63,6 +64,10 @@ bincode = "1"
 crc32fast = "1"
 zstd = "0.13"
 memmap2 = "0.9"
+
+# Backup endpoint: tar.gz of data_dir after a checkpoint
+tar = "0.4"
+flate2 = "1"
 crossbeam-skiplist = "0.1"
 ordered-float = "4"
 half = "2"

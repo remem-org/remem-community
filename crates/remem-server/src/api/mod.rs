@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state.config.server.allowed_origins);
     let rate_limit_rps = state.config.server.rate_limit_rps;
     let rate_limit_burst = state.config.server.rate_limit_burst;
+    let trust_proxy_headers = state.config.server.trust_proxy_headers;
 
     #[cfg(feature = "business")]
     let (prometheus_layer, metric_handle) = axum_prometheus::PrometheusMetricLayer::pair();
@@ -57,6 +58,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/openapi.json", get(openapi::openapi_json))
         // Stats
         .route("/api/v1/stats", get(routes::health::stats))
+        // Backup — full data_dir snapshot, behind auth like everything below
+        .route("/api/v1/backup", post(routes::backup::create_backup))
         // Memories CRUD
         .route("/api/v1/memories", post(routes::memories::create_memory))
         .route("/api/v1/memories", get(routes::memories::list_memories))
@@ -148,5 +151,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(cors);
 
-    middleware::rate_limit::apply_if_configured(router, rate_limit_rps, rate_limit_burst)
+    middleware::rate_limit::apply_if_configured(
+        router,
+        rate_limit_rps,
+        rate_limit_burst,
+        trust_proxy_headers,
+    )
 }

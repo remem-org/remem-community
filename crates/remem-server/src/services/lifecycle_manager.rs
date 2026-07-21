@@ -5,7 +5,7 @@ use crate::embedding::EmbeddingService;
 use crate::error::{AppError, Result};
 use crate::services::connection_manager::ConnectionManager;
 use crate::services::repository::MemoryRepository;
-use crate::services::types::{memory_key, now_ms, MemoryType, StoredMemory};
+use crate::services::types::{memory_key, now_ms, parse_memory_id, MemoryType, StoredMemory};
 
 pub struct LifecycleManager {
     repo: Arc<MemoryRepository>,
@@ -13,6 +13,9 @@ pub struct LifecycleManager {
     embedding: Arc<EmbeddingService>,
     /// Access-count threshold above which an expired short-term memory is promoted.
     promote_threshold: u32,
+    /// When true, active_forgetting hard-deletes at health=0 instead of
+    /// archiving. Defaults to false at the config layer (see TaskConfig).
+    hard_delete_on_forgetting: bool,
 }
 
 impl LifecycleManager {
@@ -20,17 +23,21 @@ impl LifecycleManager {
         repo: Arc<MemoryRepository>,
         connection: Arc<ConnectionManager>,
         embedding: Arc<EmbeddingService>,
+        hard_delete_on_forgetting: bool,
     ) -> Self {
         Self {
             repo,
             connection,
             embedding,
             promote_threshold: 3,
+            hard_delete_on_forgetting,
         }
     }
 
     /// Promote a short-term memory to long-term. Returns the updated memory.
     pub async fn promote(&self, id: Uuid) -> Result<StoredMemory> {
+        let _guard = self.repo.lock(id).await;
+
         let mut stored = self
             .repo
             .load(id)
@@ -64,6 +71,9 @@ impl LifecycleManager {
         let mut handled = 0usize;
 
         for (_ts, key_bytes) in entries {
+            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let guard = self.repo.lock(id).await;
+
             let Some(mut stored) = self.repo.load_by_key(&key_bytes).await? else {
                 continue;
             };
@@ -75,7 +85,10 @@ impl LifecycleManager {
             }
 
             if stored.metadata.access_count >= self.promote_threshold {
-                // Promote high-access expired memories
+                // Release our lock before calling promote(), which acquires
+                // its own lock on this same id -- holding both would
+                // deadlock (tokio::sync::Mutex is not reentrant).
+                drop(guard);
                 let _ = self.promote(stored.id).await;
             } else {
                 // Archive low-value expired memories
@@ -102,6 +115,9 @@ impl LifecycleManager {
         let mut updated = 0usize;
 
         for (_ts, key_bytes) in entries {
+            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let _guard = self.repo.lock(id).await;
+
             let Some(mut stored) = self.repo.load_by_key(&key_bytes).await? else {
                 continue;
             };
@@ -112,7 +128,11 @@ impl LifecycleManager {
                 continue;
             }
 
-            let age_days = (now.saturating_sub(stored.metadata.updated_at)) / day_ms;
+            let last_decay = stored
+                .metadata
+                .last_decay_at
+                .unwrap_or(stored.metadata.created_at);
+            let age_days = (now.saturating_sub(last_decay)) / day_ms;
             if age_days == 0 {
                 continue;
             }
@@ -120,7 +140,7 @@ impl LifecycleManager {
             let new_importance =
                 stored.metadata.importance * decay_factor.powi(age_days as i32);
             stored.metadata.importance = new_importance.max(0.0);
-            stored.metadata.updated_at = now;
+            stored.metadata.last_decay_at = Some(now);
 
             let _ = self.repo.store(&stored).await;
             updated += 1;
@@ -130,7 +150,9 @@ impl LifecycleManager {
         Ok(updated)
     }
 
-    /// Decay memory health and permanently remove memories whose health reaches zero.
+    /// Decay memory health and archive memories whose health reaches zero.
+    /// Only hard-deletes when `hard_delete_on_forgetting` is explicitly set
+    /// (see `TaskConfig.active_forgetting_hard_delete`).
     pub async fn active_forgetting(&self) -> Result<usize> {
         let now = now_ms();
         let day_ms: u64 = 86_400_000;
@@ -138,6 +160,9 @@ impl LifecycleManager {
         let mut handled = 0usize;
 
         for (_ts, key_bytes) in entries {
+            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let _guard = self.repo.lock(id).await;
+
             let Some(mut stored) = self.repo.load_by_key(&key_bytes).await? else {
                 continue;
             };
@@ -148,12 +173,19 @@ impl LifecycleManager {
                 continue;
             }
 
+            // Genuine reinforcement signals only -- deliberately excludes
+            // updated_at, which apply_importance_decay (and any future
+            // lifecycle task) touches on its own periodic schedule, not
+            // because the memory was actually recalled or edited.
             let last_reinforced = stored
                 .metadata
                 .last_recalled_at
-                .unwrap_or(stored.metadata.accessed_at)
-                .max(stored.metadata.updated_at);
-            let age_days = (now.saturating_sub(last_reinforced)) / day_ms;
+                .unwrap_or(stored.metadata.accessed_at);
+            let last_checked = stored
+                .metadata
+                .last_health_check_at
+                .unwrap_or(stored.metadata.created_at);
+            let age_days = (now.saturating_sub(last_reinforced.max(last_checked))) / day_ms;
             if age_days == 0 {
                 continue;
             }
@@ -164,11 +196,19 @@ impl LifecycleManager {
             };
             stored.metadata.health = (stored.metadata.health - daily_decay * age_days as f32)
                 .clamp(0.0, 100.0);
+            stored.metadata.last_health_check_at = Some(now);
 
             if stored.metadata.health <= 0.0 {
-                self.repo.delete(stored.id).await?;
+                if self.hard_delete_on_forgetting {
+                    self.repo.delete(stored.id).await?;
+                } else {
+                    stored.archived = true;
+                    stored.metadata.updated_at = now;
+                    self.repo.store(&stored).await?;
+                    let key = memory_key(stored.id);
+                    let _ = self.repo.engine.add_tags(key, &["__archived__".to_owned()]);
+                }
             } else {
-                stored.metadata.updated_at = now;
                 self.repo.store(&stored).await?;
             }
             handled += 1;
@@ -195,6 +235,9 @@ impl LifecycleManager {
         let mut deleted = 0usize;
 
         for (_ts, key_bytes) in entries {
+            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let _guard = self.repo.lock(id).await;
+
             let Some(stored) = self.repo.load_by_key(&key_bytes).await? else {
                 continue;
             };
@@ -282,5 +325,244 @@ impl LifecycleManager {
 
         tracing::info!(total, "discover_connections completed");
         Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod active_forgetting_tests {
+    use super::*;
+    use crate::services::connection_manager::ConnectionManager;
+    use crate::services::repository::MemoryRepository;
+    use crate::services::types::{MemoryType, StoredMetadata};
+
+    async fn test_engine() -> Arc<crate::engine::StorageEngine> {
+        Arc::new(
+            crate::engine::storage::engine::StorageEngine::new(
+                crate::engine::storage::engine::EngineConfig {
+                    data_dir: tempfile::tempdir().unwrap().keep(),
+                    sync_writes: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn active_forgetting_archives_by_default_instead_of_hard_deleting() {
+        let engine = test_engine().await;
+        let repo = Arc::new(MemoryRepository::new(Arc::clone(&engine)));
+        let connection = Arc::new(ConnectionManager::new(Arc::clone(&repo)));
+        let embedding = Arc::new(EmbeddingService::new_for_test());
+        let lifecycle = LifecycleManager::new(
+            Arc::clone(&repo),
+            connection,
+            embedding,
+            /* hard_delete_on_forgetting */ false,
+        );
+
+        let id = Uuid::new_v4();
+        let stored = StoredMemory {
+            id,
+            content: "old memory".into(),
+            memory_type: MemoryType::ShortTerm,
+            metadata: StoredMetadata {
+                created_at: 0,
+                updated_at: 0,
+                accessed_at: 0,
+                access_count: 0,
+                source: None,
+                tags: vec![],
+                importance: 0.5,
+                emotional_valence: 0.0,
+                arousal: 0.0,
+                health: 1.0, // one decay tick away from zero
+                last_recalled_at: None,
+                flashbulb_until: None,
+                ttl: None,
+                last_decay_at: None,
+                last_health_check_at: None,
+            },
+            archived: false,
+        };
+        repo.store(&stored).await.unwrap();
+        engine.add_timestamp(memory_key(id), 0).unwrap();
+
+        lifecycle.active_forgetting().await.unwrap();
+
+        let after = repo.load(id).await.unwrap();
+        assert!(
+            after.is_some(),
+            "memory must still exist (archived, not hard-deleted)"
+        );
+        assert!(
+            after.unwrap().archived,
+            "memory must be archived when health reaches zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_forgetting_hard_deletes_when_flag_is_set() {
+        let engine = test_engine().await;
+        let repo = Arc::new(MemoryRepository::new(Arc::clone(&engine)));
+        let connection = Arc::new(ConnectionManager::new(Arc::clone(&repo)));
+        let embedding = Arc::new(EmbeddingService::new_for_test());
+        let lifecycle = LifecycleManager::new(
+            Arc::clone(&repo),
+            connection,
+            embedding,
+            /* hard_delete_on_forgetting */ true,
+        );
+
+        let id = Uuid::new_v4();
+        let stored = StoredMemory {
+            id,
+            content: "old memory".into(),
+            memory_type: MemoryType::ShortTerm,
+            metadata: StoredMetadata {
+                created_at: 0,
+                updated_at: 0,
+                accessed_at: 0,
+                access_count: 0,
+                source: None,
+                tags: vec![],
+                importance: 0.5,
+                emotional_valence: 0.0,
+                arousal: 0.0,
+                health: 1.0,
+                last_recalled_at: None,
+                flashbulb_until: None,
+                ttl: None,
+                last_decay_at: None,
+                last_health_check_at: None,
+            },
+            archived: false,
+        };
+        repo.store(&stored).await.unwrap();
+        engine.add_timestamp(memory_key(id), 0).unwrap();
+
+        lifecycle.active_forgetting().await.unwrap();
+
+        let after = repo.load(id).await.unwrap();
+        assert!(
+            after.is_none(),
+            "memory must be hard-deleted when the opt-in flag is set"
+        );
+    }
+
+    /// Regression test for the Phase 1 Task 8 deadlock: `expire_short_term`
+    /// holds this id's per-memory lock while scanning, and its promote
+    /// branch calls `self.promote(id)`, which re-acquires the *same*
+    /// non-reentrant `tokio::sync::Mutex`. The fix is the `drop(guard)`
+    /// right before that call in `expire_short_term`; a future refactor
+    /// that silently drops it hangs the task forever instead of returning
+    /// an error, which would otherwise surface only as a CI timeout. The
+    /// `tokio::time::timeout` here turns that hang into a fast,
+    /// bisectable assertion failure.
+    #[tokio::test]
+    async fn expire_short_term_promoting_an_expired_memory_does_not_deadlock() {
+        let engine = test_engine().await;
+        let repo = Arc::new(MemoryRepository::new(Arc::clone(&engine)));
+        let connection = Arc::new(ConnectionManager::new(Arc::clone(&repo)));
+        let embedding = Arc::new(EmbeddingService::new_for_test());
+        let lifecycle = LifecycleManager::new(Arc::clone(&repo), connection, embedding, false);
+
+        let id = Uuid::new_v4();
+        let stored = StoredMemory {
+            id,
+            content: "frequently accessed short-term memory".into(),
+            memory_type: MemoryType::ShortTerm,
+            metadata: StoredMetadata {
+                created_at: 0,
+                updated_at: 0,
+                accessed_at: 0,
+                access_count: 5, // >= promote_threshold (3): must take the promote branch
+                source: None,
+                tags: vec![],
+                importance: 0.5,
+                emotional_valence: 0.0,
+                arousal: 0.0,
+                health: 100.0,
+                last_recalled_at: None,
+                flashbulb_until: None,
+                ttl: Some(1), // created_at 0 + ttl 1s: already expired
+                last_decay_at: None,
+                last_health_check_at: None,
+            },
+            archived: false,
+        };
+        repo.store(&stored).await.unwrap();
+        engine.add_timestamp(memory_key(id), 0).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lifecycle.expire_short_term(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "expire_short_term deadlocked promoting an expired, frequently-accessed memory \
+             -- the per-memory lock was held across the reentrant promote() call"
+        );
+        result.unwrap().unwrap();
+
+        let after = repo.load(id).await.unwrap().unwrap();
+        assert_eq!(
+            after.memory_type,
+            MemoryType::LongTerm,
+            "expired memory at/above the access-count threshold must be promoted, not archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn importance_decay_does_not_reset_active_forgetting_clock() {
+        let engine = test_engine().await;
+        let repo = Arc::new(MemoryRepository::new(Arc::clone(&engine)));
+        let connection = Arc::new(ConnectionManager::new(Arc::clone(&repo)));
+        let embedding = Arc::new(EmbeddingService::new_for_test());
+        let lifecycle = LifecycleManager::new(Arc::clone(&repo), connection, embedding, false);
+
+        let id = Uuid::new_v4();
+        let long_ago = 0u64;
+        let stored = StoredMemory {
+            id,
+            content: "long-term memory".into(),
+            memory_type: MemoryType::LongTerm,
+            metadata: StoredMetadata {
+                created_at: long_ago,
+                updated_at: long_ago,
+                accessed_at: long_ago,
+                access_count: 0,
+                source: None,
+                tags: vec![],
+                importance: 0.9,
+                emotional_valence: 0.0,
+                arousal: 0.0,
+                health: 100.0,
+                last_recalled_at: None,
+                flashbulb_until: None,
+                ttl: None,
+                last_decay_at: None,
+                last_health_check_at: None,
+            },
+            archived: false,
+        };
+        repo.store(&stored).await.unwrap();
+        engine.add_timestamp(memory_key(id), long_ago).unwrap();
+
+        // Run importance decay first -- it should NOT reset the clock
+        // active_forgetting uses.
+        lifecycle.apply_importance_decay().await.unwrap();
+        lifecycle.active_forgetting().await.unwrap();
+
+        let after = repo.load(id).await.unwrap().unwrap();
+        assert!(
+            after.metadata.health < 100.0,
+            "health should have decayed based on real age, not been reset by the decay task \
+             touching updated_at (health = {})",
+            after.metadata.health
+        );
     }
 }

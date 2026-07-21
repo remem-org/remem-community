@@ -208,7 +208,7 @@ impl Default for EngineConfig {
             data_dir: PathBuf::from("./data"),
             memtable_size: 256 * 1024 * 1024,   // 256 MB
             block_cache_size: 64 * 1024 * 1024, // 64 MB
-            sync_writes: false,                 // Batch syncs for performance
+            sync_writes: true,                  // matches FileStorageConfig::default() and config/remem-server.toml
             compaction: CompactionConfig::default(),
             vector: VectorConfig::default(),
             graph: GraphIndexConfig::default(),
@@ -219,6 +219,12 @@ impl Default for EngineConfig {
         }
     }
 }
+
+/// Maximum number of immutable memtables allowed to queue for flush before
+/// new writes are rejected. Without this cap, a stuck flush loop (disk
+/// full, permissions) lets rotated memtables accumulate in RAM
+/// indefinitely while writes keep being accepted.
+const MAX_PENDING_IMMUTABLE_MEMTABLES: usize = 4;
 
 /// The main storage engine
 pub struct StorageEngine {
@@ -260,6 +266,14 @@ impl StorageEngine {
         std::fs::create_dir_all(config.data_dir.join("wal"))?;
         std::fs::create_dir_all(config.data_dir.join("sstables"))?;
         std::fs::create_dir_all(config.data_dir.join("index"))?;
+
+        // Remove any `.tmp` files left behind by a crash mid-write in a
+        // previous run (manifest, segment writer, HNSW deleted-nodes file,
+        // SSTable writer -- see `tmp_sweep`). Must run before the indexes
+        // and SSTables below are opened so a fresh writer never collides
+        // with a leftover tmp file of the same name.
+        super::tmp_sweep::sweep_orphaned_tmp_files(&config.data_dir.join("index"));
+        super::tmp_sweep::sweep_orphaned_tmp_files(&config.data_dir.join("sstables"));
 
         // Open KV layer (cache, compaction, WAL, memtable)
         let kv = super::init::open_kv_layer(&config)?;
@@ -329,28 +343,30 @@ impl StorageEngine {
         let key = key.into();
         let value = value.into();
 
-        // Write to WAL first
-        let _timestamp = {
-            let mut wal = self.wal.lock();
-            let memtable = self.memtable.read();
-            let ts = memtable.current_timestamp();
-            wal.append(&WalRecord::insert(key.clone(), value.clone(), ts))?;
-            if self.config.sync_writes {
-                wal.sync()?;
-            }
-            ts
-        };
-
-        // Insert into MemTable, retrying after rotation if full
         loop {
+            // Reserve the timestamp and append to the WAL under the same WAL
+            // lock acquisition, so a concurrent writer can't have its WAL
+            // record land in one order while its memtable insert lands in
+            // another (the old code peeked `current_timestamp()` here, then
+            // let `memtable.insert()` assign the *real* timestamp later,
+            // unlocked).
+            let timestamp = {
+                let mut wal = self.wal.lock();
+                let ts = self.memtable.read().reserve_timestamp();
+                wal.append(&WalRecord::insert(key.clone(), value.clone(), ts))?;
+                if self.config.sync_writes {
+                    wal.sync()?;
+                }
+                ts
+            };
+
             let result = {
                 let memtable = self.memtable.read();
-                memtable.insert(key.clone(), value.clone())
+                memtable.insert_with_timestamp(key.clone(), value.clone(), timestamp)
             };
 
             match result {
-                Ok(_) => {
-                    // Check if we should flush after successful insert
+                Ok(()) => {
                     let should_flush = self.memtable.read().is_full();
                     if should_flush {
                         self.rotate_memtable().await?;
@@ -358,9 +374,10 @@ impl StorageEngine {
                     return Ok(());
                 }
                 Err(StorageError::MemTableFull { .. }) => {
-                    // MemTable is full, rotate and retry
+                    // MemTable is full: rotate and retry. The retry reserves
+                    // a fresh timestamp + WAL record against the new
+                    // (post-rotation) memtable, so the two always agree.
                     self.rotate_memtable().await?;
-                    // Loop will retry the insert with the new memtable
                 }
                 Err(e) => return Err(e),
             }
@@ -371,27 +388,24 @@ impl StorageEngine {
     pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
 
-        // Write to WAL first
-        {
-            let mut wal = self.wal.lock();
-            let memtable = self.memtable.read();
-            let ts = memtable.current_timestamp();
-            wal.append(&WalRecord::delete(key.clone(), ts))?;
-            if self.config.sync_writes {
-                wal.sync()?;
-            }
-        }
-
-        // Insert tombstone into MemTable, retrying after rotation if full
         loop {
+            let timestamp = {
+                let mut wal = self.wal.lock();
+                let ts = self.memtable.read().reserve_timestamp();
+                wal.append(&WalRecord::delete(key.clone(), ts))?;
+                if self.config.sync_writes {
+                    wal.sync()?;
+                }
+                ts
+            };
+
             let result = {
                 let memtable = self.memtable.read();
-                memtable.delete(key.clone())
+                memtable.delete_with_timestamp(key.clone(), timestamp)
             };
 
             match result {
-                Ok(_) => {
-                    // Check if we should flush after successful delete
+                Ok(()) => {
                     let should_flush = self.memtable.read().is_full();
                     if should_flush {
                         self.rotate_memtable().await?;
@@ -399,9 +413,7 @@ impl StorageEngine {
                     return Ok(());
                 }
                 Err(StorageError::MemTableFull { .. }) => {
-                    // Memtable is full, rotate and retry
                     self.rotate_memtable().await?;
-                    // Loop will retry the delete with the new memtable
                 }
                 Err(e) => return Err(e),
             }
@@ -442,7 +454,46 @@ impl StorageEngine {
     }
 
     /// Rotate the active MemTable (make it immutable and create a new one)
+    ///
+    /// # Invariant: safe to race a writer's reserve/apply gap (Phase 3: keep this true)
+    ///
+    /// `put`/`delete`/`store_memory_core` reserve a timestamp via
+    /// `self.memtable.read().reserve_timestamp()` *inside* the WAL lock,
+    /// append the WAL record, release the WAL lock, and only then apply the
+    /// insert/delete to `self.memtable` via a fresh, unlocked
+    /// `self.memtable.read()`. `rotate_memtable` doesn't take the WAL lock,
+    /// so it can swap `self.memtable` for a brand-new, empty one in that gap
+    /// -- the writer's later apply step lands in a *different* `MemTable`
+    /// instance than the one that handed out its reserved timestamp.
+    ///
+    /// This is safe today only because `MemTable::insert_with_timestamp`
+    /// (and `delete_with_timestamp`) CAS-bump the *target* memtable's own
+    /// `next_timestamp` counter up to `timestamp + 1` whenever an inserted
+    /// timestamp is `>=` the counter's current value -- see the "Update
+    /// next_timestamp if needed" loop in `memtable.rs`. So even though the
+    /// timestamp was reserved against the old memtable's counter, applying
+    /// it to the new one still advances the new memtable's counter past it,
+    /// and the WAL-record-order-vs-apply-order invariant (every WAL record
+    /// and its corresponding memtable entry carry the same timestamp, and
+    /// no later reservation can undercut an earlier one) holds across the
+    /// swap.
+    ///
+    /// `rotate_memtable` not taking the WAL lock is deliberate (unlike
+    /// `checkpoint()`'s flush+truncate span, which does); full WAL
+    /// segmentation (Phase 3, see `docs/PROJECT_REVIEW.md` §8) will
+    /// restructure this. Whatever replaces this function must preserve the
+    /// property above: a
+    /// reservation's timestamp must never be reused, and no later
+    /// reservation (on any memtable) may be numerically smaller.
     async fn rotate_memtable(&self) -> Result<()> {
+        if self.immutable_memtables.read().len() >= MAX_PENDING_IMMUTABLE_MEMTABLES {
+            return Err(StorageError::Io(std::io::Error::other(format!(
+                "too many pending memtable flushes ({} queued); rejecting write until \
+                 the flush backlog drains (disk full or flush stalled?)",
+                MAX_PENDING_IMMUTABLE_MEMTABLES
+            ))));
+        }
+
         let old_memtable = {
             let mut memtable = self.memtable.write();
             let old = std::mem::replace(
@@ -452,13 +503,11 @@ impl StorageEngine {
             old
         };
 
-        // Add to immutable list
         {
             let mut immutable = self.immutable_memtables.write();
             immutable.push(Arc::new(ImmutableMemTable::from_memtable(old_memtable)));
         }
 
-        // Trigger background flush
         let _ = self.flush_tx.send(()).await;
 
         Ok(())
@@ -578,35 +627,31 @@ impl StorageEngine {
         let key = key.into();
         let value = value.into();
 
-        // Write to WAL first (with embedding if present)
-        let _timestamp = {
-            let mut wal = self.wal.lock();
-            let memtable = self.memtable.read();
-            let ts = memtable.current_timestamp();
+        loop {
+            let timestamp = {
+                let mut wal = self.wal.lock();
+                let ts = self.memtable.read().reserve_timestamp();
 
-            let record = if let Some(ref emb) = embedding {
-                WalRecord::insert_with_embedding(key.clone(), value.clone(), ts, emb.clone())
-            } else {
-                WalRecord::insert(key.clone(), value.clone(), ts)
+                let record = if let Some(ref emb) = embedding {
+                    WalRecord::insert_with_embedding(key.clone(), value.clone(), ts, emb.clone())
+                } else {
+                    WalRecord::insert(key.clone(), value.clone(), ts)
+                };
+
+                wal.append(&record)?;
+                if self.config.sync_writes {
+                    wal.sync()?;
+                }
+                ts
             };
 
-            wal.append(&record)?;
-            if self.config.sync_writes {
-                wal.sync()?;
-            }
-            ts
-        };
-
-        // Insert into MemTable, retrying after rotation if full
-        loop {
             let result = {
                 let memtable = self.memtable.read();
-                memtable.insert(key.clone(), value.clone())
+                memtable.insert_with_timestamp(key.clone(), value.clone(), timestamp)
             };
 
             match result {
-                Ok(_) => {
-                    // Check if we should flush after successful insert
+                Ok(()) => {
                     let should_flush = self.memtable.read().is_full();
                     if should_flush {
                         self.rotate_memtable().await?;
@@ -614,15 +659,12 @@ impl StorageEngine {
                     break;
                 }
                 Err(StorageError::MemTableFull { .. }) => {
-                    // Memtable is full, rotate and retry
                     self.rotate_memtable().await?;
-                    // Loop will retry the insert with the new memtable
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // Index embedding if provided and HNSW is enabled
         if let (Some(embedding), Some(index)) = (embedding, &self.hnsw_index) {
             index.insert(key, embedding)?;
         }
@@ -648,36 +690,36 @@ impl StorageEngine {
         let key: Bytes = key.into();
         let value: Bytes = value.into();
 
-        // ── Step 1: single WAL lock, single fsync ────────────────────────────
-        {
-            let mut wal = self.wal.lock();
-            let ts = self.memtable.read().current_timestamp();
+        // ── Step 1+2: reserve ts under the WAL lock, apply with that ts ──────
+        loop {
+            let kv_ts = {
+                let mut wal = self.wal.lock();
+                let ts = self.memtable.read().reserve_timestamp();
 
-            let kv_record = if let Some(ref emb) = embedding {
-                WalRecord::insert_with_embedding(key.clone(), value.clone(), ts, emb.clone())
-            } else {
-                WalRecord::insert(key.clone(), value.clone(), ts)
+                let kv_record = if let Some(ref emb) = embedding {
+                    WalRecord::insert_with_embedding(key.clone(), value.clone(), ts, emb.clone())
+                } else {
+                    WalRecord::insert(key.clone(), value.clone(), ts)
+                };
+
+                let records = [
+                    kv_record,
+                    WalRecord::set_timestamp(key.clone(), timestamp, ts),
+                    WalRecord::add_tags(key.clone(), tags.to_vec(), ts),
+                ];
+                wal.append_batch(&records)?;
+                if self.config.sync_writes {
+                    wal.sync()?;
+                }
+                ts
             };
 
-            let records = [
-                kv_record,
-                WalRecord::set_timestamp(key.clone(), timestamp, ts),
-                WalRecord::add_tags(key.clone(), tags.to_vec(), ts),
-            ];
-            wal.append_batch(&records)?;
-            if self.config.sync_writes {
-                wal.sync()?;
-            }
-        }
-
-        // ── Step 2: apply to KV memtable ─────────────────────────────────────
-        loop {
             let result = {
                 let memtable = self.memtable.read();
-                memtable.insert(key.clone(), value.clone())
+                memtable.insert_with_timestamp(key.clone(), value.clone(), kv_ts)
             };
             match result {
-                Ok(_) => {
+                Ok(()) => {
                     if self.memtable.read().is_full() {
                         self.rotate_memtable().await?;
                     }
@@ -802,6 +844,7 @@ impl StorageEngine {
             if index.is_dirty() {
                 let index_dir = self.config.data_dir.join("index");
                 index.save_dirty_chunks(&index_dir)?;
+                index.save_deleted_nodes(&index_dir)?;
                 tracing::info!("Saved HNSW index chunks ({} vectors)", index.len());
             }
         }
@@ -1178,41 +1221,73 @@ impl StorageEngine {
     /// (both outgoing and incoming). Does not touch the KV store — call `delete()`
     /// for that. Returns Ok(()) even if the key was not present in any index.
     pub fn remove_from_indexes(&self, key: &[u8]) -> Result<()> {
-        let ts = self.memtable.read().current_timestamp();
+        // Write the WAL record(s) FIRST, matching every other write path
+        // (put/add_edge/add_edges_batch). The previous order mutated the
+        // in-memory indexes before logging, so a crash in between left an
+        // index mutation that was never durably recorded.
+        //
+        // Graph edges: we don't know which edges exist until we look, so we
+        // peek them read-only *before* taking the WAL lock. This is a
+        // separate, coarse-grained lock (`adjacency: RwLock<Vec<..>>` in
+        // graph.rs) from the WAL lock — taking it here would either force a
+        // lock-ordering rule between the two locks or hold the graph lock
+        // across WAL I/O (fsync), which we don't want. The peek->WAL->remove
+        // split does open a window where a concurrent `add_edge` or
+        // `remove_edge` on this node can interleave: a concurrent add is
+        // simply left alone (not part of this removal, correct), and a
+        // concurrent remove of the same edge makes our later `remove_edge`
+        // call a harmless no-op (idempotent). No corruption path exists, so
+        // this is an accepted tradeoff to keep WAL fsync out of the graph
+        // lock's critical section.
+        let peeked_edges = if let Some(index) = &self.graph_index {
+            index.read().peek_node_edges(key)?
+        } else {
+            Vec::new()
+        };
+
+        // Reserve the timestamp and build+append the WAL records inside the
+        // same WAL-lock critical section, so the WAL's on-disk order for
+        // this key matches the order the timestamp implies — see
+        // `MemTable::reserve_timestamp`'s contract.
         let mut wal_records: Vec<WalRecord> = Vec::new();
+        {
+            let mut wal = self.wal.lock();
+            let ts = self.memtable.read().reserve_timestamp();
 
-        // HNSW vector index
-        if let Some(index) = &self.hnsw_index {
-            index.remove(key);
-            wal_records.push(WalRecord::remove_vector(Bytes::copy_from_slice(key), ts));
-        }
+            if self.hnsw_index.is_some() {
+                wal_records.push(WalRecord::remove_vector(Bytes::copy_from_slice(key), ts));
+            }
+            if self.time_series_index.is_some() {
+                wal_records.push(WalRecord::remove_timestamp(Bytes::copy_from_slice(key), ts));
+            }
+            if self.tag_index.is_some() {
+                wal_records.push(WalRecord::remove_tags(Bytes::copy_from_slice(key), ts));
+            }
+            for (src, dst) in &peeked_edges {
+                wal_records.push(WalRecord::remove_edge(src.clone(), dst.clone(), ts));
+            }
 
-        // Time-series index
-        if let Some(index) = &self.time_series_index {
-            let _ = index.read().remove(key);
-            wal_records.push(WalRecord::remove_timestamp(Bytes::copy_from_slice(key), ts));
-        }
-
-        // Tag index
-        if let Some(index) = &self.tag_index {
-            let _ = index.read().remove(key);
-            wal_records.push(WalRecord::remove_tags(Bytes::copy_from_slice(key), ts));
-        }
-
-        // Graph edges (outgoing + incoming) — each removed pair becomes a RemoveEdge record
-        if let Some(index) = &self.graph_index {
-            let removed = index.read().remove_node_edges(key)?;
-            for (src, dst) in removed {
-                wal_records.push(WalRecord::remove_edge(src, dst, ts));
+            if !wal_records.is_empty() {
+                wal.append_batch(&wal_records)?;
+                if self.config.sync_writes {
+                    wal.sync()?;
+                }
             }
         }
 
-        // Single WAL write for all index cleanups
-        if !wal_records.is_empty() {
-            let mut wal = self.wal.lock();
-            wal.append_batch(&wal_records)?;
-            if self.config.sync_writes {
-                wal.sync()?;
+        // Now apply the mutations the WAL already durably recorded.
+        if let Some(index) = &self.hnsw_index {
+            index.remove(key);
+        }
+        if let Some(index) = &self.time_series_index {
+            let _ = index.read().remove(key);
+        }
+        if let Some(index) = &self.tag_index {
+            let _ = index.read().remove(key);
+        }
+        if let Some(index) = &self.graph_index {
+            for (src, dst) in &peeked_edges {
+                let _ = index.read().remove_edge(src, dst);
             }
         }
 
@@ -1226,20 +1301,32 @@ impl StorageEngine {
         let Some(index) = &self.graph_index else {
             return Ok(());
         };
-        let removed = index.read().remove_node_edges(key)?;
-        if removed.is_empty() {
+
+        // Peek edges read-only before the WAL lock — see the comment in
+        // `remove_from_indexes` for why the graph lock isn't held across
+        // WAL I/O and why the resulting peek/remove split is safe.
+        let edges = index.read().peek_node_edges(key)?;
+        if edges.is_empty() {
             return Ok(());
         }
-        let ts = self.memtable.read().current_timestamp();
-        let records: Vec<WalRecord> = removed
-            .into_iter()
-            .map(|(src, dst)| WalRecord::remove_edge(src, dst, ts))
-            .collect();
-        let mut wal = self.wal.lock();
-        wal.append_batch(&records)?;
-        if self.config.sync_writes {
-            wal.sync()?;
+
+        {
+            let mut wal = self.wal.lock();
+            let ts = self.memtable.read().reserve_timestamp();
+            let wal_records: Vec<WalRecord> = edges
+                .iter()
+                .map(|(src, dst)| WalRecord::remove_edge(src.clone(), dst.clone(), ts))
+                .collect();
+            wal.append_batch(&wal_records)?;
+            if self.config.sync_writes {
+                wal.sync()?;
+            }
         }
+
+        for (src, dst) in &edges {
+            let _ = index.read().remove_edge(src, dst);
+        }
+
         Ok(())
     }
 
@@ -1432,26 +1519,74 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Checkpoint the storage engine
+    /// Returns the configured data directory. `config` is private, so callers
+    /// that need the on-disk root (e.g. the backup endpoint, which tars it up
+    /// right after a `checkpoint()`) go through this accessor instead.
+    pub fn data_dir(&self) -> &Path {
+        &self.config.data_dir
+    }
+
+    /// Checkpoint the storage engine.
     ///
-    /// This saves all indexes to disk and truncates the WAL.
-    /// It should be called periodically or when WAL grows too large.
+    /// Saves all indexes, flushes memtables to SSTables, then truncates the
+    /// WAL -- all three under the same WAL lock, so no write's WAL record
+    /// can be appended (and then erased by truncate) without its data being
+    /// safely on disk in either a flushed SSTable or the still-un-truncated
+    /// WAL. Should be called periodically or when the WAL grows too large.
+    ///
+    /// The WAL-locked span runs on the blocking thread pool (`spawn_blocking`)
+    /// rather than inline: every writer's first step is `wal.lock()`, so this
+    /// span already briefly stalls all writers for its duration (the
+    /// deliberate write barrier -- see above) regardless of which thread
+    /// runs it. Running it inline on an async executor thread additionally
+    /// blocks *unrelated* async work sharing that thread (health checks,
+    /// reads that never touch the WAL lock, etc.) for the same span;
+    /// `spawn_blocking` confines that cost to the writers actually waiting
+    /// on the lock.
     pub async fn checkpoint(&self) -> Result<()> {
         tracing::info!("Starting checkpoint...");
 
-        // Save all indexes
-        // Note: we can't use save_all_indexes() directly here if we wanted to be async,
-        // but the save methods are blocking/sync currently (std::fs).
-        // For now, we keep it simple. Index saving is blocking.
+        // Any index-save failure aborts before we touch the WAL.
         self.save_all_indexes()?;
 
-        // Truncate WAL
-        {
-            let mut wal = self.wal.lock();
-            let _ = wal.truncate()?;
-        }
+        let wal = Arc::clone(&self.wal);
+        let memtable = Arc::clone(&self.memtable);
+        let immutable_memtables = Arc::clone(&self.immutable_memtables);
+        let compaction = Arc::clone(&self.compaction);
+        let config = self.config.clone();
 
-        tracing::info!("Checkpoint complete (Indexes saved, WAL truncated)");
+        tokio::task::spawn_blocking(move || {
+            let mut wal = wal.lock();
+
+            let newly_immutable = {
+                let mut mt = memtable.write();
+                if mt.is_empty() {
+                    None
+                } else {
+                    let old = std::mem::replace(
+                        &mut *mt,
+                        MemTable::with_capacity(config.memtable_size),
+                    );
+                    Some(Arc::new(ImmutableMemTable::from_memtable(old)))
+                }
+            };
+            if let Some(new_imm) = newly_immutable {
+                immutable_memtables.write().push(Arc::clone(&new_imm));
+            }
+
+            let to_flush: Vec<_> = immutable_memtables.read().clone();
+            for imm in to_flush {
+                super::tasks::flush_memtable(&imm, &compaction, &config)?;
+                immutable_memtables.write().retain(|m| !Arc::ptr_eq(m, &imm));
+            }
+
+            wal.truncate()?;
+            Ok::<(), StorageError>(())
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+
+        tracing::info!("Checkpoint complete (indexes saved, memtables flushed, WAL truncated)");
         Ok(())
     }
 
@@ -1585,6 +1720,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_sweeps_orphaned_tmp_files_left_by_a_crash() {
+        let dir = tempdir().unwrap();
+        let index_dir = dir.path().join("index");
+        let sstables_dir = dir.path().join("sstables");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::create_dir_all(&sstables_dir).unwrap();
+
+        // Simulate a crash mid-write at each of the four tmp+rename sites.
+        std::fs::write(index_dir.join("hnsw.manifest.tmp"), b"stale").unwrap();
+        std::fs::write(index_dir.join("nodes_0_100.seg.tmp"), b"stale").unwrap();
+        std::fs::write(index_dir.join("deleted_nodes.bin.tmp"), b"stale").unwrap();
+        std::fs::write(sstables_dir.join("000123.sst.tmp"), b"stale").unwrap();
+
+        let config = EngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let _engine = StorageEngine::new(config).await.unwrap();
+
+        assert!(!index_dir.join("hnsw.manifest.tmp").exists());
+        assert!(!index_dir.join("nodes_0_100.seg.tmp").exists());
+        assert!(!index_dir.join("deleted_nodes.bin.tmp").exists());
+        assert!(!sstables_dir.join("000123.sst.tmp").exists());
+    }
+
+    #[tokio::test]
     async fn test_delete() {
         let dir = tempdir().unwrap();
         let config = EngineConfig {
@@ -1629,13 +1790,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = EngineConfig {
             data_dir: dir.path().to_path_buf(),
-            memtable_size: 1024, // Very small for testing
+            memtable_size: 10 * 1024 * 1024, // 10 MB to accommodate all writes without hitting backlog cap
             ..Default::default()
         };
 
         let engine = StorageEngine::new(config).await.unwrap();
 
-        // Write enough data to trigger flush
+        // Write enough data to verify flushing works
         for i in 0..100 {
             engine
                 .put(format!("key{:05}", i), format!("value{}", i))
@@ -1771,6 +1932,16 @@ mod storage_recovery_tests {
         }
     }
 
+    #[test]
+    fn engine_config_default_matches_production_toml_default() {
+        // config/remem-server.toml and FileStorageConfig::default() both
+        // ship sync_writes = true; EngineConfig::default() must agree, or
+        // any code path constructing it directly (StorageEngine::open,
+        // tests using ..Default::default()) silently runs without
+        // durability.
+        assert!(EngineConfig::default().sync_writes);
+    }
+
     #[tokio::test]
     async fn remove_all_edges_clears_graph() {
         let dir = TempDir::new().unwrap();
@@ -1841,5 +2012,508 @@ mod storage_recovery_tests {
                 "HNSW must not contain hard-deleted key after WAL replay"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn remove_from_indexes_wal_record_present_immediately() {
+        let dir = TempDir::new().unwrap();
+        let key = Bytes::from_static(b"memory:will-be-removed");
+
+        {
+            let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+                .await
+                .unwrap();
+            engine
+                .store_memory_core(
+                    key.clone(),
+                    Bytes::from_static(b"{}"),
+                    Some(vec![1.0, 0.0, 0.0, 0.0]),
+                    1,
+                    &[],
+                )
+                .await
+                .unwrap();
+            engine.remove_from_indexes(key.as_ref()).unwrap();
+            // No checkpoint — only the WAL should record this removal.
+        }
+
+        // Fresh replay must reflect the removal (vector gone from search,
+        // not just from the KV layer, which `delete()` handles separately).
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let results = engine2.vector_search(&[1.0, 0.0, 0.0, 0.0], 5).await.unwrap();
+        assert!(
+            results.iter().all(|r| r.key.as_ref() != key.as_ref()),
+            "removed vector should not resurrect after WAL replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_deleted_vector_does_not_resurrect_after_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let key = Bytes::from_static(b"memory:vec-to-delete");
+
+        {
+            let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+                .await
+                .unwrap();
+            engine
+                .store_memory_core(
+                    key.clone(),
+                    Bytes::from_static(b"{}"),
+                    Some(vec![1.0, 0.0, 0.0, 0.0]),
+                    1,
+                    &[],
+                )
+                .await
+                .unwrap();
+            engine.remove_from_indexes(key.as_ref()).unwrap();
+            engine.checkpoint().await.unwrap(); // saves chunks + deleted_nodes, truncates WAL
+        }
+
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let results = engine2
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.key.as_ref() != key.as_ref()),
+            "hard-deleted vector resurrected as a phantom after checkpoint + restart: {:?}",
+            results
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_deleted_vector_does_not_resurrect_after_delete_only_checkpoint() {
+        // Regression test for the `is_dirty()` gating gap: insert+checkpoint
+        // first (clears the dirty flag), THEN remove with no further insert
+        // before the next checkpoint. Before `remove()` was fixed to mark
+        // the index dirty, this second checkpoint would see `is_dirty() ==
+        // false`, skip saving `deleted_nodes` entirely, and still truncate
+        // the WAL -- silently losing the only durable record of the delete.
+        let dir = TempDir::new().unwrap();
+        let key = Bytes::from_static(b"memory:vec-to-delete-2");
+
+        {
+            let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+                .await
+                .unwrap();
+            engine
+                .store_memory_core(
+                    key.clone(),
+                    Bytes::from_static(b"{}"),
+                    Some(vec![1.0, 0.0, 0.0, 0.0]),
+                    1,
+                    &[],
+                )
+                .await
+                .unwrap();
+            engine.checkpoint().await.unwrap(); // first checkpoint: clears the dirty flag
+
+            engine.remove_from_indexes(key.as_ref()).unwrap();
+            engine.checkpoint().await.unwrap(); // delete-only checkpoint
+        }
+
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let results = engine2
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.key.as_ref() != key.as_ref()),
+            "hard-deleted vector resurrected after a delete-only checkpoint cycle: {:?}",
+            results
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_record_timestamp_matches_applied_memtable_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        engine
+            .put(Bytes::from_static(b"a"), Bytes::from_static(b"1"))
+            .await
+            .unwrap();
+        engine
+            .put(Bytes::from_static(b"a"), Bytes::from_static(b"2"))
+            .await
+            .unwrap();
+
+        // Replay-from-scratch must land on the LAST write ("2"), proving the
+        // WAL's on-disk order for this key matches the order the memtable
+        // actually applied them in (both writes reserved+logged their
+        // timestamp atomically, so replay can't reorder them).
+        drop(engine);
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine2.get(b"a".as_slice()).await.unwrap(),
+            Some(Bytes::from_static(b"2")),
+        );
+    }
+
+    // NOTE: the brief's original version of this test made the HNSW index
+    // directory read-only via `set_readonly(true)` to simulate a disk-full /
+    // permission error during `save_dirty_chunks`. Verified flaky (in fact,
+    // deterministically *not* failing) in the dev container: it runs as
+    // root, and root ignores directory write-permission bits on most
+    // filesystems, so `save_dirty_chunks` still succeeded and `checkpoint()`
+    // returned `Ok`. Run 5x in a loop to confirm: 5/5 failed the
+    // `result.is_err()` assertion.
+    //
+    // Falls back to the deterministic injection the brief suggested:
+    // `HnswIndex::save_dirty_chunks` calls `std::fs::create_dir_all(dir)`
+    // where `dir` is `data_dir/index`. `StorageEngine::new` already creates
+    // that directory during startup, so after construction we swap it out
+    // for a regular *file* at the same path. `create_dir_all` fails with
+    // `AlreadyExists`/`NotADirectory` when the final path component exists
+    // as a non-directory, regardless of uid — this fails the save the same
+    // way for root and non-root alike.
+    #[tokio::test]
+    async fn checkpoint_skips_wal_truncation_when_an_index_save_fails() {
+        let dir = TempDir::new().unwrap();
+        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        engine
+            .store_memory_core(
+                Bytes::from_static(b"memory:x"),
+                Bytes::from_static(b"{}"),
+                Some(vec![1.0, 0.0, 0.0, 0.0]),
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // Replace the HNSW index directory with a regular file so
+        // `save_dirty_chunks`'s `create_dir_all` fails deterministically,
+        // simulating a disk-full/permission error during checkpoint --
+        // without relying on permission bits that root ignores.
+        let hnsw_dir = dir.path().join("index");
+        std::fs::remove_dir_all(&hnsw_dir).unwrap();
+        std::fs::write(&hnsw_dir, b"not a directory").unwrap();
+
+        // checkpoint() should surface the index-save error rather than
+        // silently truncating the WAL anyway.
+        let result = engine.checkpoint().await;
+
+        // Restore the directory so TempDir can clean up (and so a fresh
+        // engine can load/create indexes normally below).
+        std::fs::remove_file(&hnsw_dir).unwrap();
+        std::fs::create_dir_all(&hnsw_dir).unwrap();
+
+        assert!(
+            result.is_err(),
+            "checkpoint must fail (and skip WAL truncation) when an index save fails"
+        );
+
+        // The WAL must still contain the write — replay after this failed
+        // checkpoint must recover it.
+        drop(engine);
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(engine2.get(b"memory:x".as_slice()).await.unwrap().is_some());
+    }
+
+    /// The other half of the write-barrier defect: even when every index
+    /// save succeeds, the pre-fix `checkpoint()` truncated the WAL without
+    /// ever flushing the (in-memory-only) memtable to an SSTable first. A
+    /// write that landed in the memtable but was never flushed would have
+    /// its only durable record (the WAL entry) erased by `truncate()`, then
+    /// vanish for good once the in-memory memtable is lost (e.g. on
+    /// restart). This is the scenario the single-index-failure test above
+    /// does not exercise, since that one fails before ever reaching the WAL
+    /// truncation step.
+    #[tokio::test]
+    async fn checkpoint_flushes_memtable_before_truncating_wal() {
+        let dir = TempDir::new().unwrap();
+        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        engine
+            .store_memory_core(
+                Bytes::from_static(b"memory:y"),
+                Bytes::from_static(b"{}"),
+                Some(vec![0.0, 1.0, 0.0, 0.0]),
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // No index-save failure this time -- checkpoint should succeed
+        // outright, but must flush the memtable (to an SSTable) as part of
+        // that success, not just truncate the WAL.
+        engine.checkpoint().await.unwrap();
+
+        // Drop the engine, discarding the in-memory memtable. If the write
+        // was flushed to an SSTable before the WAL was truncated, the data
+        // survives. If checkpoint() only truncated the WAL, the write is
+        // gone: no WAL record to replay, no SSTable entry either.
+        drop(engine);
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(
+            engine2.get(b"memory:y".as_slice()).await.unwrap().is_some(),
+            "checkpoint() must flush the memtable to an SSTable before truncating the WAL, \
+             or an in-memtable-only write is lost once the WAL is truncated"
+        );
+    }
+
+    /// `checkpoint()`'s WAL-locked flush+truncate span does blocking file
+    /// I/O (SSTable writes + fsync). Run directly in an `async fn` with no
+    /// `.await` inside that span, this executes start-to-finish on
+    /// whichever executor thread polls `checkpoint()`, without ever
+    /// yielding -- so unrelated async work sharing that thread (e.g. a
+    /// `current_thread` runtime, or a busy worker on a multi-thread one)
+    /// is blocked alongside the writers waiting on the WAL lock, not just
+    /// the writers themselves. Dispatching the span to `spawn_blocking`
+    /// fixes this: awaiting the returned `JoinHandle` always yields at
+    /// least once (the blocking closure runs on a separate thread and
+    /// wakes the awaiting task via a channel, which cannot resolve
+    /// synchronously within a single poll), giving the executor a chance
+    /// to run other ready tasks while the flush is in flight.
+    ///
+    /// This test proves that yield happens: it races a task that
+    /// increments a counter and calls `yield_now()` in a loop against
+    /// `checkpoint()` on a `current_thread` runtime (`#[tokio::test]`'s
+    /// default). If `checkpoint()` never yields, the ticker task cannot be
+    /// scheduled even once before `checkpoint()` returns, since a
+    /// single-threaded runtime only switches tasks at yield points.
+    #[tokio::test]
+    async fn checkpoint_flush_does_not_monopolize_the_executor_thread() {
+        let dir = TempDir::new().unwrap();
+        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        engine
+            .store_memory_core(
+                Bytes::from_static(b"memory:yield"),
+                Bytes::from_static(b"{}"),
+                Some(vec![1.0, 1.0, 0.0, 0.0]),
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let yields_task = Arc::clone(&yields);
+        let ticker = tokio::spawn(async move {
+            loop {
+                yields_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        engine.checkpoint().await.unwrap();
+        let yields_during_checkpoint = yields.load(std::sync::atomic::Ordering::SeqCst);
+        ticker.abort();
+
+        assert!(
+            yields_during_checkpoint > 0,
+            "checkpoint() ran its WAL-locked flush span start-to-finish without \
+             yielding to the executor -- a concurrently-spawned task never got \
+             scheduled even once, meaning the flush is blocking I/O running \
+             directly on the async runtime thread instead of via spawn_blocking"
+        );
+    }
+
+    /// Same defect as `checkpoint_skips_wal_truncation_when_an_index_save_fails`,
+    /// but exercised through the actual *background* checkpoint loop
+    /// (`start_background_tasks` in tasks.rs) rather than the manually
+    /// triggered `checkpoint()` -- these are two independent code paths with
+    /// separately duplicated logic, so passing the manual-checkpoint test
+    /// does not prove the background loop's `all_saves_ok` gating works.
+    ///
+    /// Uses `start_paused = true` + `tokio::time::advance` (same idiom as
+    /// `tasks::supervisor::tests`) to fast-forward past the loop's
+    /// hard-coded 10s poll interval without a real-time wait.
+    #[tokio::test(start_paused = true)]
+    async fn background_checkpoint_loop_skips_wal_truncation_when_index_save_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_cfg(dir.path().to_path_buf());
+        // Force `should_checkpoint` true on the loop's very first tick,
+        // independent of `checkpoint_interval`.
+        cfg.max_wal_size = 1;
+        let engine = StorageEngine::new(cfg).await.unwrap();
+
+        engine
+            .store_memory_core(
+                Bytes::from_static(b"memory:bg"),
+                Bytes::from_static(b"{}"),
+                Some(vec![0.0, 0.0, 1.0, 0.0]),
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // Corrupt the HNSW index directory so the background loop's
+        // save_dirty_chunks fails deterministically on its first tick,
+        // regardless of uid (see the note on the sibling test above).
+        let hnsw_dir = dir.path().join("index");
+        std::fs::remove_dir_all(&hnsw_dir).unwrap();
+        std::fs::write(&hnsw_dir, b"not a directory").unwrap();
+
+        // Let the background task observe the corrupted directory, then
+        // advance virtual time past its 10s poll interval so it runs.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Restore the directory so a fresh engine can load/create indexes
+        // normally below.
+        std::fs::remove_file(&hnsw_dir).unwrap();
+        std::fs::create_dir_all(&hnsw_dir).unwrap();
+
+        drop(engine);
+        let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let results = engine2
+            .vector_search(&[0.0, 0.0, 1.0, 0.0], 5)
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.key.as_ref() == b"memory:bg".as_slice()),
+            "background checkpoint loop must not truncate the WAL when an index save fails -- \
+             otherwise the vector is lost for good once the un-persisted HNSW chunk and the \
+             truncated WAL both vanish, with nothing left to replay on restart"
+        );
+    }
+
+    /// Regression test for REM-14 (`docs/PROJECT_REVIEW.md` §2.4 item 2):
+    /// the background checkpoint loop stamps `last_checkpoint` on *every*
+    /// attempt, success or failure. While the underlying problem persists
+    /// that's harmless (the loop just retries on the same cadence), but it
+    /// means a transient failure that clears up between ticks still has to
+    /// wait a full `checkpoint_interval` for the next attempt, rather than
+    /// retrying on the very next 10s poll -- the interval-based trigger
+    /// "silently stops mattering" as a *prompt* retry mechanism once
+    /// something has failed once.
+    ///
+    /// Isolates the time-based trigger from the WAL-size trigger (a huge
+    /// `max_wal_size` never fires) and picks a `checkpoint_interval` (25s)
+    /// that doesn't land exactly on the loop's fixed 10s poll tick, so a
+    /// bug here is distinguishable: with the bug, the checkpoint attempt at
+    /// t=30s (first tick where elapsed > 25s) that fails resets the clock,
+    /// so the next attempt doesn't come until t=60s (elapsed > 25s again
+    /// from t=30); fixed, the failed attempt leaves the clock alone, so the
+    /// next attempt comes at the very next tick, t=40s (elapsed=40 > 25,
+    /// still measured from t=0).
+    ///
+    /// Advances the paused clock in exact 10s increments (the loop's own
+    /// poll granularity), yielding between each -- advancing past several
+    /// tick boundaries in one jump isn't a reliable way to observe each
+    /// individual tick's own timer registration (see the identical idiom
+    /// in `tasks::supervisor::tests`).
+    #[tokio::test(start_paused = true)]
+    async fn background_checkpoint_loop_retries_promptly_after_a_failed_attempt() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_cfg(dir.path().to_path_buf());
+        cfg.checkpoint_interval = Duration::from_secs(25);
+        // Default max_wal_size (1 GB) never fires for this test's one tiny
+        // write -- only the time-based trigger can cause a checkpoint here.
+        let engine = StorageEngine::new(cfg).await.unwrap();
+
+        engine
+            .store_memory_core(
+                Bytes::from_static(b"memory:retry"),
+                Bytes::from_static(b"{}"),
+                Some(vec![0.0, 1.0, 1.0, 0.0]),
+                1,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let hnsw_dir = dir.path().join("index");
+        std::fs::remove_dir_all(&hnsw_dir).unwrap();
+        std::fs::write(&hnsw_dir, b"not a directory").unwrap();
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        // t=10s, t=20s: elapsed (10s, 20s) <= 25s interval -- no trigger yet.
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        // t=30s: elapsed=30s > 25s -- first attempt fires and fails (index
+        // dir is corrupted), since nothing has ever succeeded yet.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            engine.wal.lock().size() > 0,
+            "sanity check: the first attempt must fail without truncating the WAL"
+        );
+
+        // The underlying problem clears up between ticks.
+        std::fs::remove_file(&hnsw_dir).unwrap();
+        std::fs::create_dir_all(&hnsw_dir).unwrap();
+
+        // t=40s: only one more 10s tick past the failed attempt at t=30s --
+        // short of a full second 25s interval measured from t=30s (which
+        // wouldn't elapse until t=55s), but enough for one more poll tick.
+        // A prompt retry must pick this up now, not wait until t=55s+.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            engine.wal.lock().size(),
+            0,
+            "background checkpoint loop must retry on the very next poll after a failed \
+             attempt, not wait out a full checkpoint_interval from that failed attempt -- \
+             last_checkpoint must only reset on success"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_memtable_rejects_once_flush_backlog_is_full() {
+        let dir = TempDir::new().unwrap();
+        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf())).await.unwrap();
+
+        // Manually saturate the pending-immutable-memtable backlog to
+        // simulate a stalled flush loop (e.g. disk full) without needing
+        // to actually fill up gigabytes of memtable data.
+        for i in 0..MAX_PENDING_IMMUTABLE_MEMTABLES {
+            let mt = MemTable::with_capacity(1024);
+            mt.insert(Bytes::from(format!("k{i}")), Bytes::from_static(b"v")).unwrap();
+            engine
+                .immutable_memtables
+                .write()
+                .push(Arc::new(ImmutableMemTable::from_memtable(mt)));
+        }
+
+        let result = engine.rotate_memtable().await;
+        assert!(result.is_err(), "rotate_memtable should reject writes once the flush backlog is full");
     }
 }

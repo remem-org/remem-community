@@ -11,6 +11,7 @@ use super::format::{
     HEADER_SIZE,
 };
 use crate::engine::error::{Result, StorageError};
+use crate::engine::storage::durable_rename::durable_rename;
 use crate::engine::util::BloomFilter;
 
 /// Builder for creating SSTable files
@@ -22,8 +23,13 @@ use crate::engine::util::BloomFilter;
 /// 4. Build a bloom filter for all keys
 /// 5. Write the final file with header, data, index, bloom, and footer
 pub struct SSTableWriter {
-    /// Path to the output file
+    /// Final path of the output file (only visible after `finish()` renames
+    /// `tmp_path` onto it).
     path: PathBuf,
+    /// Path actually being written to (`{path}.tmp`) -- renamed onto `path`
+    /// only once the file is fully written and fsynced, so a crash
+    /// mid-write never leaves a partially-written `.sst` at its real name.
+    tmp_path: PathBuf,
     /// Buffered file writer
     writer: BufWriter<File>,
     /// Compression type
@@ -63,8 +69,9 @@ impl SSTableWriter {
         level: usize,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let tmp_path = path.with_extension("sst.tmp");
 
-        let file = File::create(&path)?;
+        let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
         // Write placeholder header (will be updated at the end)
@@ -81,6 +88,7 @@ impl SSTableWriter {
 
         Ok(Self {
             path,
+            tmp_path,
             writer,
             compression,
             current_block: Vec::with_capacity(BLOCK_SIZE),
@@ -211,10 +219,12 @@ impl SSTableWriter {
         // Flush everything before calculating checksum
         self.writer.flush()?;
 
-        // Calculate checksum by reading the entire file (excluding footer space)
+        // Calculate checksum by reading the entire file (excluding footer space).
+        // Read from `tmp_path`: the file hasn't been renamed to its final
+        // name yet at this point.
         let checksum = {
             use std::io::Read;
-            let mut file = std::fs::File::open(&self.path)?;
+            let mut file = std::fs::File::open(&self.tmp_path)?;
             let mut data = vec![0u8; self.current_offset as usize];
             file.read_exact(&mut data)?;
             crc32fast::hash(&data)
@@ -234,8 +244,17 @@ impl SSTableWriter {
         self.writer.seek(SeekFrom::Start(self.current_offset))?;
         self.writer.write_all(&footer_bytes)?;
         self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
 
         let file_size = self.current_offset + footer_bytes.len() as u64;
+
+        // Close the tmp file, then atomically publish it under its final
+        // name. Until this rename completes, a crash leaves only the
+        // `.tmp` file behind -- `load_existing` filters on the `.sst`
+        // extension, so a torn tmp file is never picked up as a real
+        // SSTable.
+        drop(self.writer);
+        durable_rename(&self.tmp_path, &self.path)?;
 
         Ok(SSTableMeta {
             path: self.path,

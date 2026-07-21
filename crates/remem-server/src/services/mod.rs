@@ -77,6 +77,7 @@ pub async fn create_services(engine: Arc<StorageEngine>, cfg: &Config) -> Result
         Arc::clone(&repo),
         Arc::clone(&connection),
         Arc::clone(&embedding),
+        cfg.tasks.active_forgetting_hard_delete,
     ));
     let task_registry = Arc::new(TaskRegistry::new(&cfg.storage.data_dir));
 

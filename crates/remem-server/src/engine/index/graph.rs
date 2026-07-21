@@ -367,6 +367,53 @@ impl CsrGraph {
         Ok(removed)
     }
 
+    /// Read-only counterpart to `remove_node_edges`: computes the same
+    /// (source, target) pairs — both outgoing (node → X) and incoming
+    /// (X → node) — without mutating the adjacency lists. Used by callers
+    /// that need to WAL-log a removal before applying it (log-before-mutate).
+    pub fn peek_node_edges(&self, node: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        let node_internal = {
+            let id_map = self.id_to_internal.read();
+            match id_map.get(node) {
+                Some(&id) => id,
+                None => return Ok(Vec::new()),
+            }
+        };
+
+        let node_bytes = Bytes::copy_from_slice(node);
+        // Snapshot external IDs before taking the adjacency read lock.
+        let id_snapshot: Vec<Bytes> = self.internal_to_id.read().iter().cloned().collect();
+
+        let mut found: Vec<(Bytes, Bytes)> = Vec::new();
+
+        {
+            let adjacency = self.adjacency.read();
+
+            // 1. Outgoing edges: node -> X.
+            for (target_internal, _) in adjacency[node_internal as usize].edges.iter() {
+                found.push((
+                    node_bytes.clone(),
+                    id_snapshot[*target_internal as usize].clone(),
+                ));
+            }
+
+            // 2. Incoming edges: scan all other nodes for edges pointing to node.
+            for (src_internal, node_data) in adjacency.iter().enumerate() {
+                if src_internal as u32 == node_internal {
+                    continue;
+                }
+                let src_bytes = &id_snapshot[src_internal];
+                for (tid, _) in node_data.edges.iter() {
+                    if *tid == node_internal {
+                        found.push((src_bytes.clone(), node_bytes.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(found)
+    }
+
     /// Remove all edges from `source` to `target`.
     ///
     /// Automatically unfinalizes (invalidates the CSR cache) before mutating

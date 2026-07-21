@@ -286,3 +286,4 @@ test-results/
 .superpowers/
 .mcp.json
 .remember/
+crates/remem-server/.fastembed_cache

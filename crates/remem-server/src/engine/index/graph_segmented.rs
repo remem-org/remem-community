@@ -218,6 +218,13 @@ impl SegmentedCsrGraph {
         result
     }
 
+    /// Read-only counterpart to `remove_node_edges`: returns the same edge
+    /// list without mutating the graph or marking it dirty. Used to WAL-log
+    /// a removal before applying it (log-before-mutate).
+    pub fn peek_node_edges(&self, node: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
+        self.graph.peek_node_edges(node)
+    }
+
     pub fn add_node(&self, external_id: impl Into<Bytes>) -> Result<u32> {
         let result = self.graph.add_node(external_id);
         if result.is_ok() {

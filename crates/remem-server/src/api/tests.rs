@@ -71,6 +71,7 @@ async fn make_test_app() -> (axum::Router, tempfile::TempDir) {
             allowed_origins: vec![],
             rate_limit_rps: 0,
             rate_limit_burst: 50,
+            trust_proxy_headers: false,
             env: Environment::Development,
         },
         storage: CfgStorage {
@@ -99,6 +100,7 @@ async fn make_test_app() -> (axum::Router, tempfile::TempDir) {
             discover_connections_secs: 3600,
             discovery_workers: 2,
             discovery_queue_size: 10_000,
+            active_forgetting_hard_delete: false,
         },
     };
 
@@ -530,6 +532,7 @@ async fn auth_required_when_api_key_set() {
             allowed_origins: vec![],
             rate_limit_rps: 0,
             rate_limit_burst: 50,
+            trust_proxy_headers: false,
             env: Environment::Development,
         },
         storage: CfgStorage {
@@ -550,6 +553,7 @@ async fn auth_required_when_api_key_set() {
             discover_connections_secs: 3600,
             discovery_workers: 2,
             discovery_queue_size: 10_000,
+            active_forgetting_hard_delete: false,
         },
     };
 
@@ -631,6 +635,7 @@ async fn misconfigured_server_returns_500() {
             allowed_origins: vec![],
             rate_limit_rps: 0,
             rate_limit_burst: 50,
+            trust_proxy_headers: false,
             env: Environment::Development,
         },
         storage: CfgStorage {
@@ -651,6 +656,7 @@ async fn misconfigured_server_returns_500() {
             discover_connections_secs: 3600,
             discovery_workers: 2,
             discovery_queue_size: 10_000,
+            active_forgetting_hard_delete: false,
         },
     };
 
@@ -760,6 +766,54 @@ async fn find_related_returns_structure() {
     let json = body_json(resp).await;
     assert!(json["memory_id"].is_string());
     assert!(json["related"].is_array());
+}
+
+// ── Backup ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn backup_endpoint_returns_a_nonempty_gzip_archive() {
+    let (app, _dir) = make_test_app().await;
+
+    // Seed one memory so the backup has something in it.
+    let create_resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/memories",
+            serde_json::json!({"content": "Memory to back up"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let backup_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/backup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(backup_resp.status(), StatusCode::OK);
+    assert_eq!(
+        backup_resp.headers().get("content-type").unwrap(),
+        "application/gzip"
+    );
+    assert_eq!(
+        backup_resp
+            .headers()
+            .get("content-disposition")
+            .unwrap(),
+        "attachment; filename=\"remem-backup.tar.gz\""
+    );
+
+    let body = backup_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!body.is_empty());
+    // A gzip stream starts with the magic bytes 0x1f 0x8b.
+    assert_eq!(&body[0..2], &[0x1f, 0x8b]);
 }
 
 // ── Input limit validation ─────────────────────────────────────────────────────

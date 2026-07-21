@@ -21,6 +21,7 @@ use crate::engine::index::dirty::DirtyChunkTracker;
 use crate::engine::index::manifest::{ChunkMeta, SegmentManifest};
 use crate::engine::index::segment_io::{SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_HNSW};
 use crate::engine::index::HNSW_CHUNK_SIZE;
+use crate::engine::storage::durable_rename::durable_rename;
 use crate::engine::util::simd::DistanceMetric;
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
@@ -486,7 +487,10 @@ impl HnswIndex {
 
     /// Soft-delete a node by external key. Returns false if the key is not found.
     /// The node is excluded from search results and get_vector_by_key returns None.
-    /// Deleted nodes are compacted out at the next checkpoint (not written to .seg files).
+    /// The node id is added to the deleted-nodes set (persisted via
+    /// `save_deleted_nodes`) and its chunk is marked dirty, so the deletion
+    /// survives a restart -- but the vector's bytes remain in the `.seg`
+    /// file regardless; reclaiming that disk space is deferred to Phase 3.
     pub fn remove(&self, key: &[u8]) -> bool {
         let node_id = match self.key_to_node.read().get(key).copied() {
             Some(id) => id,
@@ -498,6 +502,13 @@ impl HnswIndex {
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
         self.chunk_dirty.lock().mark_dirty(node_id);
+        // Mark the index dirty the same way `insert` does. Without this, a
+        // checkpoint cycle that only removes vectors (no new inserts since
+        // the last save) sees `is_dirty() == false`, so the checkpoint loop
+        // never calls `save_dirty_chunks`/`save_deleted_nodes` and the WAL
+        // still gets truncated -- erasing the only durable record of the
+        // deletion and resurrecting the vector on restart.
+        self.dirty.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -515,6 +526,62 @@ impl HnswIndex {
     /// Mark the index as clean (after saving)
     pub fn mark_clean(&self) {
         self.dirty.store(0, Ordering::Relaxed);
+    }
+
+    fn deleted_nodes_path(dir: &Path) -> PathBuf {
+        dir.join("deleted_nodes.bin")
+    }
+
+    /// Persist the current soft-deleted node ID set to `dir`. Call this
+    /// alongside `save_dirty_chunks` at every checkpoint -- without it,
+    /// deletions only exist as an in-memory set plus a WAL `RemoveVector`
+    /// record, and checkpoint erases the WAL record without ever writing
+    /// the set to disk, so a restart resurrects every hard-deleted vector.
+    pub fn save_deleted_nodes(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let path = Self::deleted_nodes_path(dir);
+        let tmp = path.with_extension("bin.tmp");
+
+        let deleted = self.deleted_nodes.read();
+        let mut buf = Vec::with_capacity(4 + deleted.len() * 4);
+        buf.extend_from_slice(&(deleted.len() as u32).to_le_bytes());
+        for &node_id in deleted.iter() {
+            buf.extend_from_slice(&node_id.to_le_bytes());
+        }
+        drop(deleted);
+
+        std::fs::write(&tmp, &buf)?;
+        {
+            let f = std::fs::File::open(&tmp)?;
+            f.sync_all()?;
+        }
+        durable_rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Load the persisted soft-deleted node ID set, if any. Returns an
+    /// empty set if the file doesn't exist yet (fresh index, or a data dir
+    /// written before this fix existed).
+    pub fn load_deleted_nodes(dir: &Path) -> Result<HashSet<u32>> {
+        let path = Self::deleted_nodes_path(dir);
+        if !path.exists() {
+            return Ok(HashSet::new());
+        }
+        let buf = std::fs::read(&path)?;
+        if buf.len() < 4 {
+            return Ok(HashSet::new());
+        }
+        let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let mut set = HashSet::with_capacity(count);
+        let mut offset = 4;
+        for _ in 0..count {
+            if offset + 4 > buf.len() {
+                break;
+            }
+            set.insert(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()));
+            offset += 4;
+        }
+        Ok(set)
     }
 
     /// Save only dirty chunks to `dir` using segment files + manifest.
@@ -752,6 +819,7 @@ impl HnswIndex {
             }
         }
         index.mark_clean();
+        *index.deleted_nodes.write() = Self::load_deleted_nodes(dir)?;
 
         tracing::info!(
             "HNSW: loaded {} nodes from {} chunks in {:?}",
@@ -1424,6 +1492,85 @@ mod tests {
         // 'c' should be closer than 'b' to [1,0,0]
         assert_eq!(results[1].0.as_ref(), b"c");
         assert_eq!(results[2].0.as_ref(), b"b");
+    }
+
+    #[test]
+    fn deleted_nodes_persist_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HnswConfig::with_dim(4);
+        let index = HnswIndex::new(config.clone());
+
+        index
+            .insert(b"keep".to_vec(), vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        index
+            .insert(b"gone".to_vec(), vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        assert!(index.remove(b"gone"));
+
+        let index_dir = dir.path().join("index");
+        index.save_dirty_chunks(&index_dir).unwrap();
+        index.save_deleted_nodes(&index_dir).unwrap();
+
+        let reloaded = HnswIndex::load_chunked(&index_dir, config)
+            .unwrap()
+            .unwrap();
+        let results = reloaded.search(&[0.0, 1.0, 0.0, 0.0], 10).unwrap();
+        assert!(
+            results.iter().all(|(k, _)| k.as_ref() != b"gone"),
+            "hard-deleted vector resurrected as a phantom after reload: {:?}",
+            results
+        );
+        assert!(results.iter().any(|(k, _)| k.as_ref() == b"keep"));
+    }
+
+    #[test]
+    fn deleted_nodes_persist_across_reload_without_intervening_insert() {
+        // Regression test for the `is_dirty()` gating gap: a checkpoint that
+        // only removes vectors (no new inserts since the prior save) must
+        // still persist the deleted-node set, because `remove` now marks
+        // the index dirty just like `insert` does.
+        let dir = tempfile::tempdir().unwrap();
+        let config = HnswConfig::with_dim(4);
+        let index = HnswIndex::new(config.clone());
+
+        index
+            .insert(b"keep".to_vec(), vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        index
+            .insert(b"gone".to_vec(), vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+
+        let index_dir = dir.path().join("index");
+        // First checkpoint: both vectors present, nothing deleted yet.
+        index.save_dirty_chunks(&index_dir).unwrap();
+        index.save_deleted_nodes(&index_dir).unwrap();
+        assert!(
+            !index.is_dirty(),
+            "save_dirty_chunks must clear the dirty flag"
+        );
+
+        // Remove with no further inserts, mirroring a delete-only checkpoint cycle.
+        assert!(index.remove(b"gone"));
+        assert!(
+            index.is_dirty(),
+            "remove() must mark the index dirty so the checkpoint loop saves the deletion"
+        );
+
+        // Second checkpoint, driven purely by the removal.
+        index.save_dirty_chunks(&index_dir).unwrap();
+        index.save_deleted_nodes(&index_dir).unwrap();
+
+        let reloaded = HnswIndex::load_chunked(&index_dir, config)
+            .unwrap()
+            .unwrap();
+        let results = reloaded.search(&[0.0, 1.0, 0.0, 0.0], 10).unwrap();
+        assert!(
+            results.iter().all(|(k, _)| k.as_ref() != b"gone"),
+            "hard-deleted vector resurrected after a delete-only checkpoint cycle: {:?}",
+            results
+        );
+        assert!(results.iter().any(|(k, _)| k.as_ref() == b"keep"));
     }
 }
 

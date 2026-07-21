@@ -60,3 +60,7 @@ cleanup_archived_secs = 2592000     # monthly (30 days)
 discover_connections_secs = 3600    # hourly
 discovery_workers = 2
 discovery_queue_size = 10000
+# When true, active_forgetting hard-deletes memories whose health reaches
+# zero. Defaults to false (archive instead) -- hard deletion on a heuristic
+# is destructive and should be an explicit opt-in.
+active_forgetting_hard_delete = false

@@ -9,12 +9,14 @@
 //! - Engine: High-level storage engine API
 
 pub mod compaction;
+pub mod durable_rename;
 pub mod engine;
 pub(self) mod init;
 pub mod memtable;
 pub(self) mod recovery;
 pub mod sstable;
 pub(self) mod tasks;
+pub(self) mod tmp_sweep;
 pub mod wal;
 
 pub use compaction::{CompactionConfig, CompactionManager};

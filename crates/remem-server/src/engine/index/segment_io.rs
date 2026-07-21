@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::engine::error::{Result, StorageError};
+use crate::engine::storage::durable_rename::durable_rename;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Index type constants
@@ -161,8 +162,9 @@ impl SegmentWriter {
         self.inner.write_all(&self.bytes_written.to_le_bytes())?;
         self.inner.write_all(&crc32.to_le_bytes())?;
         self.inner.flush()?;
+        self.inner.get_ref().sync_all()?;
         drop(self.inner);
-        std::fs::rename(&self.tmp_path, &self.final_path)?;
+        durable_rename(&self.tmp_path, &self.final_path)?;
         Ok(crc32)
     }
 }

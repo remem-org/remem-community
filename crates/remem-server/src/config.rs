@@ -56,10 +56,18 @@ pub struct ServerConfig {
     pub allow_auth_disabled: bool,
     /// Comma-separated allowed CORS origins. Empty = permissive (dev mode).
     pub allowed_origins: Vec<String>,
-    /// Global request rate limit in requests-per-second (0 = disabled).
+    /// Per-client request rate limit in requests-per-second (0 = disabled).
     pub rate_limit_rps: u32,
     /// Burst allowance on top of the per-second rate.
     pub rate_limit_burst: u32,
+    /// When true, rate-limit keying trusts `X-Forwarded-For`/`Forwarded`
+    /// headers (via `SmartIpKeyExtractor`) instead of the TCP peer address.
+    /// Only safe when a trusted reverse proxy strips/overwrites any
+    /// client-supplied value for these headers before forwarding — never
+    /// enable this if remem-server is reachable by any path that bypasses
+    /// that proxy. Must be explicitly opted-in via
+    /// REMEM_TRUST_PROXY_HEADERS=true.
+    pub trust_proxy_headers: bool,
     /// Deployment environment (`REMEM_ENV`); gates dev-only conveniences.
     pub env: Environment,
 }
@@ -104,6 +112,10 @@ pub struct TaskConfig {
     pub discover_connections_secs: u64,
     pub discovery_workers: usize,
     pub discovery_queue_size: usize,
+    /// When true, active_forgetting hard-deletes memories whose health
+    /// reaches zero. Defaults to false (archive instead) -- hard deletion
+    /// on a heuristic is destructive and should be an explicit opt-in.
+    pub active_forgetting_hard_delete: bool,
 }
 
 // ─── TOML file schema ───────────────────────────────────────────────────────
@@ -215,6 +227,8 @@ struct FileTaskConfig {
     discover_connections_secs: u64,
     discovery_workers: usize,
     discovery_queue_size: usize,
+    #[serde(default)]
+    active_forgetting_hard_delete: bool,
 }
 
 impl Default for FileTaskConfig {
@@ -228,6 +242,7 @@ impl Default for FileTaskConfig {
             discover_connections_secs: 60 * 60,
             discovery_workers: 2,
             discovery_queue_size: 10_000,
+            active_forgetting_hard_delete: false,
         }
     }
 }
@@ -321,6 +336,13 @@ pub fn load(args: &Args) -> anyhow::Result<Config> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(50);
 
+    // REMEM_TRUST_PROXY_HEADERS is intentionally env-only (not TOML), same
+    // rationale as REMEM_ALLOW_AUTH_DISABLED: it's a security-relevant
+    // toggle that shouldn't be accidentally committed into a config file.
+    let trust_proxy_headers = std::env::var("REMEM_TRUST_PROXY_HEADERS")
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+
     let env = Environment::from_env();
 
     Ok(Config {
@@ -333,6 +355,7 @@ pub fn load(args: &Args) -> anyhow::Result<Config> {
             allowed_origins,
             rate_limit_rps,
             rate_limit_burst,
+            trust_proxy_headers,
             env,
         },
         storage: StorageConfig {
@@ -363,6 +386,7 @@ pub fn load(args: &Args) -> anyhow::Result<Config> {
             discover_connections_secs: file.tasks.discover_connections_secs,
             discovery_workers: file.tasks.discovery_workers,
             discovery_queue_size: file.tasks.discovery_queue_size,
+            active_forgetting_hard_delete: file.tasks.active_forgetting_hard_delete,
         },
     })
 }
@@ -469,6 +493,7 @@ mod tests {
         assert_eq!(cfg.tasks.active_forgetting_secs, 24 * 3600);
         assert_eq!(cfg.tasks.consolidate_similar_secs, 7 * 24 * 3600);
         assert_eq!(cfg.tasks.cleanup_archived_secs, 30 * 24 * 3600);
+        assert!(!cfg.tasks.active_forgetting_hard_delete);
     }
 
     #[test]
@@ -488,6 +513,25 @@ mod tests {
         let result = cfg.server.allow_auth_disabled;
         // Clean up before asserting so a test failure doesn't poison other tests
         std::env::remove_var("REMEM_ALLOW_AUTH_DISABLED");
+        assert!(result);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn trust_proxy_headers_defaults_to_false_when_env_unset() {
+        std::env::remove_var("REMEM_TRUST_PROXY_HEADERS");
+        let cfg = load(&default_args()).unwrap();
+        assert!(!cfg.server.trust_proxy_headers);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn trust_proxy_headers_true_when_env_var_set() {
+        std::env::set_var("REMEM_TRUST_PROXY_HEADERS", "true");
+        let cfg = load(&default_args()).unwrap();
+        let result = cfg.server.trust_proxy_headers;
+        // Clean up before asserting so a test failure doesn't poison other tests
+        std::env::remove_var("REMEM_TRUST_PROXY_HEADERS");
         assert!(result);
     }
 
