@@ -85,6 +85,47 @@ pub enum SearchType {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortBy {
+    #[default]
+    CreatedAt,
+    AccessedAt,
+}
+
+impl TryFrom<&str> for SortBy {
+    type Error = String;
+
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "created_at" => Ok(SortBy::CreatedAt),
+            "accessed_at" => Ok(SortBy::AccessedAt),
+            other => Err(format!("unknown sort_by: {other}; use created_at or accessed_at")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod sort_by_tests {
+    use super::SortBy;
+
+    #[test]
+    fn parses_known_values() {
+        assert_eq!(SortBy::try_from("created_at").unwrap(), SortBy::CreatedAt);
+        assert_eq!(SortBy::try_from("accessed_at").unwrap(), SortBy::AccessedAt);
+    }
+
+    #[test]
+    fn rejects_unknown_value() {
+        assert!(SortBy::try_from("popularity").is_err());
+    }
+
+    #[test]
+    fn default_is_created_at() {
+        assert_eq!(SortBy::default(), SortBy::CreatedAt);
+    }
+}
+
 // ─── Core data types ─────────────────────────────────────────────────────────
 
 /// What gets stored in the KV store under "memory:{uuid}".

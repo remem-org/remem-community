@@ -1,3 +1,4 @@
+pub mod mcp;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
@@ -102,7 +103,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tasks/:name/run", post(routes::tasks::run_task))
         .route("/api/v1/tasks/:name/history", get(routes::tasks::get_task_history))
         .route("/api/v1/tasks/:name/pause", post(routes::tasks::pause_task))
-        .route("/api/v1/tasks/:name/resume", post(routes::tasks::resume_task));
+        .route("/api/v1/tasks/:name/resume", post(routes::tasks::resume_task))
+        // MCP — Streamable HTTP, mounted here (not under /api/v1) so it gets
+        // the same auth/CORS/rate-limit layers as everything else below,
+        // closing PROJECT_REVIEW.md §7.1 #1 (previously an unauthenticated
+        // proxy on a separate port).
+        .merge(mcp::transport::router());
 
     // Business: Prometheus metrics endpoint (no auth — scraped by Prometheus server)
     #[cfg(feature = "business")]

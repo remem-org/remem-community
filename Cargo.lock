@@ -2320,15 +2320,11 @@ name = "remem-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "clap",
- "futures",
- "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
- "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "uuid",

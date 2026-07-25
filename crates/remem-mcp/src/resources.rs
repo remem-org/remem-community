@@ -60,7 +60,7 @@ pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> any
         }
 
         "collections/recent" => {
-            let data = client.list_memories(limit, offset, None, request_id).await?;
+            let data = client.list_memories(limit, offset, None, None, request_id).await?;
             let empty = vec![];
             let memories = data["memories"].as_array().unwrap_or(&empty);
             let count = memories.len();
@@ -72,7 +72,7 @@ pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> any
         }
 
         "collections/important" => {
-            let data = client.list_memories(200, 0, None, request_id).await?;
+            let data = client.list_memories(200, 0, None, None, request_id).await?;
             let empty = vec![];
             let mut all: Vec<&Value> = data["memories"].as_array().unwrap_or(&empty).iter().collect();
             all.sort_by(|a, b| {

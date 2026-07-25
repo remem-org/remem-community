@@ -1,17 +1,16 @@
 # remem-mcp
 
-MCP server bridging LLM clients to remem-server. Supports stdio and SSE transports. Port 4546 (SSE).
+MCP server bridging LLM clients to remem-server via REST. Stdio transport only — the network (Streamable HTTP) transport now lives in-process inside remem-server at `/mcp` (see crates/remem-server/CLAUDE.md).
 
 ## Source Layout
 
 ```
 src/
-├── main.rs         # Transport selection (--transport stdio|sse), reqwest client init
+├── main.rs         # CLI args, reqwest client init, stdio loop
 ├── handler.rs      # JSON-RPC 2.0 dispatch — routes method names to tools/resources
 ├── tools.rs        # 8 MCP tool implementations
 ├── resources.rs    # 3 MCP resource implementations
-├── protocol.rs     # JSON-RPC 2.0 types (Request, Response, Error, Notification)
-└── sse.rs          # SSE transport (Axum)
+└── protocol.rs     # JSON-RPC 2.0 types (Request, Response, Error, Notification)
 ```
 
 ## MCP Tools
@@ -37,27 +36,30 @@ src/
 
 ## MCP Client Configuration
 
+Run the `remem-mcp` binary directly, pointed at `remem-server`:
+
 ```json
 {
   "mcpServers": {
     "remem": {
-      "command": "docker",
-      "args": ["exec", "-i", "remem-mcp-server", "remem-mcp", "--transport", "stdio"]
+      "command": "cargo",
+      "args": ["run", "--release", "-p", "remem-mcp", "--", "--server-url", "http://localhost:4545"]
     }
   }
 }
 ```
+
+Clients that speak MCP Streamable HTTP directly can skip this binary
+entirely and talk to `remem-server`'s `/mcp` route instead — see
+crates/remem-server/CLAUDE.md.
 
 ## Environment Variables
 
 ```bash
 REMEM_SERVER_URL=http://remem-server:4545   # remem-server endpoint
 REMEM_API_KEY=                               # forwarded as Bearer token (optional)
-MCP_TRANSPORT=sse                            # sse | stdio
 ```
 
 ## Transport Notes
 
-- **stdio**: Single client, no port needed. Used with Claude Desktop / Claude Code MCP config.
-- **SSE**: Multi-client, binds port 4546. Events streamed as `text/event-stream`.
-- Transport selected at startup via `--transport` flag or `MCP_TRANSPORT` env var.
+- **stdio**: Single client, no port needed. Used with Claude Desktop / Claude Code MCP config. The only transport this crate implements.

@@ -2,7 +2,6 @@ mod client;
 mod handler;
 mod protocol;
 mod resources;
-mod sse;
 mod tools;
 
 use std::sync::Arc;
@@ -16,37 +15,15 @@ use tracing_subscriber::EnvFilter;
 use crate::client::RememClient;
 
 #[derive(Parser, Debug)]
-#[command(name = "remem-mcp", about = "Remem MCP server (stdio and SSE transports)")]
+#[command(name = "remem-mcp", about = "Remem MCP server (stdio transport)")]
 struct Args {
     /// URL of the remem-server REST API.
     #[arg(long, env = "REMEM_SERVER_URL", default_value = "http://localhost:4545")]
     server_url: String,
 
-    /// Transport to use: "stdio" or "sse".
-    #[arg(long, env = "MCP_TRANSPORT", default_value = "stdio")]
-    transport: String,
-
-    /// Host for the SSE HTTP server.
-    #[arg(long, env = "MCP_HOST", default_value = "0.0.0.0")]
-    host: String,
-
-    /// Port for the SSE HTTP server.
-    #[arg(long, env = "MCP_PORT", default_value_t = 4546)]
-    port: u16,
-
     /// API key for authenticating with remem-server. Empty = no auth header (dev only).
     #[arg(long, env = "REMEM_API_KEY", default_value = "")]
     api_key: String,
-
-    /// Maximum concurrent SSE sessions before new connections are refused
-    /// with 503 (SSE transport only).
-    #[arg(long, env = "MCP_MAX_SSE_SESSIONS", default_value_t = 1000)]
-    max_sse_sessions: usize,
-
-    /// Idle timeout in seconds for SSE sessions — a session with no
-    /// `/messages` activity for this long is evicted (SSE transport only).
-    #[arg(long, env = "MCP_SSE_IDLE_TIMEOUT_SECS", default_value_t = 1800)]
-    sse_idle_timeout_secs: u64,
 }
 
 fn build_http_client(api_key: &str) -> anyhow::Result<reqwest::Client> {
@@ -80,26 +57,9 @@ async fn main() -> anyhow::Result<()> {
     let client = build_http_client(&args.api_key)?;
     let remem = Arc::new(RememClient::new(client, base_url.clone()));
 
-    tracing::info!(
-        transport = %args.transport,
-        server_url = %base_url,
-        "remem-mcp starting"
-    );
+    tracing::info!(server_url = %base_url, "remem-mcp starting (stdio transport)");
 
-    match args.transport.as_str() {
-        "stdio" => run_stdio(remem).await,
-        "sse" => {
-            sse::run(
-                remem,
-                &args.host,
-                args.port,
-                args.max_sse_sessions,
-                std::time::Duration::from_secs(args.sse_idle_timeout_secs),
-            )
-            .await
-        }
-        other => anyhow::bail!("unknown transport '{other}'; use 'stdio' or 'sse'"),
-    }
+    run_stdio(remem).await
 }
 
 async fn run_stdio(client: Arc<RememClient>) -> anyhow::Result<()> {

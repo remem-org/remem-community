@@ -35,35 +35,6 @@ services:
     networks:
       - remem-network
 
-  # ============================================================
-  # MCP SERVER - remem-mcp
-  # ============================================================
-  remem-mcp:
-    build:
-      context: .
-      dockerfile: docker/remem-mcp.Dockerfile
-    container_name: remem-mcp-server
-    ports:
-      - "4546:4546"
-    environment:
-      - REMEM_SERVER_URL=http://remem-server:4545
-      - MCP_TRANSPORT=sse
-      - MCP_HOST=0.0.0.0
-      - MCP_PORT=4546
-      - REMEM_API_KEY=${REMEM_API_KEY:-}
-    depends_on:
-      remem-server:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4546/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - remem-network
-
 networks:
   remem-network:
     driver: bridge

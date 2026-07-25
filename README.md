@@ -20,14 +20,9 @@ Remem is a high-performance memory system designed for Large Language Models (LL
 
 ```
 ┌──────────────────────────────────────────────┐
-│        remem-mcp  (port 4546)                │
-│  MCP Server — stdio / SSE transport          │
-│  8 tools | 3 resources | JSON-RPC 2.0        │
-└──────────────────────────────────────────────┘
-                      │  HTTP
-┌──────────────────────────────────────────────┐
 │        remem-server  (port 4545)             │
 │  REST API (Axum)                             │
+│  + in-process MCP (Streamable HTTP) at /mcp  │
 │  Memory Manager | Search Engine              │
 │  Connection Manager | Lifecycle Manager      │
 │  Embedding Service (fastembed, MiniLM-L6-v2) │
@@ -35,6 +30,10 @@ Remem is a high-performance memory system designed for Large Language Models (LL
 │  Background Tasks (Tokio)                    │
 └──────────────────────────────────────────────┘
 ```
+
+`remem-mcp` is a separate stdio-only binary for clients that only speak
+stdio MCP; clients that speak Streamable HTTP can talk to `remem-server`'s
+`/mcp` route directly.
 
 ### Storage Engine (embedded in remem-server)
 
@@ -66,11 +65,10 @@ Lifecycle management runs as Tokio tasks inside remem-server — no separate wor
 
 ### Up in 30 seconds
 
-Prebuilt images live in one Docker Hub repo, split by tag prefix:
+Prebuilt image:
 
 ```bash
 docker pull rememorg/remem-community:server-latest
-docker pull rememorg/remem-community:mcp-latest
 docker compose up -d
 
 # Prebuilt binaries: coming soon
@@ -91,8 +89,7 @@ Services started:
 
 | Service | Port | Description |
 |---------|------|--------------|
-| remem-server | 4545 | REST API + storage engine |
-| remem-mcp | 4546 | MCP server (SSE transport) |
+| remem-server | 4545 | REST API + storage engine; MCP Streamable HTTP at `/mcp` |
 
 ### Verify
 
@@ -102,24 +99,34 @@ docker compose ps
 # Core API
 curl http://localhost:4545/api/v1/health
 
-# MCP server
-curl http://localhost:4546/health
+# MCP server (Streamable HTTP, in-process)
+curl -sf -X POST http://localhost:4545/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 ```
 
 ## MCP Tools
 
-Configure `remem-mcp` as an MCP server in Claude Desktop or Claude Code:
+`remem-mcp` is a stdio-only binary, run directly by the client. Two options:
+
+**Option 1: run the `remem-mcp` binary directly (stdio)**
 
 ```json
 {
   "mcpServers": {
     "remem": {
-      "command": "docker",
-      "args": ["exec", "-i", "remem-mcp-server", "remem-mcp", "--transport", "stdio"]
+      "command": "cargo",
+      "args": ["run", "--release", "-p", "remem-mcp", "--", "--server-url", "http://localhost:4545"]
     }
   }
 }
 ```
+
+**Option 2: point a Streamable-HTTP-capable client straight at `remem-server`**
+
+For clients that speak MCP Streamable HTTP directly, skip `remem-mcp`
+entirely and configure the client with the URL `http://localhost:4545/mcp`,
+passing `REMEM_API_KEY` as a bearer token if auth is enabled.
 
 Available tools:
 
@@ -180,7 +187,6 @@ Key settings in `config/remem-server.toml` and `.env`:
 | `REMEM_API_KEY` | _(empty)_ | API key for `remem-server`. Required in production. Empty key returns HTTP 500 unless `REMEM_ALLOW_AUTH_DISABLED=true` is also set. |
 | `REMEM_ALLOW_AUTH_DISABLED` | `false` | Set to `true` to explicitly allow running without an API key (development only). |
 | `RUST_LOG` | `info` | Log filter (trace/debug/info/warn/error) |
-| `MCP_TRANSPORT` | `sse` | MCP transport: `stdio` or `sse` |
 
 Storage engine parameters (in `config/remem-server.toml`):
 
@@ -246,7 +252,7 @@ Write path optimisations (merged 2026-03-26):
 | Embedding service (fastembed, MiniLM) | ✅ Complete |
 | Memory services (CRUD, search, connections, lifecycle) | ✅ Complete |
 | REST API (Axum) | ✅ Complete |
-| MCP server (Rust, stdio + SSE) | ✅ Complete |
+| MCP server (Rust, stdio via remem-mcp + in-process Streamable HTTP at remem-server:/mcp) | ✅ Complete |
 | Background lifecycle tasks (Tokio) | ✅ Complete |
 
 ## Development Utilities

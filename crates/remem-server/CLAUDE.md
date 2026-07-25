@@ -11,6 +11,13 @@ src/
 ├── error.rs
 ├── metrics.rs
 ├── api/                # Axum route handlers
+│   └── mcp/            # In-process MCP server — Streamable HTTP at /mcp
+│       ├── mod.rs      # Module wiring
+│       ├── protocol.rs # JSON-RPC 2.0 types
+│       ├── tools.rs    # 8 MCP tools, calls AppServices directly (no HTTP hop)
+│       ├── resources.rs # memory://stats, collections/*, graph/{id}
+│       ├── handler.rs  # JSON-RPC method dispatch (initialize/ping/tools/resources)
+│       └── transport.rs # Streamable HTTP session management + POST/GET/DELETE /mcp
 ├── services/           # memory_manager, search, connection_manager, lifecycle
 ├── embedding/          # fastembed-rs (MiniLM-L6-v2, 384 dims)
 ├── engine/
@@ -45,7 +52,18 @@ GET    /api/v1/health                Health check (deep: storage + embedding + t
 GET    /api/v1/stats                 System statistics
 GET    /api/v1/tasks                 Background task registry
 POST   /api/v1/tasks/{name}/run      Manually trigger a task
+POST   /mcp                          MCP JSON-RPC (Streamable HTTP, 2025-03-26 spec)
+GET    /mcp                          405 — no server-initiated push streams
+DELETE /mcp                          End an MCP session
 ```
+
+`/mcp` is merged into the `api` router *before* the auth middleware layer
+(`api/mod.rs`), so it inherits the same API-key auth as `/api/v1/*` — see
+`api/mcp/transport.rs`. Session IDs are UUIDs issued on `initialize`, tracked
+in an in-memory map with a 30-minute idle sweep and a 1000-session cap
+(`MAX_SESSIONS` in `transport.rs`; returns 503 past the cap). This is the
+network transport; `crates/remem-mcp/` still exists separately for stdio only
+— see `crates/remem-mcp/CLAUDE.md`.
 
 ## Write-Path Architecture
 

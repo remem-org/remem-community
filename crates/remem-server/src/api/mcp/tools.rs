@@ -1,9 +1,19 @@
 use anyhow::anyhow;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
-use crate::client::RememClient;
+use crate::api::routes::memories::{
+    create_memory_core, validate_create_memory, CreateMemoryRequest, UpdateMemoryRequest,
+    MAX_CONTENT_BYTES, MAX_TAGS,
+};
+use crate::api::AppState;
+use crate::services::memory_manager::UpdatePatch;
+use crate::services::search_engine::SearchQuery;
+use crate::services::types::{MemoryFilters, MemoryType, RelationshipType, SearchType, SortBy};
 
-/// Return the MCP `tools/list` result value.
+/// Return the MCP `tools/list` result value. Schema is identical to
+/// `crates/remem-mcp/src/tools.rs::list()` except `update_memory` now
+/// includes `emotional_valence`/`arousal`/`health` (REM-24 fix).
 pub fn list() -> Value {
     json!({
         "tools": [
@@ -94,7 +104,7 @@ pub fn list() -> Value {
             },
             {
                 "name": "update_memory",
-                "description": "Update an existing memory's content, tags, or importance.",
+                "description": "Update an existing memory's content, tags, importance, or emotional metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -162,20 +172,20 @@ pub fn list() -> Value {
     })
 }
 
-/// Dispatch a `tools/call` request.
-pub async fn call(params: &Value, client: &RememClient, request_id: &str) -> anyhow::Result<Value> {
+/// Dispatch a `tools/call` request against `AppServices` directly (no HTTP hop).
+pub async fn call(params: &Value, state: &AppState) -> anyhow::Result<Value> {
     let name = params["name"].as_str().ok_or_else(|| anyhow!("missing tool name"))?;
     let args = &params["arguments"];
 
     let result = match name {
-        "store_memory" => store_memory(client, args, request_id).await,
-        "search_memories" => search_memories(client, args, request_id).await,
-        "get_memory" => get_memory(client, args, request_id).await,
-        "update_memory" => update_memory(client, args, request_id).await,
-        "delete_memory" => delete_memory(client, args, request_id).await,
-        "find_related" => find_related(client, args, request_id).await,
-        "promote_to_longterm" => promote_to_longterm(client, args, request_id).await,
-        "list_recent_memories" => list_recent_memories(client, args, request_id).await,
+        "store_memory" => store_memory(state, args).await,
+        "search_memories" => search_memories(state, args).await,
+        "get_memory" => get_memory(state, args).await,
+        "update_memory" => update_memory(state, args).await,
+        "delete_memory" => delete_memory(state, args).await,
+        "find_related" => find_related(state, args).await,
+        "promote_to_longterm" => promote_to_longterm(state, args).await,
+        "list_recent_memories" => list_recent_memories(state, args).await,
         other => Err(anyhow!("unknown tool: {other}")),
     };
 
@@ -192,115 +202,194 @@ fn text_content(data: Value) -> Value {
     json!({ "content": [{"type": "text", "text": data.to_string()}] })
 }
 
-async fn store_memory(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let content = args["content"].as_str().ok_or_else(|| anyhow!("content is required"))?;
+fn parse_id(args: &Value) -> anyhow::Result<Uuid> {
+    args["memory_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("memory_id is required"))?
+        .parse::<Uuid>()
+        .map_err(|e| anyhow!("invalid memory_id: {e}"))
+}
 
-    let mut body = json!({
-        "content": content,
-        "memory_type": args.get("memory_type").and_then(|v| v.as_str()).unwrap_or("short_term"),
-        "tags": args.get("tags").cloned().unwrap_or(json!([])),
-        "importance": args.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5),
-    });
-    for field in ["emotional_valence", "arousal", "health", "ttl", "source", "graph_extraction"] {
-        if let Some(value) = args.get(field) {
-            body[field] = value.clone();
-        }
-    }
-
-    let data = client.store_memory(body, request_id).await?;
+async fn store_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let body: CreateMemoryRequest = serde_json::from_value(args.clone())
+        .map_err(|e| anyhow!("invalid store_memory arguments: {e}"))?;
+    validate_create_memory(&body)?;
+    let memory = create_memory_core(state, body).await?;
     Ok(json!({
         "success": true,
-        "memory_id": data["id"],
-        "type": data["memory_type"],
-        "summary": format!("Stored memory {} ({})", data["id"], data["memory_type"])
+        "memory_id": memory.id,
+        "type": memory.memory_type.to_string(),
+        "summary": format!("Stored memory {} ({})", memory.id, memory.memory_type)
     }))
 }
 
-async fn search_memories(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let query = args["query"].as_str().ok_or_else(|| anyhow!("query is required"))?;
+async fn search_memories(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let query_text = args["query"].as_str().ok_or_else(|| anyhow!("query is required"))?;
+    let search_type = match args.get("search_type").and_then(|v| v.as_str()).unwrap_or("hybrid") {
+        "semantic" => SearchType::Semantic,
+        "keyword" => SearchType::Keyword,
+        "hybrid" => SearchType::Hybrid,
+        other => return Err(anyhow!("unknown search_type: {other}; use semantic, keyword, or hybrid")),
+    };
 
-    let mut body = json!({
-        "query": query,
-        "search_type": args.get("search_type").and_then(|v| v.as_str()).unwrap_or("hybrid"),
-        "limit": args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10),
-    });
-    if let Some(f) = args.get("filters") {
-        body["filters"] = f.clone();
-    }
-    if let Some(id) = args.get("related_to").and_then(|v| v.as_str()) {
-        body["related_to"] = json!(id);
-    }
+    let f = args.get("filters");
+    let filters = MemoryFilters {
+        memory_type: f
+            .and_then(|f| f.get("memory_type"))
+            .and_then(|v| v.as_str())
+            .map(MemoryType::try_from)
+            .transpose()
+            .map_err(|e| anyhow!(e))?,
+        tags: f
+            .and_then(|f| f.get("tags"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        min_importance: f.and_then(|f| f.get("importance_min")).and_then(|v| v.as_f64()).map(|v| v as f32),
+        max_importance: f.and_then(|f| f.get("importance_max")).and_then(|v| v.as_f64()).map(|v| v as f32),
+        created_after: None,
+        created_before: None,
+    };
 
-    let data = client.search_memories(body, request_id).await?;
-    let count = data["results"].as_array().map(|a| a.len()).unwrap_or(0);
+    let related_to = args
+        .get("related_to")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+
+    let query = SearchQuery {
+        query: query_text.to_string(),
+        search_type,
+        filters,
+        limit: args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).min(100) as usize,
+        related_to,
+    };
+
+    let results = state.services.search.search(&query).await?;
+    let count = results.len();
     Ok(json!({
         "success": true,
-        "query": query,
+        "query": query_text,
         "results_count": count,
-        "results": data["results"],
+        "results": results,
         "summary": if count > 0 {
-            format!("Found {count} memories for '{query}'")
+            format!("Found {count} memories for '{query_text}'")
         } else {
-            format!("No memories found for '{query}'")
+            format!("No memories found for '{query_text}'")
         }
     }))
 }
 
-async fn get_memory(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let id = args["memory_id"].as_str().ok_or_else(|| anyhow!("memory_id is required"))?;
+async fn get_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let id = parse_id(args)?;
     let include_conn = args.get("include_connections").and_then(|v| v.as_bool()).unwrap_or(false);
-    let data = client.get_memory(id, include_conn, request_id).await?;
-    Ok(json!({"success": true, "memory": data}))
+    let mut memory = state.services.memory.get(id).await?;
+    if include_conn {
+        memory.connections = state.services.memory.fetch_connections(id).await?;
+    }
+    Ok(json!({"success": true, "memory": memory}))
 }
 
-async fn update_memory(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let id = args["memory_id"].as_str().ok_or_else(|| anyhow!("memory_id is required"))?;
+async fn update_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let id = parse_id(args)?;
+    let body: UpdateMemoryRequest = serde_json::from_value(args.clone())
+        .map_err(|e| anyhow!("invalid update_memory arguments: {e}"))?;
 
-    let mut body = serde_json::Map::new();
-    for field in ["content", "tags", "importance", "emotional_valence", "arousal", "health", "source"] {
-        if let Some(v) = args.get(field) {
-            body.insert(field.to_string(), v.clone());
+    if let Some(content) = &body.content {
+        if content.len() > MAX_CONTENT_BYTES {
+            return Err(anyhow!("content exceeds maximum length of {MAX_CONTENT_BYTES} bytes"));
         }
     }
-    if body.is_empty() {
+    if let Some(tags) = &body.tags {
+        if tags.len() > MAX_TAGS {
+            return Err(anyhow!("too many tags: maximum is {MAX_TAGS}, got {}", tags.len()));
+        }
+    }
+
+    let updated_fields: Vec<&'static str> = [
+        ("content", body.content.is_some()),
+        ("tags", body.tags.is_some()),
+        ("importance", body.importance.is_some()),
+        ("emotional_valence", body.emotional_valence.is_some()),
+        ("arousal", body.arousal.is_some()),
+        ("health", body.health.is_some()),
+        ("source", body.source.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+
+    if updated_fields.is_empty() {
         return Err(anyhow!("at least one field to update is required"));
     }
 
-    client.update_memory(id, Value::Object(body.clone()), request_id).await?;
-    let updated: Vec<&String> = body.keys().collect();
-    Ok(json!({"success": true, "memory_id": id, "updated_fields": updated}))
+    let patch = UpdatePatch {
+        content: body.content,
+        tags: body.tags,
+        importance: body.importance,
+        emotional_valence: body.emotional_valence,
+        arousal: body.arousal,
+        health: body.health,
+        source: body.source,
+    };
+    state.services.memory.update(id, patch).await?;
+    Ok(json!({"success": true, "memory_id": id, "updated_fields": updated_fields}))
 }
 
-async fn delete_memory(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let id = args["memory_id"].as_str().ok_or_else(|| anyhow!("memory_id is required"))?;
+async fn delete_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let id = parse_id(args)?;
     let hard = args.get("hard_delete").and_then(|v| v.as_bool()).unwrap_or(false);
-    client.delete_memory(id, hard, request_id).await?;
+    state.services.memory.delete(id, hard).await?;
     let action = if hard { "permanently deleted" } else { "archived" };
     Ok(json!({"success": true, "memory_id": id, "summary": format!("Memory {id} {action}")}))
 }
 
-async fn find_related(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let id = args["memory_id"].as_str().ok_or_else(|| anyhow!("memory_id is required"))?;
-    let depth = args.get("depth").and_then(|v| v.as_i64()).unwrap_or(1);
-    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
-    let data = client.find_related(id, depth, limit, request_id).await?;
-    let count = data["related"].as_array().map(|a| a.len()).unwrap_or(0);
-    Ok(json!({"success": true, "source_memory_id": id, "results_count": count, "related_memories": data["related"]}))
+async fn find_related(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let id = parse_id(args)?;
+    let depth = (args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize).min(5);
+    let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize).min(100);
+
+    let types: Vec<RelationshipType> = Vec::new(); // no filter — matches existing MCP tool behavior
+    let pairs = state.services.connection.find_related(id, depth, &types).await?;
+    let related: Vec<Value> = pairs
+        .into_iter()
+        .take(limit)
+        .map(|(memory, connection)| json!({"memory": memory, "connection": connection}))
+        .collect();
+    let count = related.len();
+    Ok(json!({
+        "success": true,
+        "source_memory_id": id,
+        "results_count": count,
+        "related_memories": related
+    }))
 }
 
-async fn promote_to_longterm(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let id = args["memory_id"].as_str().ok_or_else(|| anyhow!("memory_id is required"))?;
-    client.promote_to_longterm(id, request_id).await?;
+async fn promote_to_longterm(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let id = parse_id(args)?;
+    state.services.lifecycle.promote(id).await?;
     Ok(json!({"success": true, "memory_id": id, "summary": format!("Memory {id} promoted to long_term")}))
 }
 
-async fn list_recent_memories(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
-    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
-    let memory_type = args.get("memory_type").and_then(|v| v.as_str());
-    let sort_by = args.get("sort_by").and_then(|v| v.as_str());
-    let data = client.list_memories(limit, 0, memory_type, sort_by, request_id).await?;
-    let count = data["memories"].as_array().map(|a| a.len()).unwrap_or(0);
-    Ok(json!({"success": true, "count": count, "total": data["total"], "memories": data["memories"]}))
+async fn list_recent_memories(state: &AppState, args: &Value) -> anyhow::Result<Value> {
+    let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
+    let memory_type = args
+        .get("memory_type")
+        .and_then(|v| v.as_str())
+        .map(MemoryType::try_from)
+        .transpose()
+        .map_err(|e| anyhow!(e))?;
+    let sort_by = args
+        .get("sort_by")
+        .and_then(|v| v.as_str())
+        .map(SortBy::try_from)
+        .transpose()
+        .map_err(|e| anyhow!(e))?
+        .unwrap_or_default();
+
+    let filters = MemoryFilters { memory_type, ..Default::default() };
+    let (memories, total) = state.services.memory.list(&filters, sort_by, limit, 0).await?;
+    let count = memories.len();
+    Ok(json!({"success": true, "count": count, "total": total, "memories": memories}))
 }
 
 #[cfg(test)]
@@ -308,13 +397,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tools_list_contains_all_eight_tools() {
+        let list = list();
+        let tools = list["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        let expected = [
+            "store_memory", "search_memories", "get_memory", "update_memory",
+            "delete_memory", "find_related", "promote_to_longterm", "list_recent_memories",
+        ];
+        for name in expected {
+            assert!(names.contains(&name), "missing tool: {name}");
+        }
+        assert_eq!(tools.len(), expected.len());
+    }
+
+    #[test]
     fn update_memory_schema_includes_emotional_fields() {
-        let schema = list();
-        let tools = schema["tools"].as_array().unwrap();
+        let list = list();
+        let tools = list["tools"].as_array().unwrap();
         let update = tools.iter().find(|t| t["name"] == "update_memory").unwrap();
         let props = &update["inputSchema"]["properties"];
         assert!(props.get("emotional_valence").is_some());
         assert!(props.get("arousal").is_some());
         assert!(props.get("health").is_some());
+    }
+
+    #[test]
+    fn list_recent_memories_schema_advertises_sort_by() {
+        let list = list();
+        let tools = list["tools"].as_array().unwrap();
+        let lrm = tools.iter().find(|t| t["name"] == "list_recent_memories").unwrap();
+        let sort_by_enum = lrm["inputSchema"]["properties"]["sort_by"]["enum"].as_array().unwrap();
+        assert!(sort_by_enum.contains(&json!("created_at")));
+        assert!(sort_by_enum.contains(&json!("accessed_at")));
+    }
+
+    #[test]
+    fn parse_id_rejects_non_uuid() {
+        assert!(parse_id(&json!({"memory_id": "not-a-uuid"})).is_err());
+    }
+
+    #[test]
+    fn parse_id_requires_memory_id_field() {
+        assert!(parse_id(&json!({})).is_err());
     }
 }

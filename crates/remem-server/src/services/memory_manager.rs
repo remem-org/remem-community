@@ -8,7 +8,7 @@ use crate::error::{AppError, Result};
 use crate::services::connection_manager::DiscoveryTask;
 use crate::services::repository::MemoryRepository;
 use crate::services::types::{
-    memory_key, now_ms, Connection, Memory, MemoryFilters, MemoryType, StoredMemory,
+    memory_key, now_ms, Connection, Memory, MemoryFilters, MemoryType, SortBy, StoredMemory,
     StoredMetadata,
 };
 
@@ -250,10 +250,13 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// List memories ordered by creation time (newest first), with optional filters.
+    /// List memories matching `filters`, sorted by `sort_by` (ascending —
+    /// matches the existing default order; see the plan doc for why this
+    /// isn't "newest first" despite the field name).
     pub async fn list(
         &self,
         filters: &MemoryFilters,
+        sort_by: SortBy,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<Memory>, usize)> {
@@ -263,6 +266,40 @@ impl MemoryManager {
         // miss entries that sit at the tail of the newest-first sort order.
         let entries = self.repo.engine.time_range_query(0, u64::MAX, None)?;
 
+        if sort_by == SortBy::AccessedAt {
+            // Sorting by accessed_at isn't the natural iteration order, so the
+            // full matching set has to be materialized before it can be sorted.
+            let mut matched: Vec<StoredMemory> = Vec::new();
+            for (_ts, key_bytes) in entries {
+                let key = key_bytes.as_ref();
+                let Some(stored) = self.repo.load_by_key(key).await? else {
+                    continue;
+                };
+                if stored.archived {
+                    continue;
+                }
+                if !matches_filters(&stored, filters) {
+                    continue;
+                }
+                matched.push(stored);
+            }
+
+            matched.sort_by_key(|s| s.metadata.accessed_at);
+
+            let total = matched.len();
+            let memories = matched
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|s| s.into_api(Vec::new()))
+                .collect();
+
+            return Ok((memories, total));
+        }
+
+        // Default (created_at / natural iteration) order: stream and truncate
+        // eagerly so we never hold more than `limit` converted Memory objects
+        // in memory, regardless of how many entries match the filters.
         let mut memories: Vec<Memory> = Vec::new();
         let mut total = 0usize;
         let mut seen = 0usize;

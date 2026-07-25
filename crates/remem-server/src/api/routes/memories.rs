@@ -9,11 +9,11 @@ use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::error::{AppError, ErrorResponse, Result};
-use crate::services::types::{Memory, MemoryFilters, MemoryType, RelationshipType};
+use crate::services::types::{Memory, MemoryFilters, MemoryType, RelationshipType, SortBy};
 use crate::services::memory_manager::CreateOpts;
 
-const MAX_CONTENT_BYTES: usize = 100_000;
-const MAX_TAGS: usize = 50;
+pub(crate) const MAX_CONTENT_BYTES: usize = 100_000;
+pub(crate) const MAX_TAGS: usize = 50;
 const MAX_GRAPH_ENTITIES: usize = 100;
 const MAX_GRAPH_RELATIONSHIPS: usize = 200;
 
@@ -37,6 +37,16 @@ fn deserialize_opt_memory_type<'de, D: Deserializer<'de>>(d: D) -> std::result::
     match s {
         None => Ok(None),
         Some(s) => MemoryType::try_from(s.as_str()).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// Deserialize an optional `SortBy` from a string, returning a clear error
+/// on unknown values instead of propagating a generic 500.
+fn deserialize_opt_sort_by<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<SortBy>, D::Error> {
+    let s: Option<String> = Option::deserialize(d)?;
+    match s {
+        None => Ok(None),
+        Some(s) => SortBy::try_from(s.as_str()).map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -130,6 +140,9 @@ pub struct ListQuery {
     #[serde(default, deserialize_with = "deserialize_opt_rfc3339_ms")]
     pub created_before: Option<u64>,
     pub include_connections: Option<bool>,
+    /// Sort order: created_at (default) or accessed_at.
+    #[serde(default, deserialize_with = "deserialize_opt_sort_by")]
+    pub sort_by: Option<SortBy>,
 }
 
 #[derive(Deserialize)]
@@ -158,21 +171,7 @@ pub struct DeleteResponse {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-#[utoipa::path(
-    post,
-    path = "/api/v1/memories",
-    request_body = CreateMemoryRequest,
-    responses(
-        (status = 201, description = "Memory created", body = Memory),
-        (status = 422, description = "Validation error", body = ErrorResponse),
-        (status = 500, description = "Embedding or storage error", body = ErrorResponse),
-    ),
-    tag = "memories"
-)]
-pub async fn create_memory(
-    State(state): State<AppState>,
-    Json(body): Json<CreateMemoryRequest>,
-) -> Result<(StatusCode, Json<Memory>)> {
+pub(crate) fn validate_create_memory(body: &CreateMemoryRequest) -> Result<()> {
     if body.content.trim().is_empty() {
         return Err(AppError::Validation("content must not be empty".into()));
     }
@@ -200,7 +199,13 @@ pub async fn create_memory(
             )));
         }
     }
+    Ok(())
+}
 
+/// Create a memory, process optional graph extraction, and fire auto-discovery.
+/// Shared by the REST handler below and the in-process MCP `store_memory` tool
+/// (`crate::api::mcp::tools`) so the two transports can never drift on behavior.
+pub(crate) async fn create_memory_core(state: &AppState, body: CreateMemoryRequest) -> Result<Memory> {
     let memory_type = body
         .memory_type
         .as_deref()
@@ -224,7 +229,7 @@ pub async fn create_memory(
     let (memory, embedding) = state.services.memory.create(&body.content, opts).await?;
 
     if let Some(extraction) = graph_extraction {
-        if let Err(e) = process_graph_extraction(&state, memory.id, &extraction).await {
+        if let Err(e) = process_graph_extraction(state, memory.id, &extraction).await {
             tracing::warn!(memory_id = %memory.id, error = %e, "graph extraction processing failed");
         }
     }
@@ -253,6 +258,26 @@ pub async fn create_memory(
         }
     }
 
+    Ok(memory)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/memories",
+    request_body = CreateMemoryRequest,
+    responses(
+        (status = 201, description = "Memory created", body = Memory),
+        (status = 422, description = "Validation error", body = ErrorResponse),
+        (status = 500, description = "Embedding or storage error", body = ErrorResponse),
+    ),
+    tag = "memories"
+)]
+pub async fn create_memory(
+    State(state): State<AppState>,
+    Json(body): Json<CreateMemoryRequest>,
+) -> Result<(StatusCode, Json<Memory>)> {
+    validate_create_memory(&body)?;
+    let memory = create_memory_core(&state, body).await?;
     Ok((StatusCode::CREATED, Json(memory)))
 }
 
@@ -368,6 +393,7 @@ pub async fn delete_memory(
         ("created_after" = Option<String>, Query, description = "RFC-3339 timestamp lower bound"),
         ("created_before" = Option<String>, Query, description = "RFC-3339 timestamp upper bound"),
         ("include_connections" = Option<bool>, Query, description = "Include connection lists"),
+        ("sort_by" = Option<String>, Query, description = "Sort order: created_at (default) or accessed_at"),
     ),
     responses(
         (status = 200, description = "Paginated memory list", body = MemoryListResponse),
@@ -380,11 +406,12 @@ pub async fn list_memories(
 ) -> Result<Json<MemoryListResponse>> {
     let limit = q.limit.unwrap_or(10).min(100);
     let offset = q.offset.unwrap_or(0);
+    let sort_by = q.sort_by.unwrap_or_default();
 
     let filters = build_filters(&q);
     let include_connections = q.include_connections.unwrap_or(false);
 
-    let (mut memories, total) = state.services.memory.list(&filters, limit, offset).await?;
+    let (mut memories, total) = state.services.memory.list(&filters, sort_by, limit, offset).await?;
 
     if include_connections {
         for mem in &mut memories {

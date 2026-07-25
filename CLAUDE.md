@@ -56,9 +56,9 @@ src/business/
 
 The script rsyncs relevant files (per `.editions/<edition>.exclude`), patches `Cargo.toml` feature defaults, copies the edition-specific `docker-compose.yml`, then creates a squashed commit + tag in the target repo. `.github/` is always stripped from the target — edition repos are source snapshots only, no CI/CD runs there.
 
-This publishes a **source snapshot** only. The Docker images that `DEVELOPER_GUIDE.md`
-tells users to `docker pull` (`rememorg/remem-community:server-latest`,
-`rememorg/remem-community:mcp-latest`) are published from **this** dev repo via
+This publishes a **source snapshot** only. The Docker image that `DEVELOPER_GUIDE.md`
+tells users to `docker pull` (`rememorg/remem-community:server-latest`) is published
+from **this** dev repo via
 [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
 (manual `workflow_dispatch` only) — see
 [`docs/DOCKER_HUB_PUBLISHING.md`](docs/DOCKER_HUB_PUBLISHING.md).
@@ -81,7 +81,7 @@ Community PRs apply cleanly because community repo files are byte-identical to d
 ### Edition tooling files
 
 ```
-docker-compose.community.yml   # remem-server + remem-mcp only, no backoffice
+docker-compose.community.yml   # remem-server only (MCP mounted in-process at /mcp), no backoffice
 docker-compose.business.yml    # community + backoffice + observability
 
 .editions/
@@ -110,16 +110,17 @@ Remem is a persistent memory system for LLMs and AI agents. It provides semantic
 
 ```
 ┌──────────────────────────────────────────────┐
-│        remem-mcp  (port 4546)                │
-│  MCP Server — stdio / SSE transport          │
+│        remem-mcp                              │
+│  MCP Server — stdio transport only            │
 │  8 tools | 3 resources | JSON-RPC 2.0        │
 │  crates/remem-mcp/  (Rust)                   │
 │  → crates/remem-mcp/CLAUDE.md               │
 └──────────────────────────────────────────────┘
-                      │  HTTP
+                      │  REST (HTTP)
 ┌──────────────────────────────────────────────┐
 │        remem-server  (port 4545)             │
 │  REST API (Axum) + embedded storage engine   │
+│  + in-process MCP (Streamable HTTP) at /mcp  │
 │  HNSW | CSR Graph | BTree | InvertedTag | LSM│
 │  crates/remem-server/  (Rust)                │
 │  → crates/remem-server/CLAUDE.md            │
@@ -141,7 +142,7 @@ remem/
 ├── Cargo.toml                  # Workspace root
 ├── crates/
 │   ├── remem-server/           # REST API + embedded storage engine
-│   └── remem-mcp/              # MCP server (stdio + SSE)
+│   └── remem-mcp/              # MCP server (stdio only; network transport lives in remem-server at /mcp)
 ├── src/backoffice/
 │   ├── backend/                # FastAPI (Python)
 │   └── frontend/               # React + TypeScript (Vite)
@@ -163,7 +164,7 @@ remem/
 
 ### Core (Rust)
 - **remem-server**: Axum, fastembed-rs (all-MiniLM-L6-v2, 384 dims), Tokio
-- **remem-mcp**: reqwest (HTTP client to remem-server), Axum (SSE transport)
+- **remem-mcp**: reqwest (HTTP client to remem-server), stdio transport only
 - **Storage**: HNSW, CSR graph, LSM-tree — all in-process, no external DB
 
 ### Backoffice (Python + TypeScript)
@@ -174,8 +175,8 @@ remem/
 
 | Service | Port | Description |
 |---------|------|-------------|
-| remem-mcp | 4546 | MCP server (stdio + SSE) |
-| remem-server | 4545 | REST API + embedded storage |
+| remem-mcp | — | MCP server, stdio only (no listening port) |
+| remem-server | 4545 | REST API + embedded storage; MCP Streamable HTTP at /mcp |
 | backoffice-frontend | 3000 | React SPA |
 | backoffice-backend | 8002 | FastAPI proxy |
 | backoffice-postgres | 5433 | Backoffice DB (host port) |
@@ -194,7 +195,7 @@ cargo clippy --all-targets -- -D warnings
 # Start all services (business edition: everything, or use ./run-business)
 docker compose -f docker-compose.business.yml up -d
 
-# Community edition only (remem-server + remem-mcp, or use ./run-community)
+# Community edition only (remem-server, MCP mounted in-process at /mcp; or use ./run-community)
 docker compose -f docker-compose.community.yml up -d
 
 # Backoffice services only (business edition)
@@ -207,7 +208,6 @@ docker compose -f docker-compose.business.yml logs -f backoffice-backend
 
 # Health checks
 curl http://localhost:4545/api/v1/health
-curl http://localhost:4546/health
 curl http://localhost:8002/api/v1/health
 
 # Clean slate
@@ -220,7 +220,6 @@ docker compose -f docker-compose.business.yml down -v
 REMEM_API_KEY=          # Optional; leave empty to disable auth
 RUST_LOG=info
 REMEM_SERVER_URL=http://remem-server:4545
-MCP_TRANSPORT=sse
 JWT_SECRET_KEY=<generate with: openssl rand -hex 32>
 REMEM_CORS_ORIGINS=     # Required in production compose
 ```
@@ -278,7 +277,7 @@ All storage embedded in remem-server: HNSW (vector search), CSR Graph (relations
 | Embedding service (fastembed, MiniLM) | ✅ |
 | Memory services (CRUD, search, connections, lifecycle) | ✅ |
 | REST API (Axum) | ✅ |
-| MCP server (Rust, stdio + SSE) | ✅ |
+| MCP server (Rust, stdio via remem-mcp + in-process Streamable HTTP at remem-server:/mcp) | ✅ |
 | Background lifecycle tasks (Tokio) | ✅ |
 | Backoffice backend (FastAPI) | ✅ Phases 1–3, 9–11 |
 | Backoffice frontend (React) | ✅ Phases 2, 4–11 |
@@ -298,7 +297,10 @@ All storage embedded in remem-server: HNSW (vector search), CSR Graph (relations
 **Next**: Phase 16 — LLM-Powered Background Intelligence. See
 [docs/PROJECT_REVIEW.md](docs/PROJECT_REVIEW.md) for the current backlog
 (security, durability, product, performance) ordered into an implementation
-roadmap — Phase 0 of that roadmap is in progress.
+roadmap — that roadmap's Phase 1 (durability correctness, REM-13..20,
+released as v0.2.0, see §2.4) and Phase 2 (MCP transport migration +
+container merge, REM-21/22/23/24, see below) are both complete; Phase 0
+(config/narrow-diff security) is in progress.
 
 ## Roadmap
 
@@ -310,4 +312,20 @@ roadmap — Phase 0 of that roadmap is in progress.
 | 15 | Active Forgetting | ✅ **Complete.** `health` score (0–100); daily decay in `lifecycle_manager::active_forgetting`; retrieval boosts health; hard delete at health=0 (see docs/PROJECT_REVIEW.md §2.1 #11 — hard-delete-on-heuristic is flagged for a default-to-archive change) |
 | 16 | LLM-Powered Background Intelligence | Dreaming cycle; constructive retrieval (`narrative` mode); requires LLM API key or local Ollama |
 | 17 | Associative Wandering | Background task walks memory graph; creates `REALIZATION` memories; new MCP resource `memory://insights/pending` |
+
+_Note: the phase numbers above track this repo's own feature roadmap (Rust
+rewrite → backoffice → emotional/forgetting layers). [docs/PROJECT_REVIEW.md](docs/PROJECT_REVIEW.md)
+tracks a separate, numbered implementation roadmap (§8: security, durability,
+product, performance). That roadmap's **Phase 2 — MCP transport migration +
+container merge — is complete** (REM-21/22/23/24): SSE→Streamable HTTP
+migration, in-process `/mcp` mount behind auth, MCP tool schema fixes
+(emotional fields on `update_memory`, `sort_by` forwarding), and the
+docker-compose/Docker-image collapse to a single `remem-server` container
+(`docker/remem-mcp.Dockerfile` and its CI/publish-script steps deleted,
+`remem-mcp` now stdio-only and run by the user directly). Commits
+`c7536a5..6919196` on `main`
+(`docs/superpowers/plans/2026-07-22-mcp-inprocess-transport-migration.md` +
+`docs/superpowers/plans/2026-07-22-mcp-container-merge-cleanup.md`), plus this
+documentation sweep — matching the citation convention used for that
+roadmap's Phase 1 in [docs/PROJECT_REVIEW.md](docs/PROJECT_REVIEW.md) §2.4._
 

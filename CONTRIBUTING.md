@@ -10,11 +10,11 @@ Remem is developed in a private dev repository and released to this community re
 
 The community edition contains:
 
-- `crates/remem-server/` — REST API and embedded storage engine (Rust)
-- `crates/remem-mcp/` — MCP server (Rust)
+- `crates/remem-server/` — REST API, embedded storage engine, and in-process MCP endpoint (`/mcp`) (Rust)
+- `crates/remem-mcp/` — MCP stdio client, for the remote/local-process topology (Rust)
 - `config/remem-server.toml` — storage configuration
-- `docker/remem-server.Dockerfile`, `docker/remem-mcp.Dockerfile`
-- `docker-compose.yml` — core services only
+- `docker/remem-server.Dockerfile`
+- `docker-compose.yml` — core service only
 - `tests/durability/` — durability and correctness tests
 - `scripts/generate_memories.py`
 

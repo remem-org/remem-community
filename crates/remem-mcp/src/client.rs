@@ -165,12 +165,13 @@ impl RememClient {
         Ok(())
     }
 
-    /// `GET /api/v1/memories` — list memories with pagination and optional type filter.
+    /// `GET /api/v1/memories` — list memories with pagination, type filter, and sort order.
     pub async fn list_memories(
         &self,
         limit: i64,
         offset: i64,
         memory_type: Option<&str>,
+        sort_by: Option<&str>,
         request_id: &str,
     ) -> anyhow::Result<Value> {
         let mut query: Vec<(&str, String)> = vec![
@@ -179,6 +180,9 @@ impl RememClient {
         ];
         if let Some(mt) = memory_type {
             query.push(("memory_type", mt.to_string()));
+        }
+        if let Some(sb) = sort_by {
+            query.push(("sort_by", sb.to_string()));
         }
         let resp = self
             .get("/api/v1/memories", request_id)

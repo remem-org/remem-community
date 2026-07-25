@@ -4,23 +4,18 @@ Remem is a persistent memory system for LLMs and AI agents. It stores memories w
 vector embeddings, automatically discovers connections between them, and exposes
 everything through the Model Context Protocol (MCP) as well as a plain REST API.
 
-This guide covers the **Community Edition**: the open-source core made up of two
-Rust services, `remem-server` and `remem-mcp`. It does not cover the web-based
-Backoffice admin UI, Prometheus/Grafana observability, or RBAC/multi-database
-features — those ship in the Business Edition.
+This guide covers the **Community Edition**: the open-source core, a single
+Rust service (`remem-server`) that also exposes an MCP endpoint in-process. It
+does not cover the web-based Backoffice admin UI, Prometheus/Grafana
+observability, or RBAC/multi-database features — those ship in the Business
+Edition.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────┐
-│        remem-mcp   (port 4546)               │
-│  MCP Server — stdio / SSE transport          │
-│  8 tools | 3 resources | JSON-RPC 2.0        │
-└──────────────────────────────────────────────┘
-                      │  HTTP
-┌──────────────────────────────────────────────┐
 │        remem-server   (port 4545)            │
-│  REST API (Axum)                             │
+│  REST API (Axum) + in-process MCP at /mcp    │
 │  Memory Manager | Search Engine              │
 │  Connection Manager | Lifecycle Manager      │
 │  Embedding Service (fastembed, MiniLM-L6-v2) │
@@ -29,9 +24,15 @@ features — those ship in the Business Edition.
 └──────────────────────────────────────────────┘
 ```
 
-`remem-mcp` is a thin protocol adapter — it holds no data itself. All state lives in
-`remem-server`, which embeds its own storage engine directly in-process (no external
-database, no Qdrant/Postgres/Redis dependency for the core).
+The in-process MCP mount at `/mcp` (Streamable HTTP, JSON-RPC 2.0) is now the
+primary way to reach MCP tools/resources — it calls into `remem-server`'s
+services directly, with no separate process or HTTP hop. The `remem-mcp`
+binary still exists as a thin, stateless stdio adapter for the
+remote/local-process topology (an LLM client that spawns a local process
+against a remote `remem-server`) — see [Connecting an LLM client via
+MCP](#connecting-an-llm-client-via-mcp) below. All state lives in
+`remem-server`, which embeds its own storage engine directly in-process (no
+external database, no Qdrant/Postgres/Redis dependency for the core).
 
 ### Storage engine
 
@@ -76,14 +77,13 @@ this promotion only happens at creation time — raising `arousal` past `0.8` vi
 - Docker and Docker Compose
 - 2GB+ RAM free
 
-### 1. Pull the images
+### 1. Pull the image
 
-Both images live in a single Docker Hub repository, `rememorg/remem-community`,
-distinguished by tag prefix (`server-*` / `mcp-*`):
+`remem-server` is published to a single Docker Hub repository,
+`rememorg/remem-community`, tagged `server-*`:
 
 ```bash
 docker pull rememorg/remem-community:server-latest
-docker pull rememorg/remem-community:mcp-latest
 ```
 
 ### 2. Create a compose file
@@ -110,20 +110,6 @@ services:
       retries: 3
       start_period: 60s
     restart: unless-stopped
-
-  remem-mcp:
-    image: rememorg/remem-community:mcp-latest
-    container_name: remem-mcp-server
-    ports:
-      - "4546:4546"
-    environment:
-      - REMEM_SERVER_URL=http://remem-server:4545
-      - MCP_TRANSPORT=sse
-      - REMEM_API_KEY=${REMEM_API_KEY:-}
-    depends_on:
-      remem-server:
-        condition: service_healthy
-    restart: unless-stopped
 ```
 
 Download the default config into `./config/remem-server.toml` — see
@@ -144,7 +130,11 @@ model loads on first boot; give it a minute before expecting `healthy`.
 
 ```bash
 curl http://localhost:4545/api/v1/health
-curl http://localhost:4546/health
+
+# MCP (Streamable HTTP, in-process)
+curl -sf -X POST http://localhost:4545/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 ```
 
 ### 5. Store and search a memory
@@ -164,22 +154,29 @@ call except `/api/v1/health`.
 
 ## Connecting an LLM client via MCP
 
-`remem-mcp` speaks JSON-RPC 2.0 over stdio or SSE. To use it from Claude Desktop or
-Claude Code, exec into the running container over stdio:
+`remem-server` speaks MCP JSON-RPC 2.0 over Streamable HTTP at `/mcp` — there is no
+compose-managed MCP container to `docker exec` into. Two ways to connect:
+
+**Option 1: a client that speaks Streamable HTTP directly** — point it at
+`http://localhost:4545/mcp`, passing `REMEM_API_KEY` as a bearer token if auth is
+enabled. No extra process needed.
+
+**Option 2: a client that only speaks stdio** — run the `remem-mcp` binary yourself,
+pointed at whichever `remem-server` (local or remote) you want:
 
 ```json
 {
   "mcpServers": {
     "remem": {
-      "command": "docker",
-      "args": ["exec", "-i", "remem-mcp-server", "remem-mcp", "--transport", "stdio"]
+      "command": "cargo",
+      "args": ["run", "--release", "-p", "remem-mcp", "--", "--server-url", "http://localhost:4545"]
     }
   }
 }
 ```
 
-For a client that speaks SSE directly, point it at `http://localhost:4546` instead —
-no exec needed.
+`remem-mcp` is a thin stdio-to-REST adapter; it holds no state of its own and
+forwards every call to `remem-server`'s REST API.
 
 ### MCP tools
 
@@ -425,8 +422,7 @@ and the active-forgetting task under [Background tasks](#background-tasks).
 | `REMEM_ALLOW_AUTH_DISABLED` | `false` | Set `true` to explicitly allow running with no API key (development only). |
 | `REMEM_CORS_ORIGINS` | _(empty)_ | Comma-separated allowed CORS origins. |
 | `RUST_LOG` | `info` | Log filter: `trace`/`debug`/`info`/`warn`/`error`. |
-| `REMEM_SERVER_URL` | `http://remem-server:4545` | `remem-mcp` → `remem-server` endpoint. |
-| `MCP_TRANSPORT` | `sse` | `stdio` or `sse`. |
+| `REMEM_SERVER_URL` | `http://remem-server:4545` | Only relevant when running `remem-mcp` standalone for stdio — the `remem-server` endpoint it forwards calls to. Not used by `remem-server` itself. |
 
 ### `config/remem-server.toml`
 

@@ -98,16 +98,7 @@ pub async fn ready(
     )
 }
 
-#[utoipa::path(
-    get,
-    path = "/api/v1/stats",
-    responses(
-        (status = 200, description = "Memory and connection counts", body = StatsResponse),
-        (status = 500, description = "Storage error", body = ErrorResponse),
-    ),
-    tag = "system"
-)]
-pub async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>> {
+pub(crate) async fn compute_stats(state: &AppState) -> Result<Stats> {
     // Walk all BTree entries and verify each against KV. time_range_query with no
     // limit returns every entry regardless of count, avoiding the truncation bug
     // that time_latest(btree_count + 64) introduced when btree_count lagged the
@@ -156,16 +147,27 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>>
         }
     }
 
-    Ok(Json(StatsResponse {
-        success: true,
-        stats: Stats {
-            total_memories: total,
-            short_term_memories: short_term,
-            long_term_memories: long_term,
-            total_connections,
-            avg_importance,
-        },
-    }))
+    Ok(Stats {
+        total_memories: total,
+        short_term_memories: short_term,
+        long_term_memories: long_term,
+        total_connections,
+        avg_importance,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/stats",
+    responses(
+        (status = 200, description = "Memory and connection counts", body = StatsResponse),
+        (status = 500, description = "Storage error", body = ErrorResponse),
+    ),
+    tag = "system"
+)]
+pub async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>> {
+    let stats = compute_stats(&state).await?;
+    Ok(Json(StatsResponse { success: true, stats }))
 }
 
 #[utoipa::path(

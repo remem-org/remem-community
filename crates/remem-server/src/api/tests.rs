@@ -37,7 +37,7 @@ use crate::{
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
-async fn make_test_app() -> (axum::Router, tempfile::TempDir) {
+async fn make_test_app() -> (axum::Router, AppState, tempfile::TempDir) {
     let tmpdir = tempfile::tempdir().expect("tempdir");
 
     let engine_cfg = EngineConfig {
@@ -109,7 +109,7 @@ async fn make_test_app() -> (axum::Router, tempfile::TempDir) {
         .expect("services (requires embedding model — run with FASTEMBED_CACHE_PATH set)");
 
     let state = AppState { services, config: Arc::new(cfg) };
-    (build_router(state), tmpdir)
+    (build_router(state.clone()), state, tmpdir)
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -147,7 +147,7 @@ fn delete(uri: &str) -> Request<Body> {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn health_returns_healthy() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let resp = app.oneshot(get("/api/v1/health")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
@@ -159,7 +159,7 @@ async fn health_returns_healthy() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn stats_returns_counts() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let resp = app.oneshot(get("/api/v1/stats")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
@@ -172,7 +172,7 @@ async fn stats_returns_counts() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn create_memory_returns_memory_object() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     let resp = app
         .oneshot(post_json(
@@ -201,7 +201,7 @@ async fn create_memory_returns_memory_object() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn create_long_term_memory() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     let resp = app
         .oneshot(post_json(
@@ -225,7 +225,7 @@ async fn create_long_term_memory() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn get_memory_by_id() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Create
     let create_resp = app
@@ -253,7 +253,7 @@ async fn get_memory_by_id() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn get_nonexistent_memory_returns_404() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let fake = "00000000-0000-0000-0000-000000000000";
     let resp = app
         .oneshot(get(&format!("/api/v1/memories/{fake}")))
@@ -265,7 +265,7 @@ async fn get_nonexistent_memory_returns_404() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn update_memory_content_and_importance() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Create
     let create_resp = app
@@ -310,7 +310,7 @@ async fn update_memory_content_and_importance() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn soft_delete_memory() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Create
     let create_resp = app
@@ -345,7 +345,7 @@ async fn soft_delete_memory() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn list_memories_returns_created_memories() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Create 3 memories
     for i in 0..3 {
@@ -368,12 +368,281 @@ async fn list_memories_returns_created_memories() {
     assert!(memories.len() >= 3);
 }
 
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn list_memories_sort_by_accessed_at_reorders_by_last_access() {
+    let (app, _state, _dir) = make_test_app().await;
+
+    // Create two memories; "first" is created before "second".
+    let first_id = {
+        let resp = app.clone().oneshot(post_json(
+            "/api/v1/memories",
+            serde_json::json!({"content": "first memory"}),
+        )).await.unwrap();
+        body_json(resp).await["id"].as_str().unwrap().to_owned()
+    };
+    let second_id = {
+        let resp = app.clone().oneshot(post_json(
+            "/api/v1/memories",
+            serde_json::json!({"content": "second memory"}),
+        )).await.unwrap();
+        body_json(resp).await["id"].as_str().unwrap().to_owned()
+    };
+
+    // Touch "first" via GET so its accessed_at becomes the most recent.
+    app.clone().oneshot(get(&format!("/api/v1/memories/{first_id}"))).await.unwrap();
+
+    // sort_by=accessed_at sorts ascending (oldest-accessed first). "second"
+    // was never touched after creation, so its accessed_at predates "first"'s
+    // just-bumped accessed_at — "second" must sort before "first".
+    let resp = app
+        .oneshot(get("/api/v1/memories?limit=10&sort_by=accessed_at"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let memories = json["memories"].as_array().unwrap();
+    assert!(memories.len() >= 2);
+
+    let position_of = |id: &str| {
+        memories
+            .iter()
+            .position(|m| m["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("memory {id} not found in response"))
+    };
+    let first_pos = position_of(&first_id);
+    let second_pos = position_of(&second_id);
+    assert!(
+        second_pos < first_pos,
+        "expected 'second' (accessed_at set at creation) to sort before 'first' \
+         (accessed_at just bumped via GET), got second_pos={second_pos} first_pos={first_pos}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn list_memories_rejects_unknown_sort_by() {
+    let (app, _state, _dir) = make_test_app().await;
+    let resp = app
+        .oneshot(get("/api/v1/memories?sort_by=popularity"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+// ── In-process MCP tools ────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_store_memory_tool_creates_a_memory() {
+    let (_app, state, _dir) = make_test_app().await;
+    let result = crate::api::mcp::tools::call(
+        &serde_json::json!({
+            "name": "store_memory",
+            "arguments": {"content": "MCP-created memory"}
+        }),
+        &state,
+    )
+    .await
+    .unwrap();
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let data: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(data["success"], true);
+    assert!(data["memory_id"].is_string());
+}
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_update_memory_tool_accepts_emotional_fields() {
+    let (_app, state, _dir) = make_test_app().await;
+    let store_result = crate::api::mcp::tools::call(
+        &serde_json::json!({"name": "store_memory", "arguments": {"content": "to update"}}),
+        &state,
+    )
+    .await
+    .unwrap();
+    let store_text = store_result["content"][0]["text"].as_str().unwrap();
+    let store_data: serde_json::Value = serde_json::from_str(store_text).unwrap();
+    let id = store_data["memory_id"].as_str().unwrap();
+
+    let update_result = crate::api::mcp::tools::call(
+        &serde_json::json!({
+            "name": "update_memory",
+            "arguments": {"memory_id": id, "emotional_valence": 0.5, "arousal": 0.9, "health": 80.0}
+        }),
+        &state,
+    )
+    .await
+    .unwrap();
+    let update_text = update_result["content"][0]["text"].as_str().unwrap();
+    let update_data: serde_json::Value = serde_json::from_str(update_text).unwrap();
+    assert_eq!(update_data["success"], true);
+    let updated_fields = update_data["updated_fields"].as_array().unwrap();
+    let names: Vec<&str> = updated_fields.iter().filter_map(|v| v.as_str()).collect();
+    assert!(names.contains(&"emotional_valence"));
+    assert!(names.contains(&"arousal"));
+    assert!(names.contains(&"health"));
+}
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_list_recent_memories_tool_honors_sort_by() {
+    let (_app, state, _dir) = make_test_app().await;
+    crate::api::mcp::tools::call(
+        &serde_json::json!({"name": "store_memory", "arguments": {"content": "one"}}),
+        &state,
+    )
+    .await
+    .unwrap();
+    let result = crate::api::mcp::tools::call(
+        &serde_json::json!({"name": "list_recent_memories", "arguments": {"limit": 5, "sort_by": "accessed_at"}}),
+        &state,
+    )
+    .await
+    .unwrap();
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let data: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(data["success"], true);
+    assert!(!data["memories"].as_array().unwrap().is_empty());
+}
+
+// ── In-process MCP resources ────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_resource_stats_returns_json() {
+    let (_app, state, _dir) = make_test_app().await;
+    let result = crate::api::mcp::resources::read(
+        &serde_json::json!({"uri": "memory://stats"}),
+        &state,
+    )
+    .await
+    .unwrap();
+    let text = result["contents"][0]["text"].as_str().unwrap();
+    let data: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(data["total_memories"].is_number());
+}
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_resource_unknown_path_errors() {
+    let (_app, state, _dir) = make_test_app().await;
+    let result = crate::api::mcp::resources::read(
+        &serde_json::json!({"uri": "memory://nonsense"}),
+        &state,
+    )
+    .await;
+    assert!(result.is_err());
+}
+
+// ── MCP transport (Streamable HTTP, mounted at /mcp) ────────────────────────────
+
+fn mcp_post(body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_endpoint_requires_auth_when_api_key_set() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(StorageEngine::new(EngineConfig {
+        data_dir: tmpdir.path().to_path_buf(),
+        sync_writes: false,
+        ..EngineConfig::default()
+    }).await.unwrap());
+    let cfg = Config {
+        server: ServerConfig {
+            host: "127.0.0.1".into(), port: 4545, api_key: "test-secret".into(), api_key_secondary: String::new(),
+            allow_auth_disabled: false, allowed_origins: vec![], rate_limit_rps: 0, rate_limit_burst: 50,
+            trust_proxy_headers: false, env: Environment::Development,
+        },
+        storage: CfgStorage { data_dir: tmpdir.path().to_path_buf(), sync_writes: false, checkpoint_interval_secs: 300, max_wal_size_mb: 256 },
+        vector: CfgVector { dimension: 384, hnsw_m: 16, hnsw_ef_construction: 200, hnsw_ef_search: 50 },
+        embedding: EmbeddingConfig { cache_size: 100 },
+        connections: ConnectionConfig { auto_discovery_threshold: 0.7, auto_discovery_top_k: 5 },
+        tasks: TaskConfig {
+            expire_short_term_secs: 300, apply_importance_decay_secs: 86400, active_forgetting_secs: 86400,
+            consolidate_similar_secs: 604800, cleanup_archived_secs: 2592000, discover_connections_secs: 3600,
+            discovery_workers: 2, discovery_queue_size: 10_000, active_forgetting_hard_delete: false,
+        },
+    };
+    let services = create_services(Arc::clone(&engine), &cfg).await.unwrap();
+    let app = build_router(AppState { services, config: Arc::new(cfg) });
+
+    let resp = app.oneshot(mcp_post(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    }))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[ignore = "requires fastembed ONNX model"]
+async fn mcp_initialize_then_tools_call_round_trip() {
+    let (app, _state, _dir) = make_test_app().await;
+
+    let init_resp = app.clone().oneshot(mcp_post(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    }))).await.unwrap();
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let session_id = init_resp.headers().get("Mcp-Session-Id").unwrap().to_str().unwrap().to_owned();
+    let init_json = body_json(init_resp).await;
+    assert_eq!(init_json["result"]["protocolVersion"], "2025-03-26");
+
+    let call_req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("Mcp-Session-Id", &session_id)
+        .body(Body::from(serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "store_memory", "arguments": {"content": "via /mcp"}}
+        })).unwrap()))
+        .unwrap();
+    let call_resp = app.clone().oneshot(call_req).await.unwrap();
+    assert_eq!(call_resp.status(), StatusCode::OK);
+    let call_json = body_json(call_resp).await;
+    let text = call_json["result"]["content"][0]["text"].as_str().unwrap();
+    let data: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(data["success"], true);
+
+    // GET is not supported — 405.
+    let get_resp = app.clone().oneshot(get("/mcp")).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    // A call without a valid session id (post-initialize) is rejected.
+    let no_session_req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+        })).unwrap()))
+        .unwrap();
+    let no_session_resp = app.clone().oneshot(no_session_req).await.unwrap();
+    assert_eq!(no_session_resp.status(), StatusCode::BAD_REQUEST);
+
+    // DELETE terminates the session.
+    let del_req = Request::builder()
+        .method("DELETE")
+        .uri("/mcp")
+        .header("Mcp-Session-Id", &session_id)
+        .body(Body::empty())
+        .unwrap();
+    let del_resp = app.oneshot(del_req).await.unwrap();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+}
+
 // ── Search ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn semantic_search_returns_results() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Store a memory
     app.clone()
@@ -408,7 +677,7 @@ async fn semantic_search_returns_results() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn keyword_search_returns_results() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     app.clone()
         .oneshot(post_json(
@@ -436,7 +705,7 @@ async fn keyword_search_returns_results() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn hybrid_search_returns_results() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     app.clone()
         .oneshot(post_json(
@@ -464,7 +733,7 @@ async fn hybrid_search_returns_results() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn search_empty_query_returns_error() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let resp = app
         .oneshot(post_json(
             "/api/v1/memories/search",
@@ -478,7 +747,7 @@ async fn search_empty_query_returns_error() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn create_memory_empty_content_returns_error() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let resp = app
         .oneshot(post_json(
             "/api/v1/memories",
@@ -492,7 +761,7 @@ async fn create_memory_empty_content_returns_error() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn create_memory_invalid_type_returns_error() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let resp = app
         .oneshot(post_json(
             "/api/v1/memories",
@@ -695,7 +964,7 @@ async fn misconfigured_server_returns_500() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn promote_memory_to_long_term() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Create short-term
     let create_resp = app
@@ -743,7 +1012,7 @@ async fn promote_memory_to_long_term() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn find_related_returns_structure() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     let create_resp = app
         .clone()
@@ -773,7 +1042,7 @@ async fn find_related_returns_structure() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn backup_endpoint_returns_a_nonempty_gzip_archive() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
 
     // Seed one memory so the backup has something in it.
     let create_resp = app
@@ -821,7 +1090,7 @@ async fn backup_endpoint_returns_a_nonempty_gzip_archive() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn create_memory_rejects_oversized_content() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let content = "x".repeat(100_001);
     let resp = app
         .oneshot(post_json(
@@ -836,7 +1105,7 @@ async fn create_memory_rejects_oversized_content() {
 #[tokio::test]
 #[ignore = "requires fastembed ONNX model"]
 async fn create_memory_rejects_too_many_tags() {
-    let (app, _dir) = make_test_app().await;
+    let (app, _state, _dir) = make_test_app().await;
     let tags: Vec<String> = (0..51).map(|i| format!("tag{i}")).collect();
     let resp = app
         .oneshot(post_json(
