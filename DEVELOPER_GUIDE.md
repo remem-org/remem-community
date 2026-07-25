@@ -154,26 +154,30 @@ call except `/api/v1/health`.
 
 ## Connecting an LLM client via MCP
 
-`remem-server` speaks MCP JSON-RPC 2.0 over Streamable HTTP at `/mcp` — there is no
-compose-managed MCP container to `docker exec` into. Two ways to connect:
+`remem-server` speaks MCP JSON-RPC 2.0 over Streamable HTTP at `/mcp`. Two ways to
+connect:
 
 **Option 1: a client that speaks Streamable HTTP directly** — point it at
 `http://localhost:4545/mcp`, passing `REMEM_API_KEY` as a bearer token if auth is
 enabled. No extra process needed.
 
 **Option 2: a client that only speaks stdio** — run the `remem-mcp` binary yourself,
-pointed at whichever `remem-server` (local or remote) you want:
+pointed at whichever `remem-server` (local or remote) you want. It ships in the same
+`rememorg/remem-community:server-latest` image as `remem-server`, so this works via
+Docker with no Rust toolchain:
 
 ```json
 {
   "mcpServers": {
     "remem": {
-      "command": "cargo",
-      "args": ["run", "--release", "-p", "remem-mcp", "--", "--server-url", "http://localhost:4545"]
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "--network", "remem-network", "rememorg/remem-community:server-latest", "remem-mcp", "--server-url", "http://remem-server:4545"]
     }
   }
 }
 ```
+
+Building from source instead: `cargo run --release -p remem-mcp -- --server-url http://localhost:4545`.
 
 `remem-mcp` is a thin stdio-to-REST adapter; it holds no state of its own and
 forwards every call to `remem-server`'s REST API.

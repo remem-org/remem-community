@@ -111,12 +111,15 @@ curl -sf -X POST http://localhost:4545/mcp \
 
 **Option 1: run the `remem-mcp` binary directly (stdio)**
 
+`remem-mcp` ships in the same `rememorg/remem-community:server-latest` image as
+`remem-server` — run it via Docker, no Rust toolchain needed:
+
 ```json
 {
   "mcpServers": {
     "remem": {
-      "command": "cargo",
-      "args": ["run", "--release", "-p", "remem-mcp", "--", "--server-url", "http://localhost:4545"]
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "--network", "remem-network", "rememorg/remem-community:server-latest", "remem-mcp", "--server-url", "http://remem-server:4545"]
     }
   }
 }

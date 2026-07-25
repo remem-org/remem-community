@@ -49,6 +49,20 @@ Run the `remem-mcp` binary directly, pointed at `remem-server`:
 }
 ```
 
+Without a local build, the same binary ships in the published
+`rememorg/remem-community:server-latest` image:
+
+```json
+{
+  "mcpServers": {
+    "remem": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "--network", "remem-network", "rememorg/remem-community:server-latest", "remem-mcp", "--server-url", "http://remem-server:4545"]
+    }
+  }
+}
+```
+
 Clients that speak MCP Streamable HTTP directly can skip this binary
 entirely and talk to `remem-server`'s `/mcp` route instead — see
 crates/remem-server/CLAUDE.md.

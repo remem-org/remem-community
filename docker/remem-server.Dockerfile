@@ -69,6 +69,10 @@ ARG EDITION_FEATURES=""
 # of downloading it again during the build script.
 RUN cargo build --release -p remem-server ${EDITION_FEATURES:+--features $EDITION_FEATURES}
 
+# remem-mcp is a plain reqwest client with no edition features — built
+# separately so EDITION_FEATURES (which it doesn't declare) never applies to it.
+RUN cargo build --release -p remem-mcp
+
 # ── Model download stage ──────────────────────────────────────────────────────
 # Use Python huggingface_hub to download the embedding model in the standard
 # hf-hub cache format, which is compatible with the Rust hf-hub crate used by
@@ -109,6 +113,12 @@ COPY --from=model-downloader /fastembed-cache /var/lib/fastembed
 RUN chown -R remem:remem /var/lib/fastembed
 
 COPY --from=release-builder /workspace/target/release/remem-server /usr/local/bin/remem-server
+
+# remem-mcp: stdio MCP client bridging to remem-server's REST API. Bundled
+# into this same image so `docker run <image> remem-mcp --server-url ...`
+# works without a Rust toolchain — it's not started by CMD/entrypoint by
+# default, only invoked directly by MCP clients that spawn it as a subprocess.
+COPY --from=release-builder /workspace/target/release/remem-mcp /usr/local/bin/remem-mcp
 
 # Point fastembed at the pre-baked model cache
 ENV FASTEMBED_CACHE_PATH=/var/lib/fastembed
