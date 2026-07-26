@@ -128,4 +128,7 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -f http://localhost:4545/api/v1/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["remem-server", "--config", "/etc/remem/config.toml"]
+# entrypoint.sh wires up --config /etc/remem/config.toml itself when a file is
+# mounted there, and otherwise runs config-less on built-in defaults -- so the
+# default CMD stays bare.
+CMD ["remem-server"]
