@@ -5,19 +5,18 @@
 //! cross-chunk edge traversal is transparent. Segmentation applies to on-disk
 //! persistence: only node ranges whose chunk has been marked dirty are
 //! rewritten on checkpoint.
-#![allow(dead_code)]
 
 use bytes::Bytes;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::error::{Result, StorageError};
 use crate::engine::index::manifest::{ChunkMeta, SegmentManifest};
-use crate::engine::index::segment_io::{SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_GRAPH};
-use crate::engine::index::{
-    CsrGraph, EdgeMetadata, GraphConfig, TraversalResult, GRAPH_CHUNK_SIZE,
+use crate::engine::index::segment_io::{
+    SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_GRAPH,
 };
+use crate::engine::index::{CsrGraph, EdgeMetadata, GraphConfig, TraversalResult};
 
 // ── SegmentedCsrGraph ─────────────────────────────────────────────────────────
 
@@ -29,7 +28,6 @@ use crate::engine::index::{
 /// node in that range gets a new edge. The growing segment covers new nodes
 /// beyond the last sealed node boundary.
 pub struct SegmentedCsrGraph {
-    config: GraphConfig,
     /// The single in-memory graph containing all nodes and edges.
     graph: CsrGraph,
     /// Index directory for segment files and the manifest.
@@ -44,9 +42,8 @@ impl SegmentedCsrGraph {
     /// Create a new empty segmented graph.
     pub fn new(config: GraphConfig, dir: PathBuf) -> Self {
         let manifest = SegmentManifest::new("graph");
-        let graph = CsrGraph::new(config.clone());
+        let graph = CsrGraph::new(config);
         Self {
-            config,
             graph,
             dir,
             manifest,
@@ -62,10 +59,15 @@ impl SegmentedCsrGraph {
         let manifest = SegmentManifest::load(&dir, "graph")
             .unwrap_or(None)
             .unwrap_or_else(|| SegmentManifest::new("graph"));
-        let graph = CsrGraph::new(config.clone());
+        let graph = CsrGraph::new(config);
 
         if manifest.chunks.is_empty() {
-            return Self { config, graph, dir, manifest, dirty: AtomicBool::new(false) };
+            return Self {
+                graph,
+                dir,
+                manifest,
+                dirty: AtomicBool::new(false),
+            };
         }
 
         // Load each chunk and replay into the in-memory graph
@@ -106,7 +108,6 @@ impl SegmentedCsrGraph {
         );
 
         Self {
-            config,
             graph,
             dir,
             manifest,
@@ -116,7 +117,7 @@ impl SegmentedCsrGraph {
 
     /// Seal the current graph state as a new chunk on disk, then update the manifest.
     ///
-    /// Used when `node_count() >= GRAPH_CHUNK_SIZE` or during explicit checkpoint.
+    /// Called during explicit checkpoint.
     pub fn seal_growing(&mut self) -> Result<()> {
         if self.graph.node_count() == 0 {
             return Ok(());
@@ -143,9 +144,7 @@ impl SegmentedCsrGraph {
         writer.write_bytes(&data)?;
         let crc32 = writer.finish()?;
 
-        let file_size = std::fs::metadata(&seg_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
 
         self.manifest.chunks.push(ChunkMeta {
             seq_no,
@@ -210,49 +209,16 @@ impl SegmentedCsrGraph {
         result
     }
 
-    pub fn remove_node_edges(&self, node: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
-        let result = self.graph.remove_node_edges(node);
-        if result.as_ref().map(|v| !v.is_empty()).unwrap_or(false) {
-            self.dirty.store(true, Ordering::Release);
-        }
-        result
-    }
-
-    /// Read-only counterpart to `remove_node_edges`: returns the same edge
-    /// list without mutating the graph or marking it dirty. Used to WAL-log
-    /// a removal before applying it (log-before-mutate).
+    /// Returns the same edge list without mutating the graph or marking it
+    /// dirty. Used to WAL-log a removal before applying it (log-before-mutate).
     pub fn peek_node_edges(&self, node: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         self.graph.peek_node_edges(node)
-    }
-
-    pub fn add_node(&self, external_id: impl Into<Bytes>) -> Result<u32> {
-        let result = self.graph.add_node(external_id);
-        if result.is_ok() {
-            self.dirty.store(true, Ordering::Release);
-        }
-        result
-    }
-
-    pub fn finalize(&self) -> Result<()> {
-        self.graph.finalize()
-    }
-
-    pub fn unfinalize(&self) {
-        self.graph.unfinalize();
     }
 
     // ── Read operations (delegated to inner graph) ──────────────────────────
 
     pub fn get_neighbors(&self, external_id: &[u8]) -> Result<Vec<(Bytes, EdgeMetadata)>> {
         self.graph.get_neighbors(external_id)
-    }
-
-    pub fn get_neighbors_by_type(
-        &self,
-        external_id: &[u8],
-        edge_type: &str,
-    ) -> Result<Vec<(Bytes, EdgeMetadata)>> {
-        self.graph.get_neighbors_by_type(external_id, edge_type)
     }
 
     pub fn traverse_bfs(&self, start: &[u8], max_depth: usize) -> Result<Vec<TraversalResult>> {
@@ -265,15 +231,8 @@ impl SegmentedCsrGraph {
         max_depth: usize,
         edge_types: &[String],
     ) -> Result<Vec<TraversalResult>> {
-        self.graph.traverse_bfs_with_type(start, max_depth, edge_types)
-    }
-
-    pub fn contains_node(&self, external_id: &[u8]) -> bool {
-        self.graph.contains_node(external_id)
-    }
-
-    pub fn has_edge(&self, source: &[u8], target: &[u8]) -> bool {
-        self.graph.has_edge(source, target)
+        self.graph
+            .traverse_bfs_with_type(start, max_depth, edge_types)
     }
 
     pub fn node_count(&self) -> usize {
@@ -282,23 +241,6 @@ impl SegmentedCsrGraph {
 
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.graph.is_empty()
-    }
-
-    pub fn is_finalized(&self) -> bool {
-        self.graph.is_finalized()
-    }
-
-    pub fn out_degree(&self, external_id: &[u8]) -> usize {
-        self.graph.out_degree(external_id)
-    }
-
-    pub fn needs_compaction(&self) -> bool {
-        // Compaction for graph: not triggered in Phase F (no physical node removal)
-        false
     }
 
     /// Load a legacy single-file graph and re-save as a segmented chunk.
@@ -352,7 +294,10 @@ fn replay_graph_from_binary(target: &CsrGraph, data: &[u8]) -> Result<()> {
     let mut magic = [0u8; 4];
     cursor.read_exact(&mut magic)?;
     if &magic != b"CSRG" {
-        return Err(StorageError::invalid_format("graph chunk", "Invalid CSRG magic"));
+        return Err(StorageError::invalid_format(
+            "graph chunk",
+            "Invalid CSRG magic",
+        ));
     }
 
     // Read version

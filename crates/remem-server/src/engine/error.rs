@@ -1,5 +1,4 @@
 //! Error types for the storage engine
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -30,10 +29,6 @@ pub enum StorageError {
     #[error("Invalid file format in {file}: {message}")]
     InvalidFormat { file: PathBuf, message: String },
 
-    /// Key not found
-    #[error("Key not found")]
-    KeyNotFound,
-
     /// MemTable is full
     #[error("MemTable is full (size: {current} bytes, max: {max} bytes)")]
     MemTableFull { current: usize, max: usize },
@@ -58,28 +53,12 @@ pub enum StorageError {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// Engine is shutting down
-    #[error("Storage engine is shutting down")]
-    ShuttingDown,
-
     /// Compaction error
     #[error("Compaction error: {0}")]
     Compaction(String),
-
-    /// Index not enabled
-    #[error("Index not enabled: {0}")]
-    IndexNotEnabled(String),
 }
 
 impl StorageError {
-    /// Create a corruption error
-    pub fn corruption(file: impl Into<PathBuf>, message: impl Into<String>) -> Self {
-        Self::Corruption {
-            file: file.into(),
-            message: message.into(),
-        }
-    }
-
     /// Create a checksum mismatch error
     pub fn checksum_mismatch(file: impl Into<PathBuf>, expected: u32, actual: u32) -> Self {
         Self::ChecksumMismatch {

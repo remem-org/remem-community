@@ -1,5 +1,4 @@
 //! MemTable: In-memory sorted storage using a concurrent skip list
-#![allow(dead_code)]
 //!
 //! The MemTable is the write buffer in the LSM-tree. All writes go to the
 //! MemTable first (after being logged to the WAL), and once it reaches
@@ -39,11 +38,6 @@ impl Entry {
             value: None,
             timestamp,
         }
-    }
-
-    /// Check if this entry is a tombstone
-    pub fn is_tombstone(&self) -> bool {
-        self.value.is_none()
     }
 
     /// Get the approximate size of this entry in memory
@@ -89,39 +83,6 @@ impl MemTable {
         }
     }
 
-    /// Insert a key-value pair into the MemTable
-    ///
-    /// Returns an error if the MemTable is full. The caller should check
-    /// `is_full()` before inserting or handle the error by rotating to a
-    /// new MemTable.
-    pub fn insert(&self, key: Bytes, value: Bytes) -> Result<u64> {
-        let entry_size = key.len() + value.len() + std::mem::size_of::<Entry>();
-        let current_size = self.size.load(Ordering::Relaxed);
-
-        if current_size + entry_size > self.max_size {
-            return Err(StorageError::MemTableFull {
-                current: current_size,
-                max: self.max_size,
-            });
-        }
-
-        let timestamp = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
-        let entry = Entry::new(value, timestamp);
-
-        // Check if we're replacing an existing entry
-        if let Some(old_entry) = self.data.get(&key) {
-            let old_size = old_entry.value().size() + key.len();
-            self.size.fetch_sub(old_size, Ordering::Relaxed);
-        } else {
-            self.entry_count.fetch_add(1, Ordering::Relaxed);
-        }
-
-        self.data.insert(key, entry);
-        self.size.fetch_add(entry_size, Ordering::Relaxed);
-
-        Ok(timestamp)
-    }
-
     /// Insert an entry with a specific timestamp (used during WAL replay)
     pub fn insert_with_timestamp(&self, key: Bytes, value: Bytes, timestamp: u64) -> Result<()> {
         let entry_size = key.len() + value.len() + std::mem::size_of::<Entry>();
@@ -165,34 +126,6 @@ impl MemTable {
         }
 
         Ok(())
-    }
-
-    /// Mark a key as deleted (insert a tombstone)
-    pub fn delete(&self, key: Bytes) -> Result<u64> {
-        let entry_size = key.len() + std::mem::size_of::<Entry>();
-        let current_size = self.size.load(Ordering::Relaxed);
-
-        if current_size + entry_size > self.max_size {
-            return Err(StorageError::MemTableFull {
-                current: current_size,
-                max: self.max_size,
-            });
-        }
-
-        let timestamp = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
-        let entry = Entry::tombstone(timestamp);
-
-        if let Some(old_entry) = self.data.get(&key) {
-            let old_size = old_entry.value().size() + key.len();
-            self.size.fetch_sub(old_size, Ordering::Relaxed);
-        } else {
-            self.entry_count.fetch_add(1, Ordering::Relaxed);
-        }
-
-        self.data.insert(key, entry);
-        self.size.fetch_add(entry_size, Ordering::Relaxed);
-
-        Ok(timestamp)
     }
 
     /// Mark a key as deleted with a specific timestamp (used during WAL replay)
@@ -257,11 +190,6 @@ impl MemTable {
         self.size.load(Ordering::Relaxed)
     }
 
-    /// Get the maximum size
-    pub fn max_size(&self) -> usize {
-        self.max_size
-    }
-
     /// Get the number of entries
     pub fn len(&self) -> usize {
         self.entry_count.load(Ordering::Relaxed)
@@ -290,7 +218,7 @@ impl MemTable {
     /// order for a key always matches the order `insert_with_timestamp`/
     /// `delete_with_timestamp` will apply it in — unlike `current_timestamp()`,
     /// which only peeks the counter and lets a later, unlocked
-    /// `insert()`/`delete()` assign the real value.
+    /// `insert_with_timestamp()`/`delete_with_timestamp()` assign the real value.
     pub fn reserve_timestamp(&self) -> u64 {
         self.next_timestamp.fetch_add(1, Ordering::SeqCst)
     }
@@ -326,16 +254,6 @@ impl ImmutableMemTable {
         self.inner.iter()
     }
 
-    /// Get the approximate size in bytes
-    pub fn size(&self) -> usize {
-        self.inner.size()
-    }
-
-    /// Get the number of entries
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -354,20 +272,36 @@ impl Clone for ImmutableMemTable {
 mod tests {
     use super::*;
 
+    /// Test-only stand-in for the old `MemTable::insert` (deleted as dead code
+    /// in REM-36 -- production code only ever goes through
+    /// `insert_with_timestamp`, reserving the timestamp under the WAL lock
+    /// first). Mirrors `insert`'s old behavior exactly: `reserve_timestamp`
+    /// always hands back a strictly increasing counter value, so
+    /// `insert_with_timestamp`'s "only replace if new timestamp is greater"
+    /// guard never actually skips a write here.
+    fn insert(mt: &MemTable, key: Bytes, value: Bytes) -> u64 {
+        let ts = mt.reserve_timestamp();
+        mt.insert_with_timestamp(key, value, ts).unwrap();
+        ts
+    }
+
+    /// Test-only stand-in for the old `MemTable::delete` -- see `insert` above.
+    fn delete(mt: &MemTable, key: Bytes) -> u64 {
+        let ts = mt.reserve_timestamp();
+        mt.delete_with_timestamp(key, ts).unwrap();
+        ts
+    }
+
     #[test]
     fn test_insert_and_get() {
         let memtable = MemTable::new();
 
-        memtable
-            .insert(Bytes::from("key1"), Bytes::from("value1"))
-            .unwrap();
-        memtable
-            .insert(Bytes::from("key2"), Bytes::from("value2"))
-            .unwrap();
+        insert(&memtable, Bytes::from("key1"), Bytes::from("value1"));
+        insert(&memtable, Bytes::from("key2"), Bytes::from("value2"));
 
         let entry1 = memtable.get(b"key1").unwrap();
         assert_eq!(entry1.value.as_ref().unwrap().as_ref(), b"value1");
-        assert!(!entry1.is_tombstone());
+        assert!(entry1.value.is_some());
 
         let entry2 = memtable.get(b"key2").unwrap();
         assert_eq!(entry2.value.as_ref().unwrap().as_ref(), b"value2");
@@ -379,14 +313,10 @@ mod tests {
     fn test_update() {
         let memtable = MemTable::new();
 
-        memtable
-            .insert(Bytes::from("key1"), Bytes::from("value1"))
-            .unwrap();
+        insert(&memtable, Bytes::from("key1"), Bytes::from("value1"));
         let ts1 = memtable.get(b"key1").unwrap().timestamp;
 
-        memtable
-            .insert(Bytes::from("key1"), Bytes::from("value2"))
-            .unwrap();
+        insert(&memtable, Bytes::from("key1"), Bytes::from("value2"));
         let entry = memtable.get(b"key1").unwrap();
 
         assert_eq!(entry.value.as_ref().unwrap().as_ref(), b"value2");
@@ -397,13 +327,11 @@ mod tests {
     fn test_delete() {
         let memtable = MemTable::new();
 
-        memtable
-            .insert(Bytes::from("key1"), Bytes::from("value1"))
-            .unwrap();
-        memtable.delete(Bytes::from("key1")).unwrap();
+        insert(&memtable, Bytes::from("key1"), Bytes::from("value1"));
+        delete(&memtable, Bytes::from("key1"));
 
         let entry = memtable.get(b"key1").unwrap();
-        assert!(entry.is_tombstone());
+        assert!(entry.value.is_none());
     }
 
     #[test]
@@ -411,9 +339,9 @@ mod tests {
         let memtable = MemTable::new();
 
         // Insert in random order
-        memtable.insert(Bytes::from("c"), Bytes::from("3")).unwrap();
-        memtable.insert(Bytes::from("a"), Bytes::from("1")).unwrap();
-        memtable.insert(Bytes::from("b"), Bytes::from("2")).unwrap();
+        insert(&memtable, Bytes::from("c"), Bytes::from("3"));
+        insert(&memtable, Bytes::from("a"), Bytes::from("1"));
+        insert(&memtable, Bytes::from("b"), Bytes::from("2"));
 
         // Should iterate in sorted order
         let keys: Vec<_> = memtable.iter().map(|(k, _)| k).collect();
@@ -429,15 +357,11 @@ mod tests {
 
         assert_eq!(memtable.size(), 0);
 
-        memtable
-            .insert(Bytes::from("key1"), Bytes::from("value1"))
-            .unwrap();
+        insert(&memtable, Bytes::from("key1"), Bytes::from("value1"));
         let size1 = memtable.size();
         assert!(size1 > 0);
 
-        memtable
-            .insert(Bytes::from("key2"), Bytes::from("value2"))
-            .unwrap();
+        insert(&memtable, Bytes::from("key2"), Bytes::from("value2"));
         let size2 = memtable.size();
         assert!(size2 > size1);
     }
@@ -451,8 +375,9 @@ mod tests {
         loop {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            match memtable.insert(Bytes::from(key), Bytes::from(value)) {
-                Ok(_) => i += 1,
+            let ts = memtable.reserve_timestamp();
+            match memtable.insert_with_timestamp(Bytes::from(key), Bytes::from(value), ts) {
+                Ok(()) => i += 1,
                 Err(StorageError::MemTableFull { .. }) => break,
                 Err(e) => panic!("Unexpected error: {:?}", e),
             }
@@ -465,13 +390,9 @@ mod tests {
     fn test_timestamp_ordering() {
         let memtable = MemTable::new();
 
-        let ts1 = memtable
-            .insert(Bytes::from("key1"), Bytes::from("v1"))
-            .unwrap();
-        let ts2 = memtable
-            .insert(Bytes::from("key2"), Bytes::from("v2"))
-            .unwrap();
-        let ts3 = memtable.delete(Bytes::from("key3")).unwrap();
+        let ts1 = insert(&memtable, Bytes::from("key1"), Bytes::from("v1"));
+        let ts2 = insert(&memtable, Bytes::from("key2"), Bytes::from("v2"));
+        let ts3 = delete(&memtable, Bytes::from("key3"));
 
         assert!(ts1 < ts2);
         assert!(ts2 < ts3);
@@ -480,9 +401,7 @@ mod tests {
     #[test]
     fn test_immutable_memtable() {
         let memtable = MemTable::new();
-        memtable
-            .insert(Bytes::from("key1"), Bytes::from("value1"))
-            .unwrap();
+        insert(&memtable, Bytes::from("key1"), Bytes::from("value1"));
 
         let immutable = ImmutableMemTable::from_memtable(memtable);
 

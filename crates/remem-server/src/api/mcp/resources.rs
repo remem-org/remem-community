@@ -16,7 +16,9 @@ pub fn list() -> Value {
 }
 
 pub async fn read(params: &Value, state: &AppState) -> anyhow::Result<Value> {
-    let uri = params["uri"].as_str().ok_or_else(|| anyhow!("missing uri"))?;
+    let uri = params["uri"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing uri"))?;
     let rest = uri
         .strip_prefix("memory://")
         .ok_or_else(|| anyhow!("unsupported URI scheme in '{uri}'"))?;
@@ -25,7 +27,10 @@ pub async fn read(params: &Value, state: &AppState) -> anyhow::Result<Value> {
     let parse_int = |key: &str, default: i64| -> i64 {
         query_str
             .split('&')
-            .find_map(|p| p.strip_prefix(&format!("{key}=")).and_then(|v| v.parse().ok()))
+            .find_map(|p| {
+                p.strip_prefix(&format!("{key}="))
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(default)
     };
     let limit = (parse_int("limit", 10).max(0) as usize).min(100);
@@ -58,9 +63,17 @@ pub async fn read(params: &Value, state: &AppState) -> anyhow::Result<Value> {
                 .list(&MemoryFilters::default(), SortBy::CreatedAt, 200, 0)
                 .await?;
             memories.sort_by(|a, b| {
-                b.metadata.importance.partial_cmp(&a.metadata.importance).unwrap_or(std::cmp::Ordering::Equal)
+                b.metadata
+                    .importance
+                    .partial_cmp(&a.metadata.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let page: Vec<Value> = memories.into_iter().skip(offset).take(limit).map(|m| summarise(&m)).collect();
+            let page: Vec<Value> = memories
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|m| summarise(&m))
+                .collect();
             let count = page.len();
             let result = json!({
                 "memories": page,
@@ -74,7 +87,11 @@ pub async fn read(params: &Value, state: &AppState) -> anyhow::Result<Value> {
                 .parse()
                 .map_err(|e| anyhow!("invalid memory id: {e}"))?;
             let depth = (parse_int("depth", 2).max(0) as usize).min(5);
-            let pairs = state.services.connection.find_related(memory_id, depth, &[]).await?;
+            let pairs = state
+                .services
+                .connection
+                .find_related(memory_id, depth, &[])
+                .await?;
             let related: Vec<Value> = pairs
                 .into_iter()
                 .take(50)
@@ -93,7 +110,9 @@ fn truncate_preview(content: &str) -> String {
     if content.len() <= 100 {
         return content.to_string();
     }
-    let cut = (0..=100).rfind(|&i| content.is_char_boundary(i)).unwrap_or(0);
+    let cut = (0..=100)
+        .rfind(|&i| content.is_char_boundary(i))
+        .unwrap_or(0);
     format!("{}…", &content[..cut])
 }
 

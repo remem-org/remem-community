@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use crate::api::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, METHOD_NOT_FOUND};
+use crate::api::mcp::protocol::{
+    JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, METHOD_NOT_FOUND,
+};
 use crate::api::mcp::{resources, tools};
 use crate::api::AppState;
 

@@ -1,5 +1,4 @@
 //! Storage engine: The main interface to the LSM-tree storage
-#![allow(dead_code)]
 //!
 //! The storage engine coordinates:
 //! - WAL for durability
@@ -17,12 +16,11 @@ use tokio::task::JoinHandle;
 
 use super::compaction::{CompactionConfig, CompactionManager};
 use super::memtable::{ImmutableMemTable, MemTable};
-use super::sstable::BlockCache;
 use super::wal::{WalRecord, WAL};
 use crate::engine::error::{Result, StorageError};
 use crate::engine::index::{
-    BTreeIndex, CsrGraph, EdgeMetadata, GraphIndex, HnswConfig, HnswIndex, InvertedIndex,
-    SegmentedBTreeIndex, SegmentedCsrGraph, SegmentedInvertedIndex, TraversalResult,
+    EdgeMetadata, GraphIndex, HnswConfig, HnswIndex, SegmentedBTreeIndex, SegmentedInvertedIndex,
+    TraversalResult,
 };
 use crate::engine::util::DistanceMetric;
 
@@ -57,26 +55,6 @@ impl Default for VectorConfig {
 }
 
 impl VectorConfig {
-    /// Create a new vector config with custom dimension
-    pub fn with_dimension(dim: usize) -> Self {
-        Self {
-            dimension: dim,
-            ..Default::default()
-        }
-    }
-
-    /// Set the distance metric
-    pub fn metric(mut self, metric: DistanceMetric) -> Self {
-        self.metric = metric;
-        self
-    }
-
-    /// Enable or disable vector search
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
     /// Convert to HNSW config
     pub(super) fn to_hnsw_config(&self) -> HnswConfig {
         HnswConfig::with_dim(self.dimension)
@@ -105,20 +83,6 @@ impl Default for GraphIndexConfig {
     }
 }
 
-impl GraphIndexConfig {
-    /// Enable or disable graph index
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
-    /// Set whether the graph is directed
-    pub fn directed(mut self, directed: bool) -> Self {
-        self.directed = directed;
-        self
-    }
-}
-
 /// Configuration for time-series index
 #[derive(Debug, Clone)]
 pub struct TimeSeriesConfig {
@@ -129,14 +93,6 @@ pub struct TimeSeriesConfig {
 impl Default for TimeSeriesConfig {
     fn default() -> Self {
         Self { enabled: true }
-    }
-}
-
-impl TimeSeriesConfig {
-    /// Enable or disable time-series index
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
     }
 }
 
@@ -158,20 +114,6 @@ impl Default for TagIndexConfig {
             lowercase: true,
             min_token_length: 1,
         }
-    }
-}
-
-impl TagIndexConfig {
-    /// Enable or disable tag index
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
-    /// Set case sensitivity
-    pub fn lowercase(mut self, lowercase: bool) -> Self {
-        self.lowercase = lowercase;
-        self
     }
 }
 
@@ -208,7 +150,7 @@ impl Default for EngineConfig {
             data_dir: PathBuf::from("./data"),
             memtable_size: 256 * 1024 * 1024,   // 256 MB
             block_cache_size: 64 * 1024 * 1024, // 64 MB
-            sync_writes: true,                  // matches FileStorageConfig::default() and config/remem-server.toml
+            sync_writes: true, // matches FileStorageConfig::default() and config/remem-server.toml
             compaction: CompactionConfig::default(),
             vector: VectorConfig::default(),
             graph: GraphIndexConfig::default(),
@@ -238,8 +180,6 @@ pub struct StorageEngine {
     wal: Arc<Mutex<WAL>>,
     /// Compaction manager (handles SSTable levels)
     compaction: Arc<CompactionManager>,
-    /// Block cache
-    cache: Arc<BlockCache>,
     /// HNSW vector index (optional)
     hnsw_index: Option<Arc<HnswIndex>>,
     /// Graph index (CSR or Kuzu, depending on feature flag)
@@ -317,7 +257,6 @@ impl StorageEngine {
             immutable_memtables,
             wal: kv.wal,
             compaction: kv.compaction,
-            cache: kv.cache,
             hnsw_index: idx.hnsw,
             graph_index: idx.graph,
             time_series_index: idx.time_series,
@@ -329,95 +268,27 @@ impl StorageEngine {
         })
     }
 
-    /// Open an existing storage engine or create a new one
-    pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let config = EngineConfig {
-            data_dir: data_dir.as_ref().to_path_buf(),
-            ..Default::default()
-        };
-        Self::new(config).await
-    }
-
     /// Insert a key-value pair
     pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
         let value = value.into();
-
-        loop {
-            // Reserve the timestamp and append to the WAL under the same WAL
-            // lock acquisition, so a concurrent writer can't have its WAL
-            // record land in one order while its memtable insert lands in
-            // another (the old code peeked `current_timestamp()` here, then
-            // let `memtable.insert()` assign the *real* timestamp later,
-            // unlocked).
-            let timestamp = {
-                let mut wal = self.wal.lock();
-                let ts = self.memtable.read().reserve_timestamp();
-                wal.append(&WalRecord::insert(key.clone(), value.clone(), ts))?;
-                if self.config.sync_writes {
-                    wal.sync()?;
-                }
-                ts
-            };
-
-            let result = {
-                let memtable = self.memtable.read();
-                memtable.insert_with_timestamp(key.clone(), value.clone(), timestamp)
-            };
-
-            match result {
-                Ok(()) => {
-                    let should_flush = self.memtable.read().is_full();
-                    if should_flush {
-                        self.rotate_memtable().await?;
-                    }
-                    return Ok(());
-                }
-                Err(StorageError::MemTableFull { .. }) => {
-                    // MemTable is full: rotate and retry. The retry reserves
-                    // a fresh timestamp + WAL record against the new
-                    // (post-rotation) memtable, so the two always agree.
-                    self.rotate_memtable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.write_with_retry(
+            |ts| vec![WalRecord::insert(key.clone(), value.clone(), ts)],
+            |memtable, ts| memtable.insert_with_timestamp(key.clone(), value.clone(), ts),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Delete a key
     pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
-
-        loop {
-            let timestamp = {
-                let mut wal = self.wal.lock();
-                let ts = self.memtable.read().reserve_timestamp();
-                wal.append(&WalRecord::delete(key.clone(), ts))?;
-                if self.config.sync_writes {
-                    wal.sync()?;
-                }
-                ts
-            };
-
-            let result = {
-                let memtable = self.memtable.read();
-                memtable.delete_with_timestamp(key.clone(), timestamp)
-            };
-
-            match result {
-                Ok(()) => {
-                    let should_flush = self.memtable.read().is_full();
-                    if should_flush {
-                        self.rotate_memtable().await?;
-                    }
-                    return Ok(());
-                }
-                Err(StorageError::MemTableFull { .. }) => {
-                    self.rotate_memtable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.write_with_retry(
+            |ts| vec![WalRecord::delete(key.clone(), ts)],
+            |memtable, ts| memtable.delete_with_timestamp(key.clone(), ts),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Get a value by key
@@ -496,11 +367,11 @@ impl StorageEngine {
 
         let old_memtable = {
             let mut memtable = self.memtable.write();
-            let old = std::mem::replace(
+
+            std::mem::replace(
                 &mut *memtable,
                 MemTable::with_capacity(self.config.memtable_size),
-            );
-            old
+            )
         };
 
         {
@@ -511,6 +382,74 @@ impl StorageEngine {
         let _ = self.flush_tx.send(()).await;
 
         Ok(())
+    }
+
+    /// Reserve a timestamp under the WAL lock, write the record(s) `build_records`
+    /// produces from it, then apply `apply` to the active memtable — retrying
+    /// against a freshly rotated memtable if it reports `MemTableFull`. Returns
+    /// the timestamp that was ultimately committed.
+    ///
+    /// Shared by `put`, `delete`, `put_with_embedding`, and `store_memory_core`,
+    /// which previously each hand-rolled this loop (REM-35).
+    ///
+    /// # Invariant: reserve-and-append under one WAL-lock acquisition
+    ///
+    /// The timestamp reservation and the WAL append below happen under the
+    /// *same* WAL lock acquisition, so a concurrent writer can't have its WAL
+    /// record land in one order while its memtable insert lands in another.
+    /// The old, pre-refactor code peeked `current_timestamp()` here, then let
+    /// `memtable.insert()` assign the *real* timestamp later, unlocked — that
+    /// was a real bug (WAL order and memtable order could disagree under
+    /// concurrency) that this lock scope fixes. Don't split the reserve and
+    /// the append back across two lock acquisitions.
+    async fn write_with_retry(
+        &self,
+        mut build_records: impl FnMut(u64) -> Vec<WalRecord>,
+        mut apply: impl FnMut(&MemTable, u64) -> std::result::Result<(), StorageError>,
+    ) -> Result<u64> {
+        loop {
+            let timestamp = {
+                let mut wal = self.wal.lock();
+                let ts = self.memtable.read().reserve_timestamp();
+                let records = build_records(ts);
+                wal.append_batch(&records)?;
+                if self.config.sync_writes {
+                    wal.sync()?;
+                }
+                ts
+            };
+
+            let result = {
+                let memtable = self.memtable.read();
+                apply(&memtable, timestamp)
+            };
+
+            match result {
+                Ok(()) => {
+                    if self.memtable.read().is_full() {
+                        self.rotate_memtable().await?;
+                    }
+                    return Ok(timestamp);
+                }
+                Err(StorageError::MemTableFull { .. }) => {
+                    // MemTable is full: rotate and retry. The retry reserves
+                    // a fresh timestamp + WAL record against the new
+                    // (post-rotation) memtable, so the two always agree.
+                    self.rotate_memtable().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Returns `index.as_ref()`, or `StorageError::InvalidArgument("{label} is
+    /// not enabled")` if it's `None`. Replaces 23 duplicated
+    /// `let Some(index) = &self.<field> else { return Err(...) }` preambles
+    /// across the vector/graph/time-series/tag sections (REM-35).
+    fn require_index<'a, T>(index: &'a Option<T>, label: &str) -> Result<&'a T> {
+        index
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidArgument(format!("{label} is not enabled")))
     }
 
     /// Flush all data to disk
@@ -551,20 +490,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Force compaction
-    pub async fn compact(&self) -> Result<()> {
-        while let Some(level) = self.compaction.needs_compaction() {
-            self.compaction.compact_level(level)?;
-        }
-        Ok(())
-    }
-
     /// Get storage statistics
     pub fn stats(&self) -> StorageStats {
         let memtable_size = self.memtable.read().size();
-        let immutable_count = self.immutable_memtables.read().len();
-        let level_stats = self.compaction.stats();
-        let cache_stats = self.cache.stats();
         let vector_count = self.hnsw_index.as_ref().map(|idx| idx.len()).unwrap_or(0);
         let graph_node_count = self
             .graph_index
@@ -586,28 +514,15 @@ impl StorageEngine {
             .as_ref()
             .map(|idx| idx.read().len())
             .unwrap_or(0);
-        let tag_token_count = self
-            .tag_index
-            .as_ref()
-            .map(|idx| idx.read().all_tokens().len())
-            .unwrap_or(0);
 
         StorageStats {
             memtable_size,
-            immutable_memtables: immutable_count,
-            level_stats,
-            cache_entries: cache_stats.entries,
-            cache_size: cache_stats.size_bytes,
             vector_count,
             vector_enabled: self.hnsw_index.is_some(),
             graph_node_count,
             graph_edge_count,
-            graph_enabled: self.graph_index.is_some(),
             time_series_count,
-            time_series_enabled: self.time_series_index.is_some(),
             tag_doc_count,
-            tag_token_count,
-            tag_enabled: self.tag_index.is_some(),
         }
     }
 
@@ -627,43 +542,18 @@ impl StorageEngine {
         let key = key.into();
         let value = value.into();
 
-        loop {
-            let timestamp = {
-                let mut wal = self.wal.lock();
-                let ts = self.memtable.read().reserve_timestamp();
-
+        self.write_with_retry(
+            |ts| {
                 let record = if let Some(ref emb) = embedding {
                     WalRecord::insert_with_embedding(key.clone(), value.clone(), ts, emb.clone())
                 } else {
                     WalRecord::insert(key.clone(), value.clone(), ts)
                 };
-
-                wal.append(&record)?;
-                if self.config.sync_writes {
-                    wal.sync()?;
-                }
-                ts
-            };
-
-            let result = {
-                let memtable = self.memtable.read();
-                memtable.insert_with_timestamp(key.clone(), value.clone(), timestamp)
-            };
-
-            match result {
-                Ok(()) => {
-                    let should_flush = self.memtable.read().is_full();
-                    if should_flush {
-                        self.rotate_memtable().await?;
-                    }
-                    break;
-                }
-                Err(StorageError::MemTableFull { .. }) => {
-                    self.rotate_memtable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+                vec![record]
+            },
+            |memtable, ts| memtable.insert_with_timestamp(key.clone(), value.clone(), ts),
+        )
+        .await?;
 
         if let (Some(embedding), Some(index)) = (embedding, &self.hnsw_index) {
             index.insert(key, embedding)?;
@@ -691,46 +581,22 @@ impl StorageEngine {
         let value: Bytes = value.into();
 
         // ── Step 1+2: reserve ts under the WAL lock, apply with that ts ──────
-        loop {
-            let kv_ts = {
-                let mut wal = self.wal.lock();
-                let ts = self.memtable.read().reserve_timestamp();
-
+        self.write_with_retry(
+            |ts| {
                 let kv_record = if let Some(ref emb) = embedding {
                     WalRecord::insert_with_embedding(key.clone(), value.clone(), ts, emb.clone())
                 } else {
                     WalRecord::insert(key.clone(), value.clone(), ts)
                 };
-
-                let records = [
+                vec![
                     kv_record,
                     WalRecord::set_timestamp(key.clone(), timestamp, ts),
                     WalRecord::add_tags(key.clone(), tags.to_vec(), ts),
-                ];
-                wal.append_batch(&records)?;
-                if self.config.sync_writes {
-                    wal.sync()?;
-                }
-                ts
-            };
-
-            let result = {
-                let memtable = self.memtable.read();
-                memtable.insert_with_timestamp(key.clone(), value.clone(), kv_ts)
-            };
-            match result {
-                Ok(()) => {
-                    if self.memtable.read().is_full() {
-                        self.rotate_memtable().await?;
-                    }
-                    break;
-                }
-                Err(StorageError::MemTableFull { .. }) => {
-                    self.rotate_memtable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+                ]
+            },
+            |memtable, ts| memtable.insert_with_timestamp(key.clone(), value.clone(), ts),
+        )
+        .await?;
 
         // ── Step 3: secondary indexes ─────────────────────────────────────────
         // HNSW insert is CPU-bound (ANN graph traversal); dispatch to blocking thread pool.
@@ -787,11 +653,7 @@ impl StorageEngine {
         k: usize,
         ef: Option<usize>,
     ) -> Result<Vec<VectorSearchResult>> {
-        let Some(index) = &self.hnsw_index else {
-            return Err(StorageError::InvalidArgument(
-                "Vector search is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.hnsw_index, "Vector search")?;
 
         let results = if let Some(ef) = ef {
             index.search_with_ef(query, k, ef)?
@@ -799,33 +661,12 @@ impl StorageEngine {
             index.search(query, k)?
         };
 
-        // Optionally fetch values from storage
         let mut search_results = Vec::with_capacity(results.len());
         for (key, distance) in results {
-            search_results.push(VectorSearchResult {
-                key,
-                distance,
-                value: None, // Don't fetch by default for performance
-            });
+            search_results.push(VectorSearchResult { key, distance });
         }
 
         Ok(search_results)
-    }
-
-    /// Search for similar vectors and fetch their values
-    pub async fn vector_search_with_values(
-        &self,
-        query: &[f32],
-        k: usize,
-    ) -> Result<Vec<VectorSearchResult>> {
-        let mut results = self.vector_search(query, k).await?;
-
-        // Fetch values for each result
-        for result in &mut results {
-            result.value = self.get(&result.key).await?;
-        }
-
-        Ok(results)
     }
 
     /// Get the number of vectors in the index
@@ -853,23 +694,23 @@ impl StorageEngine {
 
     // ==================== Graph Operations ====================
 
-    /// Add an edge between two nodes
+    /// Add an edge, stamped with the caller-supplied real-world creation time.
     ///
-    /// Writes to WAL first for durability, then adds to graph index.
-    /// If an edge with the same (source, target, edge_type) already exists,
-    /// the weight is updated instead of creating a duplicate.
+    /// `created_at_ms` is an epoch-millisecond wall-clock value (e.g. `now_ms()`),
+    /// not an internal MVCC sequence number — unlike `store_memory_core`'s KV
+    /// writes, edges never claim a slot in the memtable's MVCC counter (WAL
+    /// replay for `AddEdge`/`RemoveEdge` only touches the graph index, never the
+    /// memtable), so this value is written into the WAL record and the graph
+    /// index's `EdgeMetadata.timestamp` verbatim, with no MVCC bookkeeping.
     pub fn add_edge(
         &self,
         source: impl Into<Bytes>,
         target: impl Into<Bytes>,
         edge_type: Option<String>,
         weight: Option<f32>,
+        created_at_ms: u64,
     ) -> Result<()> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.graph_index, "Graph index")?;
 
         let source: Bytes = source.into();
         let target: Bytes = target.into();
@@ -877,14 +718,12 @@ impl StorageEngine {
         // Write to WAL first for durability
         {
             let mut wal = self.wal.lock();
-            let memtable = self.memtable.read();
-            let ts = memtable.current_timestamp();
             let record = WalRecord::add_edge(
                 source.clone(),
                 target.clone(),
                 edge_type.clone(),
                 weight,
-                ts,
+                created_at_ms,
             );
             wal.append(&record)?;
             if self.config.sync_writes {
@@ -900,6 +739,7 @@ impl StorageEngine {
         if let Some(w) = weight {
             metadata = metadata.weight(w);
         }
+        metadata = metadata.timestamp(created_at_ms);
 
         index.read().add_edge(source, target, metadata)
     }
@@ -909,15 +749,17 @@ impl StorageEngine {
     /// Semantically equivalent to calling `add_edge` N times, but acquires the
     /// WAL mutex once and calls `sync` once (when `sync_writes = true`), reducing
     /// WAL serialisation from O(N) locks to O(1).
+    ///
+    /// `created_at_ms` is a single epoch-millisecond wall-clock value shared by
+    /// every edge in the batch — correct, since all edges in one atomic batch
+    /// share one creation instant (see `add_edge`'s doc comment for why this is
+    /// a real timestamp rather than an MVCC sequence number).
     pub fn add_edges_batch(
         &self,
         edges: Vec<(Bytes, Bytes, Option<String>, Option<f32>)>,
+        created_at_ms: u64,
     ) -> Result<()> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.graph_index, "Graph index")?;
 
         if edges.is_empty() {
             return Ok(());
@@ -926,11 +768,10 @@ impl StorageEngine {
         // Single WAL lock for all edges
         {
             let mut wal = self.wal.lock();
-            let ts = self.memtable.read().current_timestamp();
             let records: Vec<WalRecord> = edges
                 .iter()
                 .map(|(src, dst, et, w)| {
-                    WalRecord::add_edge(src.clone(), dst.clone(), et.clone(), *w, ts)
+                    WalRecord::add_edge(src.clone(), dst.clone(), et.clone(), *w, created_at_ms)
                 })
                 .collect();
             wal.append_batch(&records)?;
@@ -949,6 +790,7 @@ impl StorageEngine {
             if let Some(w) = w {
                 metadata = metadata.weight(w);
             }
+            metadata = metadata.timestamp(created_at_ms);
             guard.add_edge(src, dst, metadata)?;
         }
 
@@ -957,18 +799,10 @@ impl StorageEngine {
 
     /// Remove all edges from `source` to `target` in the graph index.
     ///
-    /// Unfinalizes the graph before removal and refinalizes afterwards so the
-    /// CSR read path remains consistent. Logs a warning if no edge existed.
-    pub fn remove_edge(
-        &self,
-        source: impl Into<Bytes>,
-        target: impl Into<Bytes>,
-    ) -> Result<()> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
+    /// Writes to WAL first for durability, then removes the edge from the
+    /// graph index. Logs at debug level if no matching edge existed.
+    pub fn remove_edge(&self, source: impl Into<Bytes>, target: impl Into<Bytes>) -> Result<()> {
+        let index = Self::require_index(&self.graph_index, "Graph index")?;
 
         let source: Bytes = source.into();
         let target: Bytes = target.into();
@@ -987,37 +821,25 @@ impl StorageEngine {
         let removed = index.read().remove_edge(&source, &target)?;
 
         if !removed {
-            tracing::debug!("remove_edge: no edge found from {:?} to {:?}", source, target);
+            tracing::debug!(
+                "remove_edge: no edge found from {:?} to {:?}",
+                source,
+                target
+            );
         }
 
         Ok(())
     }
 
     /// Get neighbors of a node
-    pub fn get_neighbors(&self, node: &[u8]) -> Result<Vec<(Bytes, String, f32)>> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
+    pub fn get_neighbors(&self, node: &[u8]) -> Result<Vec<(Bytes, String, f32, u64)>> {
+        let index = Self::require_index(&self.graph_index, "Graph index")?;
 
         let neighbors = index.read().get_neighbors(node)?;
         Ok(neighbors
             .into_iter()
-            .map(|(key, meta)| (key, meta.edge_type, meta.weight))
+            .map(|(key, meta)| (key, meta.edge_type, meta.weight, meta.timestamp))
             .collect())
-    }
-
-    /// Get neighbors filtered by edge type
-    pub fn get_neighbors_by_type(&self, node: &[u8], edge_type: &str) -> Result<Vec<Bytes>> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
-
-        let neighbors = index.read().get_neighbors_by_type(node, edge_type)?;
-        Ok(neighbors.into_iter().map(|(key, _)| key).collect())
     }
 
     /// Traverse the graph using BFS
@@ -1027,52 +849,20 @@ impl StorageEngine {
         max_depth: usize,
         edge_types: Option<&[String]>,
     ) -> Result<Vec<TraversalResult>> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.graph_index, "Graph index")?;
 
         if let Some(edge_types) = edge_types {
-            index.read().traverse_bfs_with_type(start, max_depth, edge_types)
+            index
+                .read()
+                .traverse_bfs_with_type(start, max_depth, edge_types)
         } else {
             index.read().traverse_bfs(start, max_depth)
         }
     }
 
-    /// Finalize the graph index for faster traversal
-    pub fn finalize_graph(&self) -> Result<()> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
-
-        index.read().finalize()
-    }
-
-    pub fn unfinalize_graph(&self) -> Result<()> {
-        let Some(index) = &self.graph_index else {
-            return Err(StorageError::InvalidArgument(
-                "Graph index is not enabled".into(),
-            ));
-        };
-
-        index.read().unfinalize();
-        Ok(())
-    }
-
     /// Check if the graph index is enabled
     pub fn graph_enabled(&self) -> bool {
         self.graph_index.is_some()
-    }
-
-    /// Get graph statistics
-    pub fn graph_stats(&self) -> (usize, usize) {
-        self.graph_index
-            .as_ref()
-            .map(|idx| (idx.read().node_count(), idx.read().edge_count()))
-            .unwrap_or((0, 0))
     }
 
     /// Save the graph index to disk
@@ -1096,12 +886,13 @@ impl StorageEngine {
     // ==================== Time-Series Operations ====================
 
     /// Add a timestamp for a key
+    ///
+    /// Test-only: used by fixture helpers in `services::connection_manager::tests`
+    /// and `services::lifecycle_manager::tests` to backdate a stored memory's
+    /// time-index entry for decay/lifecycle tests.
+    #[cfg(test)]
     pub fn add_timestamp(&self, key: impl Into<Bytes>, timestamp: u64) -> Result<()> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.time_series_index, "Time-series index")?;
 
         let key = key.into();
 
@@ -1119,17 +910,6 @@ impl StorageEngine {
         index.read().insert(timestamp, key)
     }
 
-    /// Get the timestamp for a key
-    pub fn get_timestamp(&self, key: &[u8]) -> Result<Option<u64>> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
-
-        Ok(index.read().get_timestamp(key))
-    }
-
     /// Query a range of timestamps
     pub fn time_range_query(
         &self,
@@ -1137,84 +917,13 @@ impl StorageEngine {
         end: u64,
         limit: Option<usize>,
     ) -> Result<Vec<(u64, Bytes)>> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.time_series_index, "Time-series index")?;
 
         if let Some(limit) = limit {
             Ok(index.read().range_limit(start, end, limit))
         } else {
             Ok(index.read().range(start, end))
         }
-    }
-
-    /// Get records before a timestamp
-    pub fn time_before(&self, timestamp: u64, limit: usize) -> Result<Vec<(u64, Bytes)>> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
-
-        Ok(index.read().before(timestamp, limit))
-    }
-
-    /// Get records after a timestamp
-    pub fn time_after(&self, timestamp: u64, limit: usize) -> Result<Vec<(u64, Bytes)>> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
-
-        Ok(index.read().after(timestamp, limit))
-    }
-
-    /// Get the most recent records
-    pub fn time_latest(&self, limit: usize) -> Result<Vec<(u64, Bytes)>> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
-
-        Ok(index.read().latest(limit))
-    }
-
-    /// Add multiple timestamps in a single batch operation
-    ///
-    /// More efficient than individual `add_timestamp` calls because it acquires
-    /// the WAL lock only once for the entire batch.
-    pub fn add_timestamps_batch(&self, items: Vec<(Bytes, u64)>) -> Result<usize> {
-        let Some(index) = &self.time_series_index else {
-            return Err(StorageError::InvalidArgument(
-                "Time-series index is not enabled".into(),
-            ));
-        };
-
-        let count = items.len();
-
-        // Write all records to WAL in a single lock acquisition
-        {
-            let mut wal = self.wal.lock();
-            let memtable = self.memtable.read();
-            let ts = memtable.current_timestamp();
-            for (key, timestamp) in &items {
-                wal.append(&WalRecord::set_timestamp(key.clone(), *timestamp, ts))?;
-            }
-            if self.config.sync_writes {
-                wal.sync()?;
-            }
-        }
-
-        // Insert into time-series index
-        for (key, timestamp) in items {
-            index.read().insert(timestamp, key)?;
-        }
-
-        Ok(count)
     }
 
     /// Remove a key from all mutable indexes: time-series, tag, and graph edges
@@ -1335,11 +1044,6 @@ impl StorageEngine {
         self.hnsw_index.as_ref()?.get_vector_by_key(key)
     }
 
-    /// Check if time-series index is enabled
-    pub fn time_series_enabled(&self) -> bool {
-        self.time_series_index.is_some()
-    }
-
     /// Save the time-series index to disk
     pub fn save_time_series_index(&self) -> Result<()> {
         if let Some(index) = &self.time_series_index {
@@ -1347,10 +1051,7 @@ impl StorageEngine {
             if is_dirty {
                 let len = index.read().len();
                 index.write().save_if_dirty()?;
-                tracing::info!(
-                    "Saved time-series index ({} entries)",
-                    len
-                );
+                tracing::info!("Saved time-series index ({} entries)", len);
             }
         }
         Ok(())
@@ -1360,11 +1061,7 @@ impl StorageEngine {
 
     /// Add tags to a document
     pub fn add_tags(&self, key: impl Into<Bytes>, tags: &[String]) -> Result<()> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.tag_index, "Tag index")?;
 
         let key = key.into();
 
@@ -1384,11 +1081,7 @@ impl StorageEngine {
 
     /// Replace all tags for a document (removes old tags, then sets new ones)
     pub fn set_tags(&self, key: impl Into<Bytes>, tags: &[String]) -> Result<()> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.tag_index, "Tag index")?;
 
         let key = key.into();
 
@@ -1406,91 +1099,18 @@ impl StorageEngine {
         index.read().set_tags(key, tags)
     }
 
-    /// Index text content for a document
-    ///
-    /// Note: Text is tokenized and stored as tags. The WAL stores the tokens,
-    /// not the original text, to ensure recovery produces the same index state.
-    pub fn index_text(&self, key: impl Into<Bytes>, text: &str) -> Result<()> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
-
-        let key = key.into();
-
-        // Tokenize the text to get the tags that will be stored
-        let min_len = index.read().min_token_length();
-        let tokens: Vec<String> = text
-            .split_whitespace()
-            .map(|s| s.to_lowercase())
-            .filter(|s| s.len() >= min_len)
-            .collect();
-
-        // Write to WAL first for durability (store tokens, not raw text)
-        if !tokens.is_empty() {
-            let mut wal = self.wal.lock();
-            let memtable = self.memtable.read();
-            let ts = memtable.current_timestamp();
-            wal.append(&WalRecord::add_tags(key.clone(), tokens, ts))?;
-            if self.config.sync_writes {
-                wal.sync()?;
-            }
-        }
-
-        index.read().index_text(key, text)
-    }
-
     /// Search for documents with specific tags (AND query)
     pub fn tag_search_and(&self, tags: &[&str]) -> Result<Vec<Bytes>> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.tag_index, "Tag index")?;
 
         Ok(index.read().search_and(tags))
     }
 
-    /// Search for documents with any of the given tags (OR query)
-    pub fn tag_search_or(&self, tags: &[&str]) -> Result<Vec<Bytes>> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
-
-        Ok(index.read().search_or(tags))
-    }
-
     /// Search with scoring (returns results sorted by relevance)
     pub fn tag_search_scored(&self, tags: &[&str]) -> Result<Vec<(Bytes, f32)>> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
+        let index = Self::require_index(&self.tag_index, "Tag index")?;
 
         Ok(index.read().search_or_scored(tags))
-    }
-
-    /// Get tags for a document
-    pub fn get_tags(&self, key: &[u8]) -> Result<Vec<String>> {
-        let Some(index) = &self.tag_index else {
-            return Err(StorageError::InvalidArgument(
-                "Tag index is not enabled".into(),
-            ));
-        };
-
-        Ok(index.read().get_tokens(key))
-    }
-
-    /// Check if a key exists in the tag index
-    pub fn tag_has_key(&self, key: &[u8]) -> bool {
-        self.tag_index
-            .as_ref()
-            .map(|index| index.read().contains_key(key))
-            .unwrap_or(false)
     }
 
     /// Check if tag index is enabled
@@ -1556,32 +1176,13 @@ impl StorageEngine {
         let config = self.config.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut wal = wal.lock();
-
-            let newly_immutable = {
-                let mut mt = memtable.write();
-                if mt.is_empty() {
-                    None
-                } else {
-                    let old = std::mem::replace(
-                        &mut *mt,
-                        MemTable::with_capacity(config.memtable_size),
-                    );
-                    Some(Arc::new(ImmutableMemTable::from_memtable(old)))
-                }
-            };
-            if let Some(new_imm) = newly_immutable {
-                immutable_memtables.write().push(Arc::clone(&new_imm));
-            }
-
-            let to_flush: Vec<_> = immutable_memtables.read().clone();
-            for imm in to_flush {
-                super::tasks::flush_memtable(&imm, &compaction, &config)?;
-                immutable_memtables.write().retain(|m| !Arc::ptr_eq(m, &imm));
-            }
-
-            wal.truncate()?;
-            Ok::<(), StorageError>(())
+            super::tasks::wal_locked_flush_and_truncate(
+                &wal,
+                &memtable,
+                &immutable_memtables,
+                &compaction,
+                &config,
+            )
         })
         .await
         .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
@@ -1591,11 +1192,6 @@ impl StorageEngine {
     }
 
     // ==================== Lifecycle ====================
-
-    /// Shutdown the storage engine (requires mutable reference)
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.graceful_shutdown().await
-    }
 
     /// Graceful shutdown that works with `&self` (for use from signal handlers with `Arc<StorageEngine>`)
     ///
@@ -1645,8 +1241,6 @@ pub struct VectorSearchResult {
     pub key: Bytes,
     /// Distance to the query vector (interpretation depends on metric)
     pub distance: f32,
-    /// The value, if fetched
-    pub value: Option<Bytes>,
 }
 
 impl Drop for StorageEngine {
@@ -1659,15 +1253,12 @@ impl Drop for StorageEngine {
 #[derive(Debug)]
 pub struct StorageStats {
     /// Current MemTable size in bytes
+    ///
+    /// Only read by `business::monitoring::update_from_services` (Prometheus
+    /// gauge export, gated behind the `business` Cargo feature) — dead in a
+    /// default build.
+    #[cfg_attr(not(feature = "business"), allow(dead_code))]
     pub memtable_size: usize,
-    /// Number of immutable MemTables waiting to be flushed
-    pub immutable_memtables: usize,
-    /// Statistics per level
-    pub level_stats: Vec<super::compaction::LevelStats>,
-    /// Number of entries in block cache
-    pub cache_entries: usize,
-    /// Block cache size in bytes
-    pub cache_size: usize,
     /// Number of vectors in the HNSW index
     pub vector_count: usize,
     /// Whether vector search is enabled
@@ -1675,19 +1266,22 @@ pub struct StorageStats {
     /// Number of nodes in the graph index
     pub graph_node_count: usize,
     /// Number of edges in the graph index
+    ///
+    /// Business-only, as `memtable_size` above: the last default-build reader
+    /// was `query::QueryEngineStats`, deleted with the unreachable planner
+    /// (REM-72).
+    #[cfg_attr(not(feature = "business"), allow(dead_code))]
     pub graph_edge_count: usize,
-    /// Whether graph index is enabled
-    pub graph_enabled: bool,
     /// Number of entries in time-series index
+    ///
+    /// Business-only — see `graph_edge_count`.
+    #[cfg_attr(not(feature = "business"), allow(dead_code))]
     pub time_series_count: usize,
-    /// Whether time-series index is enabled
-    pub time_series_enabled: bool,
     /// Number of documents in tag index
+    ///
+    /// Business-only — see `graph_edge_count`.
+    #[cfg_attr(not(feature = "business"), allow(dead_code))]
     pub tag_doc_count: usize,
-    /// Number of unique tokens in tag index
-    pub tag_token_count: usize,
-    /// Whether tag index is enabled
-    pub tag_enabled: bool,
 }
 
 #[cfg(test)]
@@ -1855,13 +1449,13 @@ mod tests {
             ),
         ];
 
-        engine.add_edges_batch(edges).unwrap();
+        engine.add_edges_batch(edges, 1_000).unwrap();
 
         let neighbors = engine.get_neighbors(b"node:a").unwrap();
         assert_eq!(neighbors.len(), 2);
         let targets: Vec<String> = neighbors
             .iter()
-            .map(|(k, _, _)| String::from_utf8_lossy(k).to_string())
+            .map(|(k, _, _, _)| String::from_utf8_lossy(k).to_string())
             .collect();
         assert!(targets.contains(&"node:b".to_string()));
         assert!(targets.contains(&"node:c".to_string()));
@@ -1895,7 +1489,7 @@ mod tests {
         assert_eq!(got, Some(value));
 
         // Timestamp indexed
-        let ts_entries = engine.time_latest(1).unwrap();
+        let ts_entries = engine.time_range_query(ts, ts, None).unwrap();
         assert_eq!(ts_entries.len(), 1);
         assert_eq!(ts_entries[0].0, ts);
 
@@ -1953,7 +1547,13 @@ mod storage_recovery_tests {
         let dst = Bytes::from("memory:dst");
 
         engine
-            .add_edge(src.clone(), dst.clone(), Some("related_to".to_string()), Some(0.9))
+            .add_edge(
+                src.clone(),
+                dst.clone(),
+                Some("related_to".to_string()),
+                Some(0.9),
+                1_000,
+            )
             .unwrap();
 
         let neighbors_before = engine.get_neighbors(src.as_ref()).unwrap();
@@ -1963,6 +1563,54 @@ mod storage_recovery_tests {
 
         let neighbors_after = engine.get_neighbors(src.as_ref()).unwrap();
         assert!(neighbors_after.is_empty(), "all edges must be removed");
+    }
+
+    #[tokio::test]
+    async fn edge_creation_timestamp_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        let src = Bytes::from("memory:src-ts");
+        let dst = Bytes::from("memory:dst-ts");
+        // A distinctive real-world epoch-ms value, not an MVCC-sequence-sized
+        // number like 0/1/2/3 -- picking something in that range would make
+        // this test pass by coincidence even if the bug (metadata.timestamp
+        // holding an MVCC counter instead of `created_at_ms`) were reintroduced.
+        let created_at_ms = 1_700_000_000_123_u64;
+
+        // Phase 1: create the edge with a known real timestamp — no checkpoint.
+        {
+            let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+                .await
+                .unwrap();
+            engine
+                .add_edge(
+                    src.clone(),
+                    dst.clone(),
+                    Some("related_to".to_string()),
+                    Some(0.9),
+                    created_at_ms,
+                )
+                .unwrap();
+        } // engine dropped here — no checkpoint, only WAL
+
+        // Phase 2: restart via WAL replay; the edge's timestamp must survive
+        // exactly, not reset to 0 and not be re-stamped with a fresh now().
+        {
+            let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+                .await
+                .unwrap();
+
+            let neighbors = engine.get_neighbors(src.as_ref()).unwrap();
+            assert_eq!(neighbors.len(), 1, "edge must survive WAL replay");
+            let (target, edge_type, weight, replayed_ts) = &neighbors[0];
+            assert_eq!(target.as_ref(), dst.as_ref());
+            assert_eq!(edge_type, "related_to");
+            assert_eq!(*weight, 0.9);
+            assert_eq!(
+                *replayed_ts, created_at_ms,
+                "edge creation timestamp must survive WAL replay unchanged, \
+                 not reset to 0 or re-stamped with a fresh now()"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2042,7 +1690,10 @@ mod storage_recovery_tests {
         let engine2 = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
             .await
             .unwrap();
-        let results = engine2.vector_search(&[1.0, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = engine2
+            .vector_search(&[1.0, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         assert!(
             results.iter().all(|r| r.key.as_ref() != key.as_ref()),
             "removed vector should not resurrect after WAL replay"
@@ -2499,14 +2150,18 @@ mod storage_recovery_tests {
     #[tokio::test]
     async fn rotate_memtable_rejects_once_flush_backlog_is_full() {
         let dir = TempDir::new().unwrap();
-        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf())).await.unwrap();
+        let engine = StorageEngine::new(test_cfg(dir.path().to_path_buf()))
+            .await
+            .unwrap();
 
         // Manually saturate the pending-immutable-memtable backlog to
         // simulate a stalled flush loop (e.g. disk full) without needing
         // to actually fill up gigabytes of memtable data.
         for i in 0..MAX_PENDING_IMMUTABLE_MEMTABLES {
             let mt = MemTable::with_capacity(1024);
-            mt.insert(Bytes::from(format!("k{i}")), Bytes::from_static(b"v")).unwrap();
+            let ts = mt.reserve_timestamp();
+            mt.insert_with_timestamp(Bytes::from(format!("k{i}")), Bytes::from_static(b"v"), ts)
+                .unwrap();
             engine
                 .immutable_memtables
                 .write()
@@ -2514,6 +2169,9 @@ mod storage_recovery_tests {
         }
 
         let result = engine.rotate_memtable().await;
-        assert!(result.is_err(), "rotate_memtable should reject writes once the flush backlog is full");
+        assert!(
+            result.is_err(),
+            "rotate_memtable should reject writes once the flush backlog is full"
+        );
     }
 }

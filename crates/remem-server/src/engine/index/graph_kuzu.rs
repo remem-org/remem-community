@@ -16,8 +16,6 @@ use crate::engine::error::{Result, StorageError};
 use crate::engine::index::{EdgeMetadata, GraphConfig, TraversalResult};
 
 pub struct KuzuGraphIndex {
-    #[allow(dead_code)]
-    config: GraphConfig,
     db: Database,
     conn: Mutex<Connection>,
     dir: PathBuf,
@@ -27,7 +25,7 @@ pub struct KuzuGraphIndex {
 }
 
 impl KuzuGraphIndex {
-    pub fn new(config: GraphConfig, dir: PathBuf) -> Result<Self> {
+    pub fn new(_config: GraphConfig, dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir).map_err(|e| StorageError::Io(e))?;
         let kuzu_dir = dir.join("kuzu_data");
         std::fs::create_dir_all(&kuzu_dir).map_err(|e| StorageError::Io(e))?;
@@ -42,7 +40,6 @@ impl KuzuGraphIndex {
         let (node_count, edge_count) = Self::count_stats(&conn)?;
 
         Ok(Self {
-            config,
             db,
             conn: Mutex::new(conn),
             dir,
@@ -58,27 +55,29 @@ impl KuzuGraphIndex {
 
     fn init_schema(conn: &Connection) -> Result<()> {
         // Create tables if they don't exist — Kuzu supports IF NOT EXISTS
-        conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS Memory(key STRING PRIMARY KEY)"
-        ).map_err(|e| StorageError::InvalidArgument(format!("Schema Memory: {e}")))?;
+        conn.query("CREATE NODE TABLE IF NOT EXISTS Memory(key STRING PRIMARY KEY)")
+            .map_err(|e| StorageError::InvalidArgument(format!("Schema Memory: {e}")))?;
 
         conn.query(
             "CREATE REL TABLE IF NOT EXISTS Connection(\
                 FROM Memory TO Memory, \
                 edge_type STRING, \
                 weight FLOAT, \
-                ts INT64)"
-        ).map_err(|e| StorageError::InvalidArgument(format!("Schema Connection: {e}")))?;
+                ts INT64)",
+        )
+        .map_err(|e| StorageError::InvalidArgument(format!("Schema Connection: {e}")))?;
 
         Ok(())
     }
 
     fn count_stats(conn: &Connection) -> Result<(usize, usize)> {
-        let nodes = conn.query("MATCH (n:Memory) RETURN count(n)")
+        let nodes = conn
+            .query("MATCH (n:Memory) RETURN count(n)")
             .map_err(|e| StorageError::InvalidArgument(format!("Count nodes: {e}")))?;
         let node_count = Self::extract_count(nodes);
 
-        let edges = conn.query("MATCH ()-[r:Connection]->() RETURN count(r)")
+        let edges = conn
+            .query("MATCH ()-[r:Connection]->() RETURN count(r)")
             .map_err(|e| StorageError::InvalidArgument(format!("Count edges: {e}")))?;
         let edge_count = Self::extract_count(edges);
 
@@ -97,10 +96,7 @@ impl KuzuGraphIndex {
     }
 
     fn ensure_node(conn: &Connection, key: &str) -> Result<()> {
-        let query = format!(
-            "MERGE (n:Memory {{key: '{}'}})",
-            key.replace('\'', "''")
-        );
+        let query = format!("MERGE (n:Memory {{key: '{}'}})", key.replace('\'', "''"));
         conn.query(&query)
             .map_err(|e| StorageError::InvalidArgument(format!("Ensure node: {e}")))?;
         Ok(())
@@ -181,7 +177,8 @@ impl KuzuGraphIndex {
              RETURN s.key, t.key",
             escaped, escaped,
         );
-        let mut result = conn.query(&query)
+        let mut result = conn
+            .query(&query)
             .map_err(|e| StorageError::InvalidArgument(format!("Find node edges: {e}")))?;
 
         let mut removed = Vec::new();
@@ -230,7 +227,8 @@ impl KuzuGraphIndex {
              RETURN t.key, r.edge_type, r.weight, r.ts",
             key_str.replace('\'', "''"),
         );
-        let mut result = conn.query(&query)
+        let mut result = conn
+            .query(&query)
             .map_err(|e| StorageError::InvalidArgument(format!("Get neighbors: {e}")))?;
 
         let mut neighbors = Vec::new();
@@ -279,7 +277,8 @@ impl KuzuGraphIndex {
             key_str.replace('\'', "''"),
             edge_type.replace('\'', "''"),
         );
-        let mut result = conn.query(&query)
+        let mut result = conn
+            .query(&query)
             .map_err(|e| StorageError::InvalidArgument(format!("Get neighbors by type: {e}")))?;
 
         let mut neighbors = Vec::new();
@@ -330,7 +329,8 @@ impl KuzuGraphIndex {
             max_depth,
         );
 
-        let mut result = conn.query(&query)
+        let mut result = conn
+            .query(&query)
             .map_err(|e| StorageError::InvalidArgument(format!("Traverse BFS: {e}")))?;
 
         // Start node is always included
@@ -412,7 +412,8 @@ impl KuzuGraphIndex {
             max_depth,
         );
 
-        let mut result = conn.query(&query)
+        let mut result = conn
+            .query(&query)
             .map_err(|e| StorageError::InvalidArgument(format!("Traverse BFS typed: {e}")))?;
 
         let mut results = vec![TraversalResult {
@@ -581,12 +582,8 @@ mod tests {
     fn test_add_edge_and_get_neighbors() {
         let g = temp_kuzu();
         let meta = EdgeMetadata::with_type("SimilarTo").weight(0.85);
-        g.add_edge(
-            Bytes::from("memory:aaa"),
-            Bytes::from("memory:bbb"),
-            meta,
-        )
-        .unwrap();
+        g.add_edge(Bytes::from("memory:aaa"), Bytes::from("memory:bbb"), meta)
+            .unwrap();
 
         let neighbors = g.get_neighbors(b"memory:aaa").unwrap();
         assert_eq!(neighbors.len(), 1);
@@ -641,7 +638,8 @@ mod tests {
         assert_eq!(results[0].node_id, Bytes::from("memory:a"));
 
         // All reachable nodes should be present
-        let keys: std::collections::HashSet<_> = results.iter().map(|r| r.node_id.clone()).collect();
+        let keys: std::collections::HashSet<_> =
+            results.iter().map(|r| r.node_id.clone()).collect();
         assert!(keys.contains(&Bytes::from("memory:b")));
         assert!(keys.contains(&Bytes::from("memory:c")));
         assert!(keys.contains(&Bytes::from("memory:d")));
@@ -667,7 +665,8 @@ mod tests {
         let results = g
             .traverse_bfs_with_type(b"memory:a", 1, &["related_to".to_string()])
             .unwrap();
-        let keys: std::collections::HashSet<_> = results.iter().map(|r| r.node_id.clone()).collect();
+        let keys: std::collections::HashSet<_> =
+            results.iter().map(|r| r.node_id.clone()).collect();
         assert!(keys.contains(&Bytes::from("memory:b")));
         // memory:c should be filtered out since it's a "caused_by" edge
     }

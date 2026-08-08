@@ -1,10 +1,10 @@
 mod api;
+#[cfg(feature = "business")]
+mod business;
 mod config;
 mod embedding;
 mod engine;
 mod error;
-#[cfg(feature = "business")]
-mod business;
 mod services;
 mod tasks;
 
@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use engine::{
-    storage::engine::{EngineConfig, GraphIndexConfig, TagIndexConfig, TimeSeriesConfig, VectorConfig},
+    storage::engine::{
+        EngineConfig, GraphIndexConfig, TagIndexConfig, TimeSeriesConfig, VectorConfig,
+    },
     StorageEngine,
 };
 
@@ -69,9 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let engine_cfg = EngineConfig {
         data_dir: cfg.storage.data_dir.clone(),
         sync_writes: cfg.storage.sync_writes,
-        checkpoint_interval: std::time::Duration::from_secs(
-            cfg.storage.checkpoint_interval_secs,
-        ),
+        checkpoint_interval: std::time::Duration::from_secs(cfg.storage.checkpoint_interval_secs),
         max_wal_size: cfg.storage.max_wal_size_mb * 1024 * 1024,
         vector: VectorConfig {
             enabled: true,

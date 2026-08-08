@@ -174,7 +174,9 @@ pub fn list() -> Value {
 
 /// Dispatch a `tools/call` request against `AppServices` directly (no HTTP hop).
 pub async fn call(params: &Value, state: &AppState) -> anyhow::Result<Value> {
-    let name = params["name"].as_str().ok_or_else(|| anyhow!("missing tool name"))?;
+    let name = params["name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing tool name"))?;
     let args = &params["arguments"];
 
     let result = match name {
@@ -224,12 +226,22 @@ async fn store_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
 }
 
 async fn search_memories(state: &AppState, args: &Value) -> anyhow::Result<Value> {
-    let query_text = args["query"].as_str().ok_or_else(|| anyhow!("query is required"))?;
-    let search_type = match args.get("search_type").and_then(|v| v.as_str()).unwrap_or("hybrid") {
+    let query_text = args["query"]
+        .as_str()
+        .ok_or_else(|| anyhow!("query is required"))?;
+    let search_type = match args
+        .get("search_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("hybrid")
+    {
         "semantic" => SearchType::Semantic,
         "keyword" => SearchType::Keyword,
         "hybrid" => SearchType::Hybrid,
-        other => return Err(anyhow!("unknown search_type: {other}; use semantic, keyword, or hybrid")),
+        other => {
+            return Err(anyhow!(
+                "unknown search_type: {other}; use semantic, keyword, or hybrid"
+            ))
+        }
     };
 
     let f = args.get("filters");
@@ -243,10 +255,20 @@ async fn search_memories(state: &AppState, args: &Value) -> anyhow::Result<Value
         tags: f
             .and_then(|f| f.get("tags"))
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
-        min_importance: f.and_then(|f| f.get("importance_min")).and_then(|v| v.as_f64()).map(|v| v as f32),
-        max_importance: f.and_then(|f| f.get("importance_max")).and_then(|v| v.as_f64()).map(|v| v as f32),
+        min_importance: f
+            .and_then(|f| f.get("importance_min"))
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+        max_importance: f
+            .and_then(|f| f.get("importance_max"))
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
         created_after: None,
         created_before: None,
     };
@@ -260,7 +282,11 @@ async fn search_memories(state: &AppState, args: &Value) -> anyhow::Result<Value
         query: query_text.to_string(),
         search_type,
         filters,
-        limit: args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).min(100) as usize,
+        limit: args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .min(100) as usize,
         related_to,
     };
 
@@ -281,7 +307,10 @@ async fn search_memories(state: &AppState, args: &Value) -> anyhow::Result<Value
 
 async fn get_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
     let id = parse_id(args)?;
-    let include_conn = args.get("include_connections").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_conn = args
+        .get("include_connections")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut memory = state.services.memory.get(id).await?;
     if include_conn {
         memory.connections = state.services.memory.fetch_connections(id).await?;
@@ -296,12 +325,17 @@ async fn update_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> 
 
     if let Some(content) = &body.content {
         if content.len() > MAX_CONTENT_BYTES {
-            return Err(anyhow!("content exceeds maximum length of {MAX_CONTENT_BYTES} bytes"));
+            return Err(anyhow!(
+                "content exceeds maximum length of {MAX_CONTENT_BYTES} bytes"
+            ));
         }
     }
     if let Some(tags) = &body.tags {
         if tags.len() > MAX_TAGS {
-            return Err(anyhow!("too many tags: maximum is {MAX_TAGS}, got {}", tags.len()));
+            return Err(anyhow!(
+                "too many tags: maximum is {MAX_TAGS}, got {}",
+                tags.len()
+            ));
         }
     }
 
@@ -337,9 +371,16 @@ async fn update_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> 
 
 async fn delete_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
     let id = parse_id(args)?;
-    let hard = args.get("hard_delete").and_then(|v| v.as_bool()).unwrap_or(false);
+    let hard = args
+        .get("hard_delete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     state.services.memory.delete(id, hard).await?;
-    let action = if hard { "permanently deleted" } else { "archived" };
+    let action = if hard {
+        "permanently deleted"
+    } else {
+        "archived"
+    };
     Ok(json!({"success": true, "memory_id": id, "summary": format!("Memory {id} {action}")}))
 }
 
@@ -349,7 +390,11 @@ async fn find_related(state: &AppState, args: &Value) -> anyhow::Result<Value> {
     let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize).min(100);
 
     let types: Vec<RelationshipType> = Vec::new(); // no filter — matches existing MCP tool behavior
-    let pairs = state.services.connection.find_related(id, depth, &types).await?;
+    let pairs = state
+        .services
+        .connection
+        .find_related(id, depth, &types)
+        .await?;
     let related: Vec<Value> = pairs
         .into_iter()
         .take(limit)
@@ -367,7 +412,9 @@ async fn find_related(state: &AppState, args: &Value) -> anyhow::Result<Value> {
 async fn promote_to_longterm(state: &AppState, args: &Value) -> anyhow::Result<Value> {
     let id = parse_id(args)?;
     state.services.lifecycle.promote(id).await?;
-    Ok(json!({"success": true, "memory_id": id, "summary": format!("Memory {id} promoted to long_term")}))
+    Ok(
+        json!({"success": true, "memory_id": id, "summary": format!("Memory {id} promoted to long_term")}),
+    )
 }
 
 async fn list_recent_memories(state: &AppState, args: &Value) -> anyhow::Result<Value> {
@@ -386,8 +433,15 @@ async fn list_recent_memories(state: &AppState, args: &Value) -> anyhow::Result<
         .map_err(|e| anyhow!(e))?
         .unwrap_or_default();
 
-    let filters = MemoryFilters { memory_type, ..Default::default() };
-    let (memories, total) = state.services.memory.list(&filters, sort_by, limit, 0).await?;
+    let filters = MemoryFilters {
+        memory_type,
+        ..Default::default()
+    };
+    let (memories, total) = state
+        .services
+        .memory
+        .list(&filters, sort_by, limit, 0)
+        .await?;
     let count = memories.len();
     Ok(json!({"success": true, "count": count, "total": total, "memories": memories}))
 }
@@ -402,8 +456,14 @@ mod tests {
         let tools = list["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         let expected = [
-            "store_memory", "search_memories", "get_memory", "update_memory",
-            "delete_memory", "find_related", "promote_to_longterm", "list_recent_memories",
+            "store_memory",
+            "search_memories",
+            "get_memory",
+            "update_memory",
+            "delete_memory",
+            "find_related",
+            "promote_to_longterm",
+            "list_recent_memories",
         ];
         for name in expected {
             assert!(names.contains(&name), "missing tool: {name}");
@@ -426,8 +486,13 @@ mod tests {
     fn list_recent_memories_schema_advertises_sort_by() {
         let list = list();
         let tools = list["tools"].as_array().unwrap();
-        let lrm = tools.iter().find(|t| t["name"] == "list_recent_memories").unwrap();
-        let sort_by_enum = lrm["inputSchema"]["properties"]["sort_by"]["enum"].as_array().unwrap();
+        let lrm = tools
+            .iter()
+            .find(|t| t["name"] == "list_recent_memories")
+            .unwrap();
+        let sort_by_enum = lrm["inputSchema"]["properties"]["sort_by"]["enum"]
+            .as_array()
+            .unwrap();
         assert!(sort_by_enum.contains(&json!("created_at")));
         assert!(sort_by_enum.contains(&json!("accessed_at")));
     }

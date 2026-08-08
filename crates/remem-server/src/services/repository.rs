@@ -25,7 +25,10 @@ pub struct MemoryRepository {
 
 impl MemoryRepository {
     pub fn new(engine: Arc<StorageEngine>) -> Self {
-        Self { engine, locks: StdMutex::new(HashMap::new()) }
+        Self {
+            engine,
+            locks: StdMutex::new(HashMap::new()),
+        }
     }
 
     /// Acquire the per-memory lock for `id`. Hold the returned guard across
@@ -35,7 +38,11 @@ impl MemoryRepository {
     pub async fn lock(&self, id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let mutex = {
             let mut locks = self.locks.lock().unwrap();
-            Arc::clone(locks.entry(id).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+            Arc::clone(
+                locks
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
         };
         mutex.lock_owned().await
     }
@@ -59,7 +66,14 @@ impl MemoryRepository {
         };
         match serde_json::from_slice::<StoredMemory>(&bytes) {
             Ok(stored) => Ok(Some(stored)),
-            Err(_) => Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    key = %String::from_utf8_lossy(key),
+                    error = %e,
+                    "corrupt record: failed to deserialize StoredMemory, skipping"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -79,7 +93,9 @@ impl MemoryRepository {
     ) -> Result<()> {
         let key = memory_key(stored.id);
         let json = serde_json::to_vec(stored)?;
-        self.engine.put_with_embedding(key, json, Some(embedding)).await?;
+        self.engine
+            .put_with_embedding(key, json, Some(embedding))
+            .await?;
         Ok(())
     }
 
@@ -132,5 +148,38 @@ mod lock_tests {
         }
 
         assert_eq!(counter.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn load_by_key_logs_and_returns_none_on_corrupt_json() {
+        // No global subscriber is installed for `cargo test`, so `tracing::warn!`
+        // is otherwise a silent no-op here -- install a test-scoped one (writes
+        // through the test harness's captured stdout) so the log line is
+        // actually visible under `--nocapture`, proving the warning fires and
+        // not just that `None` is returned (which was already true before).
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        let engine = crate::engine::storage::engine::StorageEngine::new(
+            crate::engine::storage::engine::EngineConfig {
+                data_dir: tempfile::tempdir().unwrap().keep(),
+                sync_writes: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepository::new(Arc::new(engine));
+
+        let key = b"memory:deadbeef-0000-0000-0000-000000000000";
+        repo.engine
+            .put(key.to_vec(), b"not valid json".to_vec())
+            .await
+            .unwrap();
+
+        let result = repo.load_by_key(key.as_slice()).await.unwrap();
+        assert!(
+            result.is_none(),
+            "corrupt record must be skipped, not surfaced as an error"
+        );
     }
 }

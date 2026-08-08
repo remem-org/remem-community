@@ -33,7 +33,12 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     pub fn ok(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn err(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
@@ -41,7 +46,10 @@ impl JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into() }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }
@@ -181,9 +189,7 @@ mod tests {
     fn tools_list_contains_all_eight_tools() {
         let list = crate::tools::list();
         let tools = list["tools"].as_array().unwrap();
-        let names: Vec<&str> = tools.iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
         let expected = [
             "store_memory",
@@ -209,11 +215,16 @@ mod tests {
         for tool in tools {
             let name = tool["name"].as_str().unwrap_or("?");
             assert!(tool.get("name").is_some(), "{name}: missing name");
-            assert!(tool.get("description").is_some(), "{name}: missing description");
-            assert!(tool.get("inputSchema").is_some(), "{name}: missing inputSchema");
+            assert!(
+                tool.get("description").is_some(),
+                "{name}: missing description"
+            );
+            assert!(
+                tool.get("inputSchema").is_some(),
+                "{name}: missing inputSchema"
+            );
             assert_eq!(
-                tool["inputSchema"]["type"],
-                "object",
+                tool["inputSchema"]["type"], "object",
                 "{name}: inputSchema must be object type"
             );
         }

@@ -1,11 +1,8 @@
 //! Type wrapper for selecting between CSR graph and Kuzu graph implementations.
 
-use super::{EdgeMetadata, GraphConfig, TraversalResult};
+use super::GraphConfig;
 use crate::engine::error::Result;
-use bytes::Bytes;
-use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[cfg(feature = "kuzu")]
 use super::KuzuGraphIndex;

@@ -1,5 +1,4 @@
 //! SSTable file format definitions
-#![allow(dead_code)]
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -19,26 +18,15 @@ pub const FOOTER_SIZE: usize = 32;
 /// Default block size (4 KB)
 pub const BLOCK_SIZE: usize = 4 * 1024;
 
-/// Maximum key size (64 KB)
-pub const MAX_KEY_SIZE: usize = 64 * 1024;
-
-/// Maximum value size (16 MB)
-pub const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
-
 /// Compression type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum Compression {
     /// No compression
     None = 0,
     /// Zstandard compression
+    #[default]
     Zstd = 1,
-}
-
-impl Default for Compression {
-    fn default() -> Self {
-        Self::Zstd
-    }
 }
 
 impl From<u8> for Compression {
@@ -267,8 +255,6 @@ impl IndexEntry {
 pub struct SSTableMeta {
     /// Path to the SSTable file
     pub path: std::path::PathBuf,
-    /// Compression type used
-    pub compression: Compression,
     /// Number of records
     pub record_count: u64,
     /// File size in bytes
@@ -277,16 +263,6 @@ pub struct SSTableMeta {
     pub min_key: Bytes,
     /// Largest key (prefix)
     pub max_key: Bytes,
-    /// Level in the LSM tree
-    pub level: usize,
-}
-
-impl SSTableMeta {
-    /// Check if a key might be in this SSTable based on key range
-    pub fn may_contain_key(&self, key: &[u8]) -> bool {
-        let key_prefix = if key.len() > 16 { &key[..16] } else { key };
-        key_prefix >= self.min_key.as_ref() && key_prefix <= self.max_key.as_ref()
-    }
 }
 
 /// Record stored in an SSTable data block
@@ -384,11 +360,6 @@ impl Record {
             },
             total_size,
         ))
-    }
-
-    /// Get the encoded size of this record
-    pub fn encoded_size(&self) -> usize {
-        14 + self.key.len() + self.value.as_ref().map(|v| v.len()).unwrap_or(0)
     }
 }
 

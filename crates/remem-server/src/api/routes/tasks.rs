@@ -6,7 +6,7 @@ use axum::{
 use serde::Serialize;
 
 use crate::api::AppState;
-use crate::error::{AppError, ErrorResponse, Result};
+use crate::error::{AppError, Result};
 use crate::tasks::registry::{RunLog, TaskStatus};
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -57,7 +57,9 @@ pub struct PauseTaskResponse {
 pub async fn list_tasks(State(state): State<AppState>) -> Json<TaskListResponse> {
     let sender = &state.services.discovery_tx;
     let queue_depth = sender.max_capacity() - sender.capacity();
-    let dropped = state.services.dropped_discovery_count
+    let dropped = state
+        .services
+        .dropped_discovery_count
         .load(std::sync::atomic::Ordering::Relaxed);
     let ws = &state.services.discovery_worker_state;
 
@@ -95,7 +97,9 @@ pub async fn run_task(
     // try_set_running atomically checks-and-sets under one lock — no TOCTOU.
     // run_task will call set_running again (harmless double-set for background loop compat).
     if !state.services.task_registry.try_set_running(&name) {
-        return Err(AppError::Conflict(format!("task '{name}' is already running")));
+        return Err(AppError::Conflict(format!(
+            "task '{name}' is already running"
+        )));
     }
 
     // Spawn the task in the background so the HTTP response returns immediately.
@@ -112,7 +116,11 @@ pub async fn run_task(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(RunTaskResponse { task: name, count: 0, error: None }),
+        Json(RunTaskResponse {
+            task: name,
+            count: 0,
+            error: None,
+        }),
     ))
 }
 
@@ -134,7 +142,10 @@ pub async fn get_task_history(
         return Err(AppError::Validation(format!("unknown task: {name}")));
     }
     let history = state.services.task_registry.get_history(&name);
-    Ok(Json(TaskHistoryResponse { task: name, history }))
+    Ok(Json(TaskHistoryResponse {
+        task: name,
+        history,
+    }))
 }
 
 #[utoipa::path(
@@ -155,7 +166,10 @@ pub async fn pause_task(
         return Err(AppError::Validation(format!("unknown task: {name}")));
     }
     state.services.task_registry.pause(&name);
-    Ok(Json(PauseTaskResponse { task: name, paused: true }))
+    Ok(Json(PauseTaskResponse {
+        task: name,
+        paused: true,
+    }))
 }
 
 #[utoipa::path(
@@ -176,5 +190,8 @@ pub async fn resume_task(
         return Err(AppError::Validation(format!("unknown task: {name}")));
     }
     state.services.task_registry.resume(&name);
-    Ok(Json(PauseTaskResponse { task: name, paused: false }))
+    Ok(Json(PauseTaskResponse {
+        task: name,
+        paused: false,
+    }))
 }

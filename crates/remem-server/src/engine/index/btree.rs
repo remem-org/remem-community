@@ -1,5 +1,4 @@
 //! B+Tree index for time-series and range queries
-#![allow(dead_code)]
 //!
 //! This module implements a B+Tree index optimized for:
 //! - Range queries: Find all records in a timestamp range
@@ -18,34 +17,15 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::ops::Bound;
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::engine::error::{Result, StorageError};
 
 /// Configuration for the B+Tree index
-#[derive(Debug, Clone)]
-pub struct BTreeConfig {
-    /// Maximum number of entries to pre-allocate
-    pub max_entries: usize,
-}
-
-impl Default for BTreeConfig {
-    fn default() -> Self {
-        Self {
-            max_entries: 10_000_000,
-        }
-    }
-}
-
-impl BTreeConfig {
-    /// Create a new config with custom max entries
-    pub fn with_max_entries(max_entries: usize) -> Self {
-        Self { max_entries }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct BTreeConfig {}
 
 /// A value stored in the B+Tree (can have multiple keys per timestamp)
 #[derive(Debug, Clone)]
@@ -78,9 +58,6 @@ impl TimestampEntry {
 /// This uses Rust's standard BTreeMap internally, which provides
 /// efficient O(log n) operations and cache-friendly iteration.
 pub struct BTreeIndex {
-    /// Configuration
-    config: BTreeConfig,
-
     /// Main index: timestamp -> list of keys
     /// Using RwLock for concurrent access
     tree: RwLock<BTreeMap<u64, TimestampEntry>>,
@@ -97,9 +74,8 @@ pub struct BTreeIndex {
 
 impl BTreeIndex {
     /// Create a new empty B+Tree index
-    pub fn new(config: BTreeConfig) -> Self {
+    pub fn new(_config: BTreeConfig) -> Self {
         Self {
-            config,
             tree: RwLock::new(BTreeMap::new()),
             key_to_timestamp: RwLock::new(std::collections::HashMap::new()),
             entry_count: AtomicUsize::new(0),
@@ -177,20 +153,6 @@ impl BTreeIndex {
         Ok(false)
     }
 
-    /// Get all keys at a specific timestamp
-    pub fn get(&self, timestamp: u64) -> Vec<Bytes> {
-        let tree = self.tree.read();
-        tree.get(&timestamp)
-            .map(|e| e.keys.clone())
-            .unwrap_or_default()
-    }
-
-    /// Get the timestamp for a key
-    pub fn get_timestamp(&self, key: &[u8]) -> Option<u64> {
-        let key_to_ts = self.key_to_timestamp.read();
-        key_to_ts.get(key).copied()
-    }
-
     /// Query a range of timestamps (inclusive)
     ///
     /// Returns (timestamp, key) pairs sorted by timestamp.
@@ -201,92 +163,6 @@ impl BTreeIndex {
         for (&ts, entry) in tree.range(start..=end) {
             for key in &entry.keys {
                 results.push((ts, key.clone()));
-            }
-        }
-
-        results
-    }
-
-    /// Query a range of timestamps with a limit
-    pub fn range_limit(&self, start: u64, end: u64, limit: usize) -> Vec<(u64, Bytes)> {
-        let tree = self.tree.read();
-        let mut results = Vec::with_capacity(limit);
-
-        for (&ts, entry) in tree.range(start..=end) {
-            for key in &entry.keys {
-                results.push((ts, key.clone()));
-                if results.len() >= limit {
-                    return results;
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Query timestamps before a given value
-    pub fn before(&self, timestamp: u64, limit: usize) -> Vec<(u64, Bytes)> {
-        let tree = self.tree.read();
-        let mut results = Vec::with_capacity(limit);
-
-        // Iterate in reverse order (most recent first)
-        for (&ts, entry) in tree.range(..timestamp).rev() {
-            for key in &entry.keys {
-                results.push((ts, key.clone()));
-                if results.len() >= limit {
-                    return results;
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Query timestamps after a given value
-    pub fn after(&self, timestamp: u64, limit: usize) -> Vec<(u64, Bytes)> {
-        let tree = self.tree.read();
-        let mut results = Vec::with_capacity(limit);
-
-        for (&ts, entry) in tree.range((Bound::Excluded(timestamp), Bound::Unbounded)) {
-            for key in &entry.keys {
-                results.push((ts, key.clone()));
-                if results.len() >= limit {
-                    return results;
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Get the most recent entries
-    pub fn latest(&self, limit: usize) -> Vec<(u64, Bytes)> {
-        let tree = self.tree.read();
-        let mut results = Vec::with_capacity(limit);
-
-        for (&ts, entry) in tree.iter().rev() {
-            for key in &entry.keys {
-                results.push((ts, key.clone()));
-                if results.len() >= limit {
-                    return results;
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Get the oldest entries
-    pub fn oldest(&self, limit: usize) -> Vec<(u64, Bytes)> {
-        let tree = self.tree.read();
-        let mut results = Vec::with_capacity(limit);
-
-        for (&ts, entry) in tree.iter() {
-            for key in &entry.keys {
-                results.push((ts, key.clone()));
-                if results.len() >= limit {
-                    return results;
-                }
             }
         }
 
@@ -305,11 +181,6 @@ impl BTreeIndex {
         tree.keys().next_back().copied()
     }
 
-    /// Get the number of unique timestamps
-    pub fn timestamp_count(&self) -> usize {
-        self.tree.read().len()
-    }
-
     /// Get the total number of entries
     pub fn len(&self) -> usize {
         self.entry_count.load(Ordering::Relaxed)
@@ -320,75 +191,9 @@ impl BTreeIndex {
         self.len() == 0
     }
 
-    /// Check if a key exists in the index
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        self.key_to_timestamp.read().contains_key(key)
-    }
-
-    /// Check if a timestamp exists in the index
-    pub fn contains_timestamp(&self, timestamp: u64) -> bool {
-        self.tree.read().contains_key(&timestamp)
-    }
-
     /// Check if the index has been modified
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
-    }
-
-    /// Mark the index as clean
-    pub fn mark_clean(&self) {
-        self.dirty.store(false, Ordering::Relaxed);
-    }
-
-    /// Save the index to a file.
-    ///
-    /// The read lock on `tree` is held only for the in-memory snapshot, not
-    /// during disk I/O.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-
-        // --- Snapshot while holding the read lock (fast, in-memory only) ---
-        let (entry_count, snapshot) = {
-            let tree = self.tree.read();
-            let snap: Vec<(u64, Vec<Bytes>)> = tree
-                .iter()
-                .map(|(&ts, e)| (ts, e.keys.clone()))
-                .collect();
-            (self.entry_count.load(Ordering::Relaxed) as u64, snap)
-            // read lock released here
-        };
-
-        // --- Write snapshot to disk without holding any lock ---
-        let tmp_path = path.with_extension("tmp");
-        let file = std::fs::File::create(&tmp_path)?;
-        let mut writer = std::io::BufWriter::new(file);
-
-        // Write header
-        writer.write_all(b"BTIX")?;
-        writer.write_all(&1u32.to_le_bytes())?;
-
-        // Write config
-        writer.write_all(&(self.config.max_entries as u64).to_le_bytes())?;
-
-        // Write entry count
-        writer.write_all(&entry_count.to_le_bytes())?;
-
-        // Write tree data
-        writer.write_all(&(snapshot.len() as u64).to_le_bytes())?;
-        for (timestamp, keys) in &snapshot {
-            writer.write_all(&timestamp.to_le_bytes())?;
-            writer.write_all(&(keys.len() as u32).to_le_bytes())?;
-            for key in keys {
-                writer.write_all(&(key.len() as u32).to_le_bytes())?;
-                writer.write_all(key)?;
-            }
-        }
-
-        writer.flush()?;
-        drop(writer);
-        std::fs::rename(&tmp_path, path)?;
-        self.mark_clean();
-        Ok(())
     }
 
     /// Load an index from a file
@@ -417,10 +222,10 @@ impl BTreeIndex {
             ));
         }
 
-        // Read config
+        // Skip legacy config bytes (max_entries — no longer stored; kept for
+        // on-disk wire-format compatibility with files written before this
+        // field was removed).
         file.read_exact(&mut buf8)?;
-        let max_entries = u64::from_le_bytes(buf8) as usize;
-        let config = BTreeConfig { max_entries };
 
         // Read entry count
         file.read_exact(&mut buf8)?;
@@ -457,20 +262,11 @@ impl BTreeIndex {
         }
 
         Ok(Self {
-            config,
             tree: RwLock::new(tree),
             key_to_timestamp: RwLock::new(key_to_timestamp),
             entry_count: AtomicUsize::new(entry_count),
             dirty: AtomicBool::new(false),
         })
-    }
-
-    /// Clear all entries from the index
-    pub fn clear(&self) {
-        self.tree.write().clear();
-        self.key_to_timestamp.write().clear();
-        self.entry_count.store(0, Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Relaxed);
     }
 }
 
@@ -483,26 +279,6 @@ mod tests {
         let index = BTreeIndex::new(BTreeConfig::default());
         assert!(index.is_empty());
         assert_eq!(index.len(), 0);
-        assert!(index.get(100).is_empty());
-    }
-
-    #[test]
-    fn test_insert_and_get() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        index.insert(1000, b"key1".to_vec()).unwrap();
-        index.insert(2000, b"key2".to_vec()).unwrap();
-        index.insert(1000, b"key3".to_vec()).unwrap(); // Same timestamp
-
-        assert_eq!(index.len(), 3);
-        assert_eq!(index.timestamp_count(), 2);
-
-        let keys_at_1000 = index.get(1000);
-        assert_eq!(keys_at_1000.len(), 2);
-
-        let keys_at_2000 = index.get(2000);
-        assert_eq!(keys_at_2000.len(), 1);
-        assert_eq!(keys_at_2000[0].as_ref(), b"key2");
     }
 
     #[test]
@@ -521,60 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn test_range_limit() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        for ts in 0..100 {
-            index.insert(ts, format!("key{}", ts)).unwrap();
-        }
-
-        let results = index.range_limit(0, 50, 10);
-        assert_eq!(results.len(), 10);
-    }
-
-    #[test]
-    fn test_before_and_after() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        for ts in (0..10).map(|i| i * 100) {
-            index.insert(ts, format!("key{}", ts)).unwrap();
-        }
-
-        // Before 500 (exclusive)
-        let before = index.before(500, 3);
-        assert_eq!(before.len(), 3);
-        assert_eq!(before[0].0, 400); // Most recent first
-        assert_eq!(before[1].0, 300);
-        assert_eq!(before[2].0, 200);
-
-        // After 500 (exclusive)
-        let after = index.after(500, 3);
-        assert_eq!(after.len(), 3);
-        assert_eq!(after[0].0, 600); // Oldest first
-        assert_eq!(after[1].0, 700);
-        assert_eq!(after[2].0, 800);
-    }
-
-    #[test]
-    fn test_latest_and_oldest() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        for ts in 0..100 {
-            index.insert(ts, format!("key{}", ts)).unwrap();
-        }
-
-        let latest = index.latest(5);
-        assert_eq!(latest.len(), 5);
-        assert_eq!(latest[0].0, 99);
-        assert_eq!(latest[4].0, 95);
-
-        let oldest = index.oldest(5);
-        assert_eq!(oldest.len(), 5);
-        assert_eq!(oldest[0].0, 0);
-        assert_eq!(oldest[4].0, 4);
-    }
-
-    #[test]
     fn test_remove() {
         let index = BTreeIndex::new(BTreeConfig::default());
 
@@ -587,13 +309,10 @@ mod tests {
         // Remove one key from a multi-key timestamp
         assert!(index.remove(b"key1").unwrap());
         assert_eq!(index.len(), 2);
-        assert_eq!(index.get(1000).len(), 1);
 
         // Remove the last key from timestamp 1000
         assert!(index.remove(b"key2").unwrap());
         assert_eq!(index.len(), 1);
-        assert!(index.get(1000).is_empty());
-        assert_eq!(index.timestamp_count(), 1);
 
         // Try to remove non-existent key
         assert!(!index.remove(b"key999").unwrap());
@@ -604,14 +323,14 @@ mod tests {
         let index = BTreeIndex::new(BTreeConfig::default());
 
         index.insert(1000, b"key1".to_vec()).unwrap();
-        assert_eq!(index.get_timestamp(b"key1"), Some(1000));
+        assert_eq!(index.range(1000, 1000), vec![(1000, Bytes::from("key1"))]);
 
-        // Update timestamp for same key
+        // Update timestamp for same key: the old (1000) entry must be gone
+        // and the new (2000) entry must be the only one -- not a duplicate.
         index.insert(2000, b"key1".to_vec()).unwrap();
-        assert_eq!(index.get_timestamp(b"key1"), Some(2000));
+        assert_eq!(index.range(1000, 1000), Vec::<(u64, Bytes)>::new());
+        assert_eq!(index.range(2000, 2000), vec![(2000, Bytes::from("key1"))]);
         assert_eq!(index.len(), 1); // Count should not increase
-        assert!(index.get(1000).is_empty());
-        assert_eq!(index.get(2000).len(), 1);
     }
 
     #[test]
@@ -627,55 +346,5 @@ mod tests {
 
         assert_eq!(index.min_timestamp(), Some(100));
         assert_eq!(index.max_timestamp(), Some(900));
-    }
-
-    #[test]
-    fn test_save_and_load() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        for ts in 0..50 {
-            index.insert(ts * 100, format!("key{}", ts)).unwrap();
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test.btree");
-
-        index.save(&path).unwrap();
-
-        let loaded = BTreeIndex::load(&path).unwrap();
-        assert_eq!(loaded.len(), 50);
-        assert_eq!(loaded.timestamp_count(), 50);
-
-        // Verify data
-        let results = loaded.range(0, 4900);
-        assert_eq!(results.len(), 50);
-    }
-
-    #[test]
-    fn test_contains() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        index.insert(1000, b"key1".to_vec()).unwrap();
-
-        assert!(index.contains_key(b"key1"));
-        assert!(!index.contains_key(b"key2"));
-        assert!(index.contains_timestamp(1000));
-        assert!(!index.contains_timestamp(2000));
-    }
-
-    #[test]
-    fn test_clear() {
-        let index = BTreeIndex::new(BTreeConfig::default());
-
-        for ts in 0..100 {
-            index.insert(ts, format!("key{}", ts)).unwrap();
-        }
-
-        assert_eq!(index.len(), 100);
-
-        index.clear();
-        assert!(index.is_empty());
-        assert_eq!(index.len(), 0);
-        assert_eq!(index.timestamp_count(), 0);
     }
 }

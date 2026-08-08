@@ -13,24 +13,23 @@ use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::engine::error::Result;
-use crate::engine::index::{
-    BTreeConfig, BTreeIndex, CsrGraph, GraphConfig, HnswIndex, InvertedIndexConfig,
-    SegmentedBTreeIndex, SegmentedCsrGraph, SegmentedInvertedIndex,
-};
-#[cfg(feature = "kuzu")]
-use crate::engine::index::KuzuGraphIndex;
 use super::compaction::CompactionManager;
 use super::engine::EngineConfig;
 use super::memtable::MemTable;
 use super::sstable::BlockCache;
 use super::wal::WAL;
+use crate::engine::error::Result;
+#[cfg(feature = "kuzu")]
+use crate::engine::index::KuzuGraphIndex;
+use crate::engine::index::{
+    BTreeConfig, BTreeIndex, GraphConfig, HnswIndex, InvertedIndexConfig, SegmentedBTreeIndex,
+    SegmentedCsrGraph, SegmentedInvertedIndex,
+};
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
 /// The KV-layer components produced by [`open_kv_layer`].
 pub(super) struct KvLayer {
-    pub cache: Arc<BlockCache>,
     pub compaction: Arc<CompactionManager>,
     pub wal: Arc<Mutex<WAL>>,
     /// Absolute path to the WAL file (needed by the WAL-replay step).
@@ -57,7 +56,7 @@ pub(super) fn open_kv_layer(config: &EngineConfig) -> Result<KvLayer> {
     let compaction = Arc::new(CompactionManager::new(
         config.data_dir.join("sstables"),
         config.compaction.clone(),
-        Arc::clone(&cache),
+        cache,
     )?);
     compaction.load_existing()?;
 
@@ -71,7 +70,12 @@ pub(super) fn open_kv_layer(config: &EngineConfig) -> Result<KvLayer> {
 
     let memtable = Arc::new(RwLock::new(MemTable::with_capacity(config.memtable_size)));
 
-    Ok(KvLayer { cache, compaction, wal, wal_path, memtable })
+    Ok(KvLayer {
+        compaction,
+        wal,
+        wal_path,
+        memtable,
+    })
 }
 
 // ── Secondary indexes ─────────────────────────────────────────────────────────
@@ -87,7 +91,12 @@ pub(super) fn open_indexes(config: &EngineConfig) -> Result<Indexes> {
     let graph = open_graph(config)?;
     let time_series = open_time_series(config)?;
     let tag = open_tag(config)?;
-    Ok(Indexes { hnsw, graph, time_series, tag })
+    Ok(Indexes {
+        hnsw,
+        graph,
+        time_series,
+        tag,
+    })
 }
 
 fn open_hnsw(config: &EngineConfig) -> Result<Option<Arc<HnswIndex>>> {
@@ -114,7 +123,10 @@ fn open_hnsw(config: &EngineConfig) -> Result<Option<Arc<HnswIndex>>> {
     if manifest_path.exists() {
         match HnswIndex::load_chunked(&index_dir, hnsw_config.clone()) {
             Ok(Some(idx)) => {
-                tracing::info!("Loaded HNSW index from segmented chunks ({} nodes)", idx.len());
+                tracing::info!(
+                    "Loaded HNSW index from segmented chunks ({} nodes)",
+                    idx.len()
+                );
                 return Ok(Some(Arc::new(idx)));
             }
             Ok(None) => {
@@ -157,7 +169,10 @@ fn open_hnsw(config: &EngineConfig) -> Result<Option<Arc<HnswIndex>>> {
             }
         }
     } else {
-        tracing::info!("Creating new HNSW index with dimension {}", config.vector.dimension);
+        tracing::info!(
+            "Creating new HNSW index with dimension {}",
+            config.vector.dimension
+        );
         HnswIndex::new(hnsw_config)
     };
 
@@ -194,7 +209,11 @@ fn open_graph(
                 "Found legacy graph index at {:?}; migrating to segmented format",
                 legacy_path
             );
-            match SegmentedCsrGraph::migrate_from_legacy(&legacy_path, graph_config.clone(), index_dir.clone()) {
+            match SegmentedCsrGraph::migrate_from_legacy(
+                &legacy_path,
+                graph_config.clone(),
+                index_dir.clone(),
+            ) {
                 Ok(seg_idx) => {
                     let _ = std::fs::remove_file(&legacy_path);
                     tracing::info!("Migrated legacy graph.idx to segmented format");
@@ -254,7 +273,8 @@ fn open_time_series(
         );
         match BTreeIndex::load(&legacy_path) {
             Ok(legacy_idx) => {
-                let mut seg_idx = SegmentedBTreeIndex::new(BTreeConfig::default(), index_dir.clone());
+                let mut seg_idx =
+                    SegmentedBTreeIndex::new(BTreeConfig::default(), index_dir.clone());
                 // Re-insert all entries from legacy index
                 for (ts, key) in legacy_idx.range(0, u64::MAX) {
                     let _ = seg_idx.insert(ts, key);
@@ -347,7 +367,10 @@ fn open_tag(
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to seal migrated tag index: {}; continuing with in-memory only", e);
+                        tracing::warn!(
+                            "Failed to seal migrated tag index: {}; continuing with in-memory only",
+                            e
+                        );
                     }
                 }
                 seg_idx

@@ -188,7 +188,6 @@ impl std::io::Write for SegmentWriter {
 /// Reads a segment file and verifies its CRC32 footer.
 #[derive(Debug)]
 pub struct SegmentReader {
-    pub header: SegmentHeader,
     data: Vec<u8>,
 }
 
@@ -198,7 +197,9 @@ impl SegmentReader {
         let file = std::fs::File::open(path).map_err(StorageError::Io)?;
         let mut r = std::io::BufReader::new(file);
 
-        let header = SegmentHeader::read_from(&mut r)?;
+        // Parsed only to advance past the header bytes — callers get chunk
+        // metadata (seq_no, entry_count, id range) from the manifest instead.
+        let _header = SegmentHeader::read_from(&mut r)?;
 
         // Read remaining bytes (DATA + footer) all at once.
         let mut remaining = Vec::new();
@@ -219,13 +220,11 @@ impl SegmentReader {
         if computed != stored_crc32 {
             return Err(StorageError::invalid_format(
                 path,
-                format!(
-                    "CRC32 mismatch: stored {stored_crc32:#010x}, computed {computed:#010x}"
-                ),
+                format!("CRC32 mismatch: stored {stored_crc32:#010x}, computed {computed:#010x}"),
             ));
         }
 
-        Ok(Self { header, data })
+        Ok(Self { data })
     }
 
     /// Return a cursor over the data section for deserialization.
@@ -248,6 +247,20 @@ mod tests {
     }
 
     #[test]
+    fn test_header_round_trip() {
+        let header = test_header();
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let parsed = SegmentHeader::read_from(&mut std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(parsed.magic, *b"TEST_SEG");
+        assert_eq!(parsed.seq_no, 0);
+        assert_eq!(parsed.entry_count, 42);
+        assert_eq!(parsed.first_id, 0);
+        assert_eq!(parsed.last_id, 41);
+    }
+
+    #[test]
     fn test_write_read_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_0000.seg");
@@ -258,8 +271,6 @@ mod tests {
         assert_ne!(crc32, 0);
 
         let r = SegmentReader::open(&path).unwrap();
-        assert_eq!(r.header.seq_no, 0);
-        assert_eq!(r.header.entry_count, 42);
         assert_eq!(r.data(), b"hello world");
     }
 

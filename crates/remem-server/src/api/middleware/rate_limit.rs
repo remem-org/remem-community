@@ -63,7 +63,12 @@ pub fn apply_if_configured(
                 .finish()
                 .expect("invalid rate limit config"),
         );
-        tracing::info!(rps, burst, key_extractor = "peer_ip", "rate limiting enabled");
+        tracing::info!(
+            rps,
+            burst,
+            key_extractor = "peer_ip",
+            "rate limiting enabled"
+        );
         router.layer(GovernorLayer { config: conf })
     }
 }

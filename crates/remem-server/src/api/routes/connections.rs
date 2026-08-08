@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::error::{AppError, ErrorResponse, Result};
+use crate::error::{AppError, Result};
 use crate::services::types::{Connection, Memory, RelationshipType};
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -83,9 +83,17 @@ pub async fn list_connections(
     let (pairs, total) = state.services.connection.list_all(limit, offset).await?;
     let connections: Vec<ConnectionResponse> = pairs
         .into_iter()
-        .map(|(src, conn)| ConnectionResponse { source_id: src, connection: conn })
+        .map(|(src, conn)| ConnectionResponse {
+            source_id: src,
+            connection: conn,
+        })
         .collect();
-    Ok(Json(ListConnectionsResponse { connections, total, limit, offset }))
+    Ok(Json(ListConnectionsResponse {
+        connections,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 #[utoipa::path(
@@ -122,7 +130,10 @@ pub async fn create_connection(
         )
         .await?;
 
-    Ok(Json(ConnectionResponse { source_id: body.source_id, connection }))
+    Ok(Json(ConnectionResponse {
+        source_id: body.source_id,
+        connection,
+    }))
 }
 
 #[utoipa::path(
@@ -143,7 +154,10 @@ pub async fn delete_connection(
     Path((source_id, target_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeleteConnectionResponse>> {
     state.services.connection.delete(source_id, target_id)?;
-    Ok(Json(DeleteConnectionResponse { success: true, message: "connection removed" }))
+    Ok(Json(DeleteConnectionResponse {
+        success: true,
+        message: "connection removed",
+    }))
 }
 
 #[utoipa::path(
@@ -192,5 +206,8 @@ pub async fn find_related(
         .map(|(memory, connection)| RelatedItem { memory, connection })
         .collect();
 
-    Ok(Json(RelatedResponse { memory_id: id, related }))
+    Ok(Json(RelatedResponse {
+        memory_id: id,
+        related,
+    }))
 }

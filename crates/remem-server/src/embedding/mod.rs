@@ -55,7 +55,7 @@ impl EmbeddingService {
         // batch. E.g. on 8 cores: 4 workers → 3 inferences + 1 collecting at
         // any moment ≈ full utilisation.
         let num_workers = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).max(2).min(8))
+            .map(|n| (n.get() / 2).clamp(2, 8))
             .unwrap_or(4);
 
         // Channel depth: enough to absorb bursts without blocking callers.
@@ -103,7 +103,10 @@ impl EmbeddingService {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(PendingEmbed { text: text.to_owned(), reply: reply_tx })
+            .send(PendingEmbed {
+                text: text.to_owned(),
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| AppError::Embedding("embedding service unavailable".into()))?;
 
@@ -191,7 +194,7 @@ fn cache_key(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
 }
 
-fn l2_normalize(v: &mut Vec<f32>) {
+fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > f32::EPSILON {
         v.iter_mut().for_each(|x| *x /= norm);

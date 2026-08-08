@@ -100,7 +100,9 @@ impl TryFrom<&str> for SortBy {
         match s {
             "created_at" => Ok(SortBy::CreatedAt),
             "accessed_at" => Ok(SortBy::AccessedAt),
-            other => Err(format!("unknown sort_by: {other}; use created_at or accessed_at")),
+            other => Err(format!(
+                "unknown sort_by: {other}; use created_at or accessed_at"
+            )),
         }
     }
 }
@@ -251,7 +253,11 @@ pub fn memory_key(id: Uuid) -> String {
 /// there's no window between "index scan finds this key" and "we know
 /// which id to lock."
 pub fn parse_memory_id(key: &[u8]) -> Option<Uuid> {
-    std::str::from_utf8(key).ok()?.strip_prefix("memory:")?.parse().ok()
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix("memory:")?
+        .parse()
+        .ok()
 }
 
 pub fn default_memory_health() -> f32 {
@@ -277,7 +283,10 @@ mod tests {
 
     #[test]
     fn memory_type_try_from_valid() {
-        assert_eq!(MemoryType::try_from("short_term"), Ok(MemoryType::ShortTerm));
+        assert_eq!(
+            MemoryType::try_from("short_term"),
+            Ok(MemoryType::ShortTerm)
+        );
         assert_eq!(MemoryType::try_from("long_term"), Ok(MemoryType::LongTerm));
     }
 
@@ -326,7 +335,11 @@ mod tests {
             ("derived_from", RelationshipType::DerivedFrom),
         ];
         for (s, expected) in pairs {
-            assert_eq!(RelationshipType::try_from(s), Ok(expected), "failed for {s}");
+            assert_eq!(
+                RelationshipType::try_from(s),
+                Ok(expected),
+                "failed for {s}"
+            );
         }
     }
 
@@ -368,7 +381,10 @@ mod tests {
     #[test]
     fn memory_key_format() {
         let id = uuid::Uuid::nil();
-        assert_eq!(memory_key(id), "memory:00000000-0000-0000-0000-000000000000");
+        assert_eq!(
+            memory_key(id),
+            "memory:00000000-0000-0000-0000-000000000000"
+        );
     }
 
     #[test]
@@ -412,7 +428,10 @@ mod tests {
     fn now_ms_after_2024() {
         let ms = now_ms();
         let jan_2024_ms: u64 = 1_704_067_200_000;
-        assert!(ms > jan_2024_ms, "now_ms() returned a timestamp before 2024");
+        assert!(
+            ms > jan_2024_ms,
+            "now_ms() returned a timestamp before 2024"
+        );
     }
 
     // ── StoredMemory::is_expired ──────────────────────────────────────────────
@@ -530,7 +549,10 @@ mod tests {
         assert!(api.metadata.ttl.is_none());
         assert_eq!(api.connections.len(), 1);
         assert_eq!(api.connections[0].target_id, target_id);
-        assert_eq!(api.connections[0].relationship_type, RelationshipType::SimilarTo);
+        assert_eq!(
+            api.connections[0].relationship_type,
+            RelationshipType::SimilarTo
+        );
     }
 
     #[test]

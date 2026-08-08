@@ -101,9 +101,15 @@ pub fn build_router(state: AppState) -> Router {
         // Background tasks
         .route("/api/v1/tasks", get(routes::tasks::list_tasks))
         .route("/api/v1/tasks/:name/run", post(routes::tasks::run_task))
-        .route("/api/v1/tasks/:name/history", get(routes::tasks::get_task_history))
+        .route(
+            "/api/v1/tasks/:name/history",
+            get(routes::tasks::get_task_history),
+        )
         .route("/api/v1/tasks/:name/pause", post(routes::tasks::pause_task))
-        .route("/api/v1/tasks/:name/resume", post(routes::tasks::resume_task))
+        .route(
+            "/api/v1/tasks/:name/resume",
+            post(routes::tasks::resume_task),
+        )
         // MCP — Streamable HTTP, mounted here (not under /api/v1) so it gets
         // the same auth/CORS/rate-limit layers as everything else below,
         // closing PROJECT_REVIEW.md §7.1 #1 (previously an unauthenticated
@@ -112,18 +118,21 @@ pub fn build_router(state: AppState) -> Router {
 
     // Business: Prometheus metrics endpoint (no auth — scraped by Prometheus server)
     #[cfg(feature = "business")]
-    let api = api.route("/api/v1/metrics", get({
-        let services = metrics_services.clone();
-        let handle = metric_handle.clone();
-        move || {
-            let services = services.clone();
-            let handle = handle.clone();
-            async move {
-                crate::business::monitoring::update_from_services(&services);
-                handle.render()
+    let api = api.route(
+        "/api/v1/metrics",
+        get({
+            let services = metrics_services.clone();
+            let handle = metric_handle.clone();
+            move || {
+                let services = services.clone();
+                let handle = handle.clone();
+                async move {
+                    crate::business::monitoring::update_from_services(&services);
+                    handle.render()
+                }
             }
-        }
-    }));
+        }),
+    );
 
     let api = api
         .layer(axum_middleware::from_fn_with_state(
@@ -140,8 +149,8 @@ pub fn build_router(state: AppState) -> Router {
     let router = router.layer(prometheus_layer);
 
     let router = router
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
                 let request_id = request
                     .headers()
                     .get("X-Request-ID")
@@ -153,8 +162,8 @@ pub fn build_router(state: AppState) -> Router {
                     path = %request.uri().path(),
                     request_id = %request_id,
                 )
-            }),
-        )
+            },
+        ))
         .layer(cors);
 
     middleware::rate_limit::apply_if_configured(

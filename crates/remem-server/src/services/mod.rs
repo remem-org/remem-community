@@ -5,8 +5,8 @@ pub mod repository;
 pub mod search_engine;
 pub mod types;
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::engine::{QueryEngine, QueryEngineConfig, StorageEngine};
@@ -22,7 +22,6 @@ pub use lifecycle_manager::LifecycleManager;
 pub use memory_manager::MemoryManager;
 pub use repository::MemoryRepository;
 pub use search_engine::SearchEngine;
-pub use types::*;
 
 /// All services bundled together and shared via Arc.
 #[derive(Clone)]
@@ -31,8 +30,6 @@ pub struct AppServices {
     pub search: Arc<SearchEngine>,
     pub connection: Arc<ConnectionManager>,
     pub lifecycle: Arc<LifecycleManager>,
-    #[allow(dead_code)]
-    pub embedding: Arc<EmbeddingService>,
     pub engine: Arc<StorageEngine>,
     /// Typed repository — exposes `load_by_key` / `load` for callers that need
     /// to scan raw storage without going through `MemoryManager` (e.g. stats).
@@ -58,7 +55,8 @@ pub async fn create_services(engine: Arc<StorageEngine>, cfg: &Config) -> Result
     let repo = Arc::new(MemoryRepository::new(Arc::clone(&engine)));
 
     // Create discovery channel FIRST so MemoryManager can hold a sender.
-    let (discovery_tx, discovery_rx) = mpsc::channel::<DiscoveryTask>(cfg.tasks.discovery_queue_size);
+    let (discovery_tx, discovery_rx) =
+        mpsc::channel::<DiscoveryTask>(cfg.tasks.discovery_queue_size);
     let dropped_discovery_count = Arc::new(AtomicU64::new(0));
     let discovery_rx = Arc::new(tokio::sync::Mutex::new(discovery_rx));
 
@@ -89,7 +87,6 @@ pub async fn create_services(engine: Arc<StorageEngine>, cfg: &Config) -> Result
         search,
         connection,
         lifecycle,
-        embedding,
         engine,
         repo,
         task_registry,

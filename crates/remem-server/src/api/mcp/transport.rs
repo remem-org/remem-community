@@ -58,7 +58,9 @@ impl Sessions {
 
     fn sweep(&self, idle_timeout: Duration) {
         let now = Instant::now();
-        self.0.lock().retain(|_, last_seen| now.duration_since(*last_seen) < idle_timeout);
+        self.0
+            .lock()
+            .retain(|_, last_seen| now.duration_since(*last_seen) < idle_timeout);
     }
 }
 
@@ -79,7 +81,10 @@ pub fn router() -> Router<AppState> {
     });
 
     Router::new()
-        .route("/mcp", post(handle_post).get(handle_get).delete(handle_delete))
+        .route(
+            "/mcp",
+            post(handle_post).get(handle_get).delete(handle_delete),
+        )
         .layer(Extension(sessions))
 }
 
@@ -127,8 +132,15 @@ async fn handle_post(
         match sessions.try_create() {
             Some(id) => Some(id),
             None => {
-                tracing::warn!(max_sessions = MAX_SESSIONS, "MCP session cap reached, refusing new session");
-                return (StatusCode::SERVICE_UNAVAILABLE, "too many active MCP sessions").into_response();
+                tracing::warn!(
+                    max_sessions = MAX_SESSIONS,
+                    "MCP session cap reached, refusing new session"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many active MCP sessions",
+                )
+                    .into_response();
             }
         }
     } else {

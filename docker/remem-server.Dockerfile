@@ -52,6 +52,9 @@ ENV ORT_LIB_LOCATION=/ort-libs
 FROM builder AS linter
 RUN cargo fmt --all -- --check
 RUN cargo clippy --all-targets -- -D warnings
+# Business-gated code is not compiled by the default build, so it needs its own
+# pass or lints in crates/remem-server/src/business/ reach main unchecked.
+RUN cargo clippy --all-targets --features business -- -D warnings
 
 # ── Test stage (used by CI / docker build --target tester) ───────────────────
 FROM builder AS tester

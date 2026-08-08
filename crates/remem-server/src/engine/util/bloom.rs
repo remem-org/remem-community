@@ -1,5 +1,4 @@
 //! Bloom filter implementation for efficient membership testing
-#![allow(dead_code)]
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -31,18 +30,8 @@ impl BloomFilter {
         // Calculate optimal number of hash functions: k = (m/n) * ln(2)
         let num_hashes = Self::optimal_num_hashes(num_bits, expected_items);
 
-        let num_words = (num_bits as usize + 63) / 64;
+        let num_words = (num_bits as usize).div_ceil(64);
 
-        Self {
-            bits: vec![0; num_words],
-            num_bits,
-            num_hashes,
-        }
-    }
-
-    /// Create a bloom filter with specific parameters
-    pub fn with_params(num_bits: u32, num_hashes: u8) -> Self {
-        let num_words = (num_bits as usize + 63) / 64;
         Self {
             bits: vec![0; num_words],
             num_bits,
@@ -55,7 +44,7 @@ impl BloomFilter {
         let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
         let m = -(n as f64) * fp_rate.ln() / ln2_squared;
         // Round up to nearest 64 for word alignment
-        let m = ((m as u32 + 63) / 64) * 64;
+        let m = (m as u32).div_ceil(64) * 64;
         m.max(64) // Minimum 64 bits
     }
 
@@ -131,16 +120,6 @@ impl BloomFilter {
         (self.bits[word_idx] >> bit_idx) & 1 == 1
     }
 
-    /// Get the number of bits in the filter
-    pub fn num_bits(&self) -> u32 {
-        self.num_bits
-    }
-
-    /// Get the number of hash functions
-    pub fn num_hashes(&self) -> u8 {
-        self.num_hashes
-    }
-
     /// Encode the bloom filter to bytes
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(5 + self.bits.len() * 8);
@@ -166,7 +145,7 @@ impl BloomFilter {
         let num_bits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let num_hashes = data[4];
 
-        let num_words = (num_bits as usize + 63) / 64;
+        let num_words = (num_bits as usize).div_ceil(64);
         let expected_len = 5 + num_words * 8;
 
         if data.len() < expected_len {
@@ -196,25 +175,6 @@ impl BloomFilter {
             num_bits,
             num_hashes,
         })
-    }
-
-    /// Estimate the current false positive rate based on fill ratio
-    pub fn estimated_fp_rate(&self) -> f64 {
-        let set_bits: usize = self.bits.iter().map(|w| w.count_ones() as usize).sum();
-        let fill_ratio = set_bits as f64 / self.num_bits as f64;
-        fill_ratio.powi(self.num_hashes as i32)
-    }
-
-    /// Check if the filter is empty
-    pub fn is_empty(&self) -> bool {
-        self.bits.iter().all(|&w| w == 0)
-    }
-
-    /// Clear all bits in the filter
-    pub fn clear(&mut self) {
-        for word in &mut self.bits {
-            *word = 0;
-        }
     }
 }
 
@@ -295,30 +255,10 @@ mod tests {
         let encoded = bloom.encode();
         let decoded = BloomFilter::decode(&encoded).unwrap();
 
-        assert_eq!(bloom.num_bits(), decoded.num_bits());
-        assert_eq!(bloom.num_hashes(), decoded.num_hashes());
+        assert_eq!(bloom.num_bits, decoded.num_bits);
+        assert_eq!(bloom.num_hashes, decoded.num_hashes);
         assert!(decoded.may_contain(b"key1"));
         assert!(decoded.may_contain(b"key2"));
         assert!(decoded.may_contain(b"key3"));
-    }
-
-    #[test]
-    fn test_empty_filter() {
-        let bloom = BloomFilter::new(100, 0.01);
-        assert!(bloom.is_empty());
-
-        let mut bloom2 = BloomFilter::new(100, 0.01);
-        bloom2.insert(b"test");
-        assert!(!bloom2.is_empty());
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut bloom = BloomFilter::new(100, 0.01);
-        bloom.insert(b"test");
-        assert!(!bloom.is_empty());
-
-        bloom.clear();
-        assert!(bloom.is_empty());
     }
 }

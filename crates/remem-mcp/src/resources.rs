@@ -31,7 +31,9 @@ pub fn list() -> Value {
 
 /// Dispatch a `resources/read` request.
 pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> anyhow::Result<Value> {
-    let uri = params["uri"].as_str().ok_or_else(|| anyhow!("missing uri"))?;
+    let uri = params["uri"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing uri"))?;
 
     // Strip "memory://" scheme
     let rest = uri
@@ -60,7 +62,9 @@ pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> any
         }
 
         "collections/recent" => {
-            let data = client.list_memories(limit, offset, None, None, request_id).await?;
+            let data = client
+                .list_memories(limit, offset, None, None, request_id)
+                .await?;
             let empty = vec![];
             let memories = data["memories"].as_array().unwrap_or(&empty);
             let count = memories.len();
@@ -74,7 +78,11 @@ pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> any
         "collections/important" => {
             let data = client.list_memories(200, 0, None, None, request_id).await?;
             let empty = vec![];
-            let mut all: Vec<&Value> = data["memories"].as_array().unwrap_or(&empty).iter().collect();
+            let mut all: Vec<&Value> = data["memories"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .collect();
             all.sort_by(|a, b| {
                 let ia = a["metadata"]["importance"].as_f64().unwrap_or(0.0);
                 let ib = b["metadata"]["importance"].as_f64().unwrap_or(0.0);
@@ -97,7 +105,9 @@ pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> any
         p if p.starts_with("graph/") => {
             let memory_id = &p["graph/".len()..];
             let depth = parse_int("depth", 2);
-            let data = client.find_related(memory_id, depth, 50, request_id).await?;
+            let data = client
+                .find_related(memory_id, depth, 50, request_id)
+                .await?;
             serde_json::to_string_pretty(&data)?
         }
 

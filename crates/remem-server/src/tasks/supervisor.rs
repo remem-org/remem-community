@@ -40,7 +40,10 @@ pub struct TaskSupervisor {
 
 impl TaskSupervisor {
     pub fn new(cancel: CancellationToken) -> Self {
-        Self { cancel, handles: Vec::new() }
+        Self {
+            cancel,
+            handles: Vec::new(),
+        }
     }
 
     /// Spawn the lifecycle schedule loop (expiry, decay, consolidation, etc.).
@@ -64,7 +67,11 @@ impl TaskSupervisor {
     pub fn spawn_discovery_workers(
         &mut self,
         n: usize,
-        rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::services::connection_manager::DiscoveryTask>>>,
+        rx: Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::Receiver<crate::services::connection_manager::DiscoveryTask>,
+            >,
+        >,
         connection: Arc<ConnectionManager>,
         state: &DiscoveryWorkerState,
     ) {
@@ -167,13 +174,12 @@ impl TaskSupervisor {
                         if slot_restarts > max_restarts {
                             tracing::error!(
                                 worker = name,
-                                "giving up after {} restart(s)", max_restarts
+                                "giving up after {} restart(s)",
+                                max_restarts
                             );
                             break;
                         }
-                        let delay = std::time::Duration::from_secs(
-                            2u64.pow(slot_restarts.min(3))
-                        );
+                        let delay = std::time::Duration::from_secs(2u64.pow(slot_restarts.min(3)));
                         tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = tokio::time::sleep(delay) => {}
@@ -207,15 +213,14 @@ mod tests {
         let token = CancellationToken::new();
         let mut sup = TaskSupervisor::new(token);
         let cancel = sup.cancel.clone();
-        let h = tokio::spawn(async move { cancel.cancelled().await; });
+        let h = tokio::spawn(async move {
+            cancel.cancelled().await;
+        });
         sup.handles.push(("test_worker", h));
 
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            sup.shutdown(),
-        )
-        .await
-        .expect("shutdown must complete within 500ms");
+        tokio::time::timeout(std::time::Duration::from_millis(500), sup.shutdown())
+            .await
+            .expect("shutdown must complete within 500ms");
     }
 
     #[tokio::test]
@@ -234,7 +239,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        assert_eq!(state.restart_count.load(Ordering::Relaxed), 1, "restart_count");
+        assert_eq!(
+            state.restart_count.load(Ordering::Relaxed),
+            1,
+            "restart_count"
+        );
         assert_eq!(state.alive.load(Ordering::Relaxed), 0, "alive");
         assert!(state.last_panic.lock().unwrap().is_some(), "last_panic set");
 
@@ -292,13 +301,23 @@ mod tests {
         });
 
         // Panic 1 → sleep 2s (2^1); panic 2 → sleep 4s (2^2); panic 3 → give up.
-        for _ in 0..20 { tokio::task::yield_now().await; }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
-        for _ in 0..20 { tokio::task::yield_now().await; }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        for _ in 0..20 { tokio::task::yield_now().await; }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
 
-        assert_eq!(state.restart_count.load(Ordering::Relaxed), 3, "3 panics total");
+        assert_eq!(
+            state.restart_count.load(Ordering::Relaxed),
+            3,
+            "3 panics total"
+        );
         assert_eq!(state.alive.load(Ordering::Relaxed), 0, "no alive workers");
 
         sup.shutdown().await;

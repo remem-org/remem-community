@@ -64,7 +64,11 @@ impl MemoryManager {
         embedding: Arc<EmbeddingService>,
         discovery_tx: mpsc::Sender<DiscoveryTask>,
     ) -> Self {
-        Self { repo, embedding, discovery_tx }
+        Self {
+            repo,
+            embedding,
+            discovery_tx,
+        }
     }
 
     pub async fn create(&self, content: &str, opts: CreateOpts) -> Result<(Memory, Vec<f32>)> {
@@ -126,13 +130,7 @@ impl MemoryManager {
 
         self.repo
             .engine
-            .store_memory_core(
-                key,
-                json,
-                Some(embedding.clone()),
-                now,
-                &index_tags,
-            )
+            .store_memory_core(key, json, Some(embedding.clone()), now, &index_tags)
             .await?;
 
         Ok((stored.into_api(Vec::new()), embedding))
@@ -141,11 +139,7 @@ impl MemoryManager {
     pub async fn get(&self, id: Uuid) -> Result<Memory> {
         let _guard = self.repo.lock(id).await;
 
-        let mut stored = self
-            .repo
-            .load(id)
-            .await?
-            .ok_or(AppError::NotFound(id))?;
+        let mut stored = self.repo.load(id).await?.ok_or(AppError::NotFound(id))?;
 
         if stored.archived {
             return Err(AppError::NotFound(id));
@@ -165,11 +159,7 @@ impl MemoryManager {
     pub async fn update(&self, id: Uuid, patch: UpdatePatch) -> Result<Memory> {
         let _guard = self.repo.lock(id).await;
 
-        let mut stored = self
-            .repo
-            .load(id)
-            .await?
-            .ok_or(AppError::NotFound(id))?;
+        let mut stored = self.repo.load(id).await?.ok_or(AppError::NotFound(id))?;
 
         if stored.archived {
             return Err(AppError::NotFound(id));
@@ -202,7 +192,9 @@ impl MemoryManager {
 
         if content_changed {
             let embedding = self.embedding.embed(&stored.content).await?;
-            self.repo.store_with_embedding(&stored, embedding.clone()).await?;
+            self.repo
+                .store_with_embedding(&stored, embedding.clone())
+                .await?;
 
             // Remove stale connections — new ones will be discovered asynchronously.
             let key = memory_key(id);
@@ -234,18 +226,16 @@ impl MemoryManager {
         if hard {
             self.repo.delete(id).await?;
         } else {
-            let mut stored = self
-                .repo
-                .load(id)
-                .await?
-                .ok_or(AppError::NotFound(id))?;
+            let mut stored = self.repo.load(id).await?.ok_or(AppError::NotFound(id))?;
             stored.archived = true;
             stored.metadata.updated_at = now_ms();
             self.repo.store(&stored).await?;
             // Keep timestamp/tag index entries so cleanup_archived can find the
             // archived record later; user-facing reads filter `archived=true`.
             let key = memory_key(id);
-            self.repo.engine.add_tags(key, &["__archived__".to_owned()])?;
+            self.repo
+                .engine
+                .add_tags(key, &["__archived__".to_owned()])?;
         }
         Ok(())
     }
@@ -329,24 +319,12 @@ impl MemoryManager {
         Ok((memories, total))
     }
 
-    /// Load a StoredMemory without updating access counts (for internal use).
-    #[allow(dead_code)]
-    pub async fn load_stored(&self, id: Uuid) -> Result<StoredMemory> {
-        self.repo.load(id).await?.ok_or(AppError::NotFound(id))
-    }
-
-    /// Persist a StoredMemory back (without re-indexing tags/timestamps).
-    #[allow(dead_code)]
-    pub async fn save_stored(&self, stored: &StoredMemory) -> Result<()> {
-        self.repo.store(stored).await
-    }
-
     pub async fn fetch_connections(&self, id: Uuid) -> Result<Vec<Connection>> {
         let key = memory_key(id);
         let neighbors = self.repo.engine.get_neighbors(key.as_bytes())?;
 
         let mut connections = Vec::new();
-        for (target_bytes, edge_type_str, weight) in neighbors {
+        for (target_bytes, edge_type_str, weight, edge_ts) in neighbors {
             let target_str = String::from_utf8_lossy(&target_bytes);
             // Key format is "memory:{uuid}"
             if let Some(uuid_str) = target_str.strip_prefix("memory:") {
@@ -358,7 +336,7 @@ impl MemoryManager {
                             target_id,
                             relationship_type: rel,
                             strength: weight,
-                            created_at: crate::services::types::ms_to_dt(now_ms()),
+                            created_at: crate::services::types::ms_to_dt(edge_ts),
                         });
                     }
                 }
@@ -461,14 +439,20 @@ mod tests {
     #[test]
     fn memory_type_filter_match() {
         let m = make_stored(MemoryType::LongTerm, 0.5, vec![], 1000);
-        let f = MemoryFilters { memory_type: Some(MemoryType::LongTerm), ..Default::default() };
+        let f = MemoryFilters {
+            memory_type: Some(MemoryType::LongTerm),
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &f));
     }
 
     #[test]
     fn memory_type_filter_no_match() {
         let m = make_stored(MemoryType::ShortTerm, 0.5, vec![], 1000);
-        let f = MemoryFilters { memory_type: Some(MemoryType::LongTerm), ..Default::default() };
+        let f = MemoryFilters {
+            memory_type: Some(MemoryType::LongTerm),
+            ..Default::default()
+        };
         assert!(!matches_filters_pub(&m, &f));
     }
 
@@ -476,10 +460,16 @@ mod tests {
     fn min_importance_boundary() {
         let m = make_stored(MemoryType::ShortTerm, 0.5, vec![], 1000);
 
-        let pass = MemoryFilters { min_importance: Some(0.5), ..Default::default() };
+        let pass = MemoryFilters {
+            min_importance: Some(0.5),
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &pass));
 
-        let fail = MemoryFilters { min_importance: Some(0.51), ..Default::default() };
+        let fail = MemoryFilters {
+            min_importance: Some(0.51),
+            ..Default::default()
+        };
         assert!(!matches_filters_pub(&m, &fail));
     }
 
@@ -487,10 +477,16 @@ mod tests {
     fn max_importance_boundary() {
         let m = make_stored(MemoryType::ShortTerm, 0.5, vec![], 1000);
 
-        let pass = MemoryFilters { max_importance: Some(0.5), ..Default::default() };
+        let pass = MemoryFilters {
+            max_importance: Some(0.5),
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &pass));
 
-        let fail = MemoryFilters { max_importance: Some(0.49), ..Default::default() };
+        let fail = MemoryFilters {
+            max_importance: Some(0.49),
+            ..Default::default()
+        };
         assert!(!matches_filters_pub(&m, &fail));
     }
 
@@ -515,10 +511,16 @@ mod tests {
     fn created_after_filter() {
         let m = make_stored(MemoryType::ShortTerm, 0.5, vec![], 2000);
 
-        let pass = MemoryFilters { created_after: Some(1000), ..Default::default() };
+        let pass = MemoryFilters {
+            created_after: Some(1000),
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &pass));
 
-        let fail = MemoryFilters { created_after: Some(3000), ..Default::default() };
+        let fail = MemoryFilters {
+            created_after: Some(3000),
+            ..Default::default()
+        };
         assert!(!matches_filters_pub(&m, &fail));
     }
 
@@ -526,27 +528,49 @@ mod tests {
     fn created_before_filter() {
         let m = make_stored(MemoryType::ShortTerm, 0.5, vec![], 2000);
 
-        let pass = MemoryFilters { created_before: Some(3000), ..Default::default() };
+        let pass = MemoryFilters {
+            created_before: Some(3000),
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &pass));
 
-        let fail = MemoryFilters { created_before: Some(1000), ..Default::default() };
+        let fail = MemoryFilters {
+            created_before: Some(1000),
+            ..Default::default()
+        };
         assert!(!matches_filters_pub(&m, &fail));
     }
 
     #[test]
     fn tags_single_match() {
-        let m = make_stored(MemoryType::ShortTerm, 0.5, vec!["rust".into(), "test".into()], 1000);
+        let m = make_stored(
+            MemoryType::ShortTerm,
+            0.5,
+            vec!["rust".into(), "test".into()],
+            1000,
+        );
 
-        let pass = MemoryFilters { tags: vec!["rust".into()], ..Default::default() };
+        let pass = MemoryFilters {
+            tags: vec!["rust".into()],
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &pass));
 
-        let fail = MemoryFilters { tags: vec!["python".into()], ..Default::default() };
+        let fail = MemoryFilters {
+            tags: vec!["python".into()],
+            ..Default::default()
+        };
         assert!(!matches_filters_pub(&m, &fail));
     }
 
     #[test]
     fn tags_all_must_match() {
-        let m = make_stored(MemoryType::ShortTerm, 0.5, vec!["rust".into(), "test".into()], 1000);
+        let m = make_stored(
+            MemoryType::ShortTerm,
+            0.5,
+            vec!["rust".into(), "test".into()],
+            1000,
+        );
 
         // Both present → passes
         let both = MemoryFilters {
@@ -566,18 +590,16 @@ mod tests {
     #[test]
     fn empty_tags_filter_matches_all() {
         let m = make_stored(MemoryType::ShortTerm, 0.5, vec![], 1000);
-        let f = MemoryFilters { tags: vec![], ..Default::default() };
+        let f = MemoryFilters {
+            tags: vec![],
+            ..Default::default()
+        };
         assert!(matches_filters_pub(&m, &f));
     }
 
     #[test]
     fn combined_filters_all_conditions() {
-        let m = make_stored(
-            MemoryType::LongTerm,
-            0.8,
-            vec!["important".into()],
-            5000,
-        );
+        let m = make_stored(MemoryType::LongTerm, 0.8, vec!["important".into()], 5000);
 
         let pass = MemoryFilters {
             memory_type: Some(MemoryType::LongTerm),

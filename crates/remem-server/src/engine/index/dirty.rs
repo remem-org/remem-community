@@ -51,15 +51,10 @@ impl DirtyChunkTracker {
     /// Ensure the tracker covers at least `total_entries` entries.
     /// Must be called from within a write lock on the owning data structure.
     pub fn grow_to(&mut self, total_entries: u32) {
-        let needed = ((total_entries + self.chunk_size - 1) / self.chunk_size) as usize;
+        let needed = total_entries.div_ceil(self.chunk_size) as usize;
         while self.dirty.len() < needed {
             self.dirty.push(AtomicBool::new(false));
         }
-    }
-
-    /// Number of chunks being tracked.
-    pub fn chunk_count(&self) -> usize {
-        self.dirty.len()
     }
 
     /// The chunk size this tracker was configured with.
@@ -89,8 +84,8 @@ mod tests {
 
         assert!(tracker.dirty_chunks().is_empty());
 
-        tracker.mark_dirty(500);   // chunk 0
-        tracker.mark_dirty(1500);  // chunk 1
+        tracker.mark_dirty(500); // chunk 0
+        tracker.mark_dirty(1500); // chunk 1
 
         let dirty = tracker.dirty_chunks();
         assert_eq!(dirty, vec![0, 1]);
@@ -103,13 +98,19 @@ mod tests {
     #[test]
     fn test_grow_to() {
         let mut tracker = DirtyChunkTracker::new(100);
-        assert_eq!(tracker.chunk_count(), 0);
+        // No chunks tracked yet — even an in-range-looking mark is a no-op.
+        tracker.mark_dirty(50);
+        assert!(tracker.dirty_chunks().is_empty());
 
-        tracker.grow_to(250);
-        assert_eq!(tracker.chunk_count(), 3); // chunks for 0-99, 100-199, 200-249
+        tracker.grow_to(250); // chunks for 0-99, 100-199, 200-249
+        tracker.mark_dirty(299); // last entry of chunk 2
+        assert_eq!(tracker.dirty_chunks(), vec![2]);
+        tracker.mark_dirty(300); // chunk 3 doesn't exist — ignored
+        assert_eq!(tracker.dirty_chunks(), vec![2]);
 
         tracker.grow_to(100); // should not shrink
-        assert_eq!(tracker.chunk_count(), 3);
+        tracker.mark_dirty(299); // chunk 2 must still exist
+        assert_eq!(tracker.dirty_chunks(), vec![2]);
     }
 
     #[test]

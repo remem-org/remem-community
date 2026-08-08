@@ -15,12 +15,18 @@ pub async fn run(
     cfg: TaskConfig,
     token: CancellationToken,
 ) {
-    let mut expiry_interval     = tokio::time::interval(Duration::from_secs(cfg.expire_short_term_secs));
-    let mut decay_interval      = tokio::time::interval(Duration::from_secs(cfg.apply_importance_decay_secs));
-    let mut forgetting_interval = tokio::time::interval(Duration::from_secs(cfg.active_forgetting_secs));
-    let mut consolidate_interval = tokio::time::interval(Duration::from_secs(cfg.consolidate_similar_secs));
-    let mut cleanup_interval    = tokio::time::interval(Duration::from_secs(cfg.cleanup_archived_secs));
-    let mut discover_interval   = tokio::time::interval(Duration::from_secs(cfg.discover_connections_secs));
+    let mut expiry_interval =
+        tokio::time::interval(Duration::from_secs(cfg.expire_short_term_secs));
+    let mut decay_interval =
+        tokio::time::interval(Duration::from_secs(cfg.apply_importance_decay_secs));
+    let mut forgetting_interval =
+        tokio::time::interval(Duration::from_secs(cfg.active_forgetting_secs));
+    let mut consolidate_interval =
+        tokio::time::interval(Duration::from_secs(cfg.consolidate_similar_secs));
+    let mut cleanup_interval =
+        tokio::time::interval(Duration::from_secs(cfg.cleanup_archived_secs));
+    let mut discover_interval =
+        tokio::time::interval(Duration::from_secs(cfg.discover_connections_secs));
 
     // Skip the immediate first tick so tasks don't fire on startup
     expiry_interval.tick().await;
@@ -96,8 +102,14 @@ pub async fn run_task(
         "consolidate_similar" => lifecycle.consolidate_similar().await,
         "cleanup_archived" => lifecycle.cleanup_archived(30).await,
         "discover_connections" => lifecycle.discover_connections(0.7, 5).await,
-        "checkpoint" => engine.checkpoint().await.map(|_| 0usize).map_err(Into::into),
-        _ => Err(crate::error::AppError::Validation(format!("unknown task: {name}"))),
+        "checkpoint" => engine
+            .checkpoint()
+            .await
+            .map(|_| 0usize)
+            .map_err(Into::into),
+        _ => Err(crate::error::AppError::Validation(format!(
+            "unknown task: {name}"
+        ))),
     };
     match result {
         Ok(n) => {

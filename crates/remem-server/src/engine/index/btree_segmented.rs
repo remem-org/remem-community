@@ -2,17 +2,18 @@
 //!
 //! Each sealed chunk covers a contiguous time window bounded by entry count.
 //! Range queries use manifest's `first_id`/`last_id` (timestamps) to skip irrelevant chunks.
-#![allow(dead_code)]
 
 use bytes::Bytes;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::error::{Result, StorageError};
 use crate::engine::index::manifest::{ChunkMeta, SegmentManifest};
-use crate::engine::index::segment_io::{SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_BTREE};
-use crate::engine::index::{BTreeConfig, BTreeIndex, BTREE_CHUNK_SIZE};
+use crate::engine::index::segment_io::{
+    SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_BTREE,
+};
+use crate::engine::index::{BTreeConfig, BTreeIndex};
 
 // ── Sealed chunk ───────────────────────────────────────────────────────────────
 
@@ -214,11 +215,9 @@ impl SegmentedBTreeIndex {
 
     /// Checkpoint: seal the growing segment to disk if it has any entries.
     ///
-    /// The chunk-size threshold (`BTREE_CHUNK_SIZE`) governs mid-run segment
-    /// rotation, not whether to persist at all.  On every checkpoint or graceful
-    /// shutdown we must flush whatever is in the growing segment — even if it
-    /// hasn't reached the rotation threshold — otherwise entries that have never
-    /// been sealed are silently lost on restart.
+    /// On every checkpoint or graceful shutdown we must flush whatever is in
+    /// the growing segment, regardless of its size — otherwise entries that
+    /// have never been sealed are silently lost on restart.
     pub fn save_if_dirty(&mut self) -> Result<()> {
         if !self.growing.is_empty() {
             self.seal_growing()?;
@@ -230,11 +229,6 @@ impl SegmentedBTreeIndex {
     /// Whether there are unsaved changes.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed) || self.growing.is_dirty()
-    }
-
-    pub fn mark_clean(&self) {
-        self.dirty.store(false, Ordering::Relaxed);
-        self.growing.mark_clean();
     }
 
     // ── Write operations ───────────────────────────────────────────────────────
@@ -267,19 +261,6 @@ impl SegmentedBTreeIndex {
 
     // ── Read operations ────────────────────────────────────────────────────────
 
-    /// Get the timestamp for a key.
-    pub fn get_timestamp(&self, key: &[u8]) -> Option<u64> {
-        if let Some(ts) = self.growing.get_timestamp(key) {
-            return Some(ts);
-        }
-        for chunk in &self.sealed {
-            if let Some(ts) = chunk.index.get_timestamp(key) {
-                return Some(ts);
-            }
-        }
-        None
-    }
-
     /// Query a range of timestamps (inclusive).
     pub fn range(&self, start: u64, end: u64) -> Vec<(u64, Bytes)> {
         let mut results = Vec::new();
@@ -299,105 +280,10 @@ impl SegmentedBTreeIndex {
         all.into_iter().take(limit).collect()
     }
 
-    /// Records before a timestamp (exclusive), newest first.
-    pub fn before(&self, timestamp: u64, limit: usize) -> Vec<(u64, Bytes)> {
-        let mut results = Vec::new();
-        for chunk in &self.sealed {
-            if chunk.first_ts < timestamp {
-                results.extend(chunk.index.before(timestamp, limit));
-            }
-        }
-        results.extend(self.growing.before(timestamp, limit));
-        // Sort descending (newest first) and deduplicate
-        results.sort_by(|a, b| b.0.cmp(&a.0));
-        results.dedup_by_key(|(ts, k)| (*ts, k.clone()));
-        results.truncate(limit);
-        results
-    }
-
-    /// Records after a timestamp (exclusive), oldest first.
-    pub fn after(&self, timestamp: u64, limit: usize) -> Vec<(u64, Bytes)> {
-        let mut results = Vec::new();
-        for chunk in &self.sealed {
-            if chunk.last_ts > timestamp {
-                results.extend(chunk.index.after(timestamp, limit));
-            }
-        }
-        results.extend(self.growing.after(timestamp, limit));
-        results.sort_by_key(|(ts, _)| *ts);
-        results.dedup_by_key(|(ts, k)| (*ts, k.clone()));
-        results.truncate(limit);
-        results
-    }
-
-    /// Most recent entries.
-    pub fn latest(&self, limit: usize) -> Vec<(u64, Bytes)> {
-        let all_ts_max = self
-            .sealed
-            .iter()
-            .map(|c| c.last_ts)
-            .max()
-            .unwrap_or(0)
-            .max(self.growing.max_timestamp().unwrap_or(0));
-
-        // Use before with a timestamp just past the max
-        let mut results = self.before(all_ts_max + 1, limit * 2);
-        // before() returns newest first
-        results.truncate(limit);
-        results
-    }
-
-    /// Oldest entries.
-    pub fn oldest(&self, limit: usize) -> Vec<(u64, Bytes)> {
-        let mut results = self.after(0, limit * 2);
-        results.truncate(limit);
-        results
-    }
-
     /// Total number of entries.
     pub fn len(&self) -> usize {
         let sealed_count: usize = self.sealed.iter().map(|c| c.entry_count()).sum();
         sealed_count + self.growing.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        if self.growing.contains_key(key) {
-            return true;
-        }
-        self.sealed.iter().any(|c| c.index.contains_key(key))
-    }
-
-    /// Min timestamp across all chunks.
-    pub fn min_timestamp(&self) -> Option<u64> {
-        let sealed_min = self.sealed.iter().map(|c| c.first_ts).min();
-        let growing_min = self.growing.min_timestamp();
-        match (sealed_min, growing_min) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
-    }
-
-    /// Max timestamp across all chunks.
-    pub fn max_timestamp(&self) -> Option<u64> {
-        let sealed_max = self.sealed.iter().map(|c| c.last_ts).max();
-        let growing_max = self.growing.max_timestamp();
-        match (sealed_max, growing_max) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
-    }
-
-    /// Number of sealed chunks.
-    pub fn sealed_chunk_count(&self) -> usize {
-        self.sealed.len()
     }
 
     /// Whether size-tiered compaction should be triggered.
@@ -420,7 +306,11 @@ impl SegmentedBTreeIndex {
 
         let a_idx = by_size[0];
         let b_idx = by_size[1];
-        let (a_idx, b_idx) = if a_idx < b_idx { (a_idx, b_idx) } else { (b_idx, a_idx) };
+        let (a_idx, b_idx) = if a_idx < b_idx {
+            (a_idx, b_idx)
+        } else {
+            (b_idx, a_idx)
+        };
 
         // Merge: collect all entries from both chunks
         let merged = BTreeIndex::new(self.config.clone());
@@ -466,7 +356,9 @@ impl SegmentedBTreeIndex {
         for fname in &old_filenames {
             let _ = std::fs::remove_file(self.dir.join(fname));
         }
-        self.manifest.chunks.retain(|c| !old_filenames.contains(&c.filename));
+        self.manifest
+            .chunks
+            .retain(|c| !old_filenames.contains(&c.filename));
 
         // Add new merged chunk to manifest
         self.manifest.chunks.push(ChunkMeta {
@@ -538,7 +430,8 @@ fn serialize_btree_index(index: &BTreeIndex, buf: &mut Vec<u8>) -> Result<()> {
     w.write_all(&(by_ts.len() as u64).to_le_bytes())
         .map_err(StorageError::Io)?;
     for (timestamp, keys) in &by_ts {
-        w.write_all(&timestamp.to_le_bytes()).map_err(StorageError::Io)?;
+        w.write_all(&timestamp.to_le_bytes())
+            .map_err(StorageError::Io)?;
         w.write_all(&(keys.len() as u32).to_le_bytes())
             .map_err(StorageError::Io)?;
         for key in keys {
@@ -572,8 +465,8 @@ fn deserialize_btree_index(cursor: &mut impl Read) -> Result<BTreeIndex> {
         )));
     }
 
+    // Skip legacy config bytes (max_entries — no longer stored on BTreeConfig).
     cursor.read_exact(&mut buf8)?;
-    let max_entries = u64::from_le_bytes(buf8) as usize;
 
     cursor.read_exact(&mut buf8)?;
     let entry_count = u64::from_le_bytes(buf8) as usize;
@@ -581,7 +474,7 @@ fn deserialize_btree_index(cursor: &mut impl Read) -> Result<BTreeIndex> {
     cursor.read_exact(&mut buf8)?;
     let timestamp_count = u64::from_le_bytes(buf8) as usize;
 
-    let index = BTreeIndex::new(BTreeConfig { max_entries });
+    let index = BTreeIndex::new(BTreeConfig::default());
     let mut _total = 0usize;
 
     for _ in 0..timestamp_count {
@@ -642,19 +535,5 @@ mod tests {
         assert_eq!(reloaded.sealed.len(), 1);
         let results = reloaded.range(0, 400);
         assert_eq!(results.len(), 5);
-    }
-
-    #[test]
-    fn test_latest() {
-        let dir = tempdir().unwrap();
-        let idx = SegmentedBTreeIndex::new(BTreeConfig::default(), dir.path().to_path_buf());
-
-        for i in 0u64..100 {
-            idx.insert(i, format!("key{i}")).unwrap();
-        }
-
-        let latest = idx.latest(5);
-        assert_eq!(latest.len(), 5);
-        assert_eq!(latest[0].0, 99);
     }
 }

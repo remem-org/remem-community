@@ -63,7 +63,10 @@ impl SegmentManifest {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if &magic != Self::MAGIC {
-            return Err(StorageError::invalid_format(&path, "Invalid manifest magic"));
+            return Err(StorageError::invalid_format(
+                &path,
+                "Invalid manifest magic",
+            ));
         }
 
         let mut buf2 = [0u8; 2];
@@ -196,12 +199,11 @@ impl SegmentManifest {
 
     /// Next available sequence number (max existing + 1).
     pub fn next_seq_no(&self) -> u32 {
-        self.chunks.iter().map(|c| c.seq_no).max().map_or(0, |m| m + 1)
-    }
-
-    /// Chunk file path for a given `seq_no`.
-    pub fn chunk_path(dir: &Path, index_name: &str, seq_no: u32) -> PathBuf {
-        dir.join(format!("{index_name}_{seq_no:04}.seg"))
+        self.chunks
+            .iter()
+            .map(|c| c.seq_no)
+            .max()
+            .map_or(0, |m| m + 1)
     }
 }
 

@@ -3,11 +3,10 @@
 //! Each sealed segment covers a contiguous range of document IDs and is stored as a
 //! `.seg` file. Deletions are tracked in a per-segment in-memory bitset that is saved
 //! to a lightweight `{index}_{seqno:04}.del` file on checkpoint.
-#![allow(dead_code)]
 
 use bytes::Bytes;
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,8 +22,6 @@ use crate::engine::index::{InvertedIndex, InvertedIndexConfig, TAGS_CHUNK_SIZE};
 /// A sealed, read-only segment covering docs `[doc_start, doc_start + doc_count)`.
 struct SealedTagSegment {
     seq_no: u32,
-    /// First global doc ID in this segment.
-    doc_start: u32,
     /// The loaded inverted index (already populated).
     index: InvertedIndex,
     /// Deletion bitset — `deleted[i]` is true if global doc `doc_start + i` is deleted.
@@ -44,14 +41,6 @@ impl SealedTagSegment {
         self.deleted.iter().filter(|&&d| d).count()
     }
 
-    fn deletion_ratio(&self) -> f64 {
-        let total = self.index.len();
-        if total == 0 {
-            return 0.0;
-        }
-        self.deletion_count() as f64 / total as f64
-    }
-
     /// Derive the segment filename from seq_no.
     fn filename(&self) -> String {
         format!("tags_{:04}.seg", self.seq_no)
@@ -63,7 +52,8 @@ impl SealedTagSegment {
         // but we don't have per-key doc IDs, so return all keys (conservative).
         // Compaction will rebuild from scratch without deleted keys,
         // using the `remove()` set tracked in the growing index.
-        self.index.all_tokens()
+        self.index
+            .all_tokens()
             .iter()
             .flat_map(|token| self.index.search(token))
             .collect::<std::collections::HashSet<_>>()
@@ -99,7 +89,7 @@ impl SealedTagSegment {
             return Ok(());
         }
         let doc_count = self.deleted.len();
-        let byte_count = (doc_count + 7) / 8;
+        let byte_count = doc_count.div_ceil(8);
         let mut bytes = vec![0u8; byte_count];
         for (i, &del) in self.deleted.iter().enumerate() {
             if del {
@@ -177,7 +167,7 @@ impl SegmentedInvertedIndex {
 
         for chunk_meta in &manifest.chunks {
             let seg_path = dir.join(&chunk_meta.filename);
-            match Self::load_sealed_segment(&seg_path, next_doc_start, chunk_meta, dir) {
+            match Self::load_sealed_segment(&seg_path, chunk_meta, dir) {
                 Ok(seg) => {
                     next_doc_start += seg.doc_count();
                     sealed.push(seg);
@@ -210,12 +200,7 @@ impl SegmentedInvertedIndex {
         })
     }
 
-    fn load_sealed_segment(
-        path: &Path,
-        doc_start: u32,
-        meta: &ChunkMeta,
-        dir: &Path,
-    ) -> Result<SealedTagSegment> {
+    fn load_sealed_segment(path: &Path, meta: &ChunkMeta, dir: &Path) -> Result<SealedTagSegment> {
         let reader = SegmentReader::open(path)?;
         let mut cursor = reader.data_cursor();
         let index = deserialize_inverted_index(&mut cursor, &InvertedIndexConfig::default())?;
@@ -226,7 +211,6 @@ impl SegmentedInvertedIndex {
 
         Ok(SealedTagSegment {
             seq_no: meta.seq_no,
-            doc_start,
             index,
             deleted,
             deletions_dirty: AtomicBool::new(false),
@@ -298,7 +282,6 @@ impl SegmentedInvertedIndex {
 
         self.sealed.push(SealedTagSegment {
             seq_no,
-            doc_start,
             index: old_growing,
             deleted: vec![false; doc_count],
             deletions_dirty: AtomicBool::new(false),
@@ -344,12 +327,10 @@ impl SegmentedInvertedIndex {
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
             || self.growing.is_dirty()
-            || self.sealed.iter().any(|s| s.deletions_dirty.load(Ordering::Relaxed))
-    }
-
-    pub fn mark_clean(&self) {
-        self.dirty.store(false, Ordering::Relaxed);
-        self.growing.mark_clean();
+            || self
+                .sealed
+                .iter()
+                .any(|s| s.deletions_dirty.load(Ordering::Relaxed))
     }
 
     // ── Write operations ───────────────────────────────────────────────────────
@@ -413,23 +394,6 @@ impl SegmentedInvertedIndex {
 
     // ── Read operations ────────────────────────────────────────────────────────
 
-    /// Search for documents containing a single tag (fan-out across all segments).
-    pub fn search(&self, query: &str) -> Vec<Bytes> {
-        let mut result_set: HashSet<Bytes> = HashSet::new();
-        for seg in &self.sealed {
-            for key in seg.index.search(query) {
-                // Skip soft-deleted keys
-                if !self.is_key_deleted_in_sealed(seg, &key) {
-                    result_set.insert(key);
-                }
-            }
-        }
-        for key in self.growing.search(query) {
-            result_set.insert(key);
-        }
-        result_set.into_iter().collect()
-    }
-
     /// AND search across all segments.
     pub fn search_and(&self, queries: &[&str]) -> Vec<Bytes> {
         let mut result_set: HashSet<Bytes> = HashSet::new();
@@ -444,40 +408,6 @@ impl SegmentedInvertedIndex {
             result_set.insert(key);
         }
         result_set.into_iter().collect()
-    }
-
-    /// OR search across all segments.
-    pub fn search_or(&self, queries: &[&str]) -> Vec<Bytes> {
-        let mut result_set: HashSet<Bytes> = HashSet::new();
-        for seg in &self.sealed {
-            for key in seg.index.search_or(queries) {
-                if !self.is_key_deleted_in_sealed(seg, &key) {
-                    result_set.insert(key);
-                }
-            }
-        }
-        for key in self.growing.search_or(queries) {
-            result_set.insert(key);
-        }
-        result_set.into_iter().collect()
-    }
-
-    /// Scored search (single token).
-    pub fn search_scored(&self, query: &str) -> Vec<(Bytes, f32)> {
-        let mut scores: std::collections::HashMap<Bytes, f32> = std::collections::HashMap::new();
-        for seg in &self.sealed {
-            for (key, score) in seg.index.search_scored(query) {
-                if !self.is_key_deleted_in_sealed(seg, &key) {
-                    *scores.entry(key).or_insert(0.0) += score;
-                }
-            }
-        }
-        for (key, score) in self.growing.search_scored(query) {
-            *scores.entry(key).or_insert(0.0) += score;
-        }
-        let mut results: Vec<(Bytes, f32)> = scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results
     }
 
     /// OR scored search.
@@ -498,43 +428,6 @@ impl SegmentedInvertedIndex {
         results
     }
 
-    /// Get all tokens for a document key.
-    pub fn get_tokens(&self, key: &[u8]) -> Vec<String> {
-        let mut tokens = self.growing.get_tokens(key);
-        if !tokens.is_empty() {
-            return tokens;
-        }
-        for seg in &self.sealed {
-            tokens = seg.index.get_tokens(key);
-            if !tokens.is_empty() {
-                return tokens;
-            }
-        }
-        Vec::new()
-    }
-
-    /// Check if a document has a specific token.
-    pub fn has_token(&self, key: &[u8], token: &str) -> bool {
-        if self.growing.has_token(key, token) {
-            return true;
-        }
-        self.sealed.iter().any(|s| s.index.has_token(key, token))
-    }
-
-    /// Get all unique tokens across all segments.
-    pub fn all_tokens(&self) -> Vec<String> {
-        let mut token_set: HashSet<String> = HashSet::new();
-        for seg in &self.sealed {
-            for t in seg.index.all_tokens() {
-                token_set.insert(t);
-            }
-        }
-        for t in self.growing.all_tokens() {
-            token_set.insert(t);
-        }
-        token_set.into_iter().collect()
-    }
-
     /// Total number of indexed documents (across all segments, excluding soft-deletes).
     pub fn len(&self) -> usize {
         let sealed_count: usize = self
@@ -543,32 +436,6 @@ impl SegmentedInvertedIndex {
             .map(|s| s.index.len() - s.deletion_count())
             .sum();
         sealed_count + self.growing.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Check if a document key exists in the index.
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        if self.growing.contains_key(key) {
-            return true;
-        }
-        self.sealed.iter().any(|s| s.index.contains_key(key))
-    }
-
-    /// Get minimum token length from config (for compatibility with engine).
-    pub fn min_token_length(&self) -> usize {
-        self.config.min_token_length
-    }
-
-    /// Index text content (delegates to add_tags via tokenization).
-    pub fn index_text(&self, key: impl Into<Bytes>, text: &str) -> Result<()> {
-        let result = self.growing.index_text(key, text);
-        if result.is_ok() {
-            self.dirty.store(true, Ordering::Relaxed);
-        }
-        result
     }
 
     /// Whether compaction should be triggered.
@@ -599,7 +466,11 @@ impl SegmentedInvertedIndex {
 
         let a_idx = by_size[0];
         let b_idx = by_size[1];
-        let (a_idx, b_idx) = if a_idx < b_idx { (a_idx, b_idx) } else { (b_idx, a_idx) };
+        let (a_idx, b_idx) = if a_idx < b_idx {
+            (a_idx, b_idx)
+        } else {
+            (b_idx, a_idx)
+        };
 
         // Build merged InvertedIndex from both segments, skipping deleted keys
         let merged_config = self.config.clone();
@@ -623,7 +494,7 @@ impl SegmentedInvertedIndex {
 
         let doc_start: u32 = self.sealed[..a_idx.min(b_idx)]
             .iter()
-            .map(|s| s.doc_count() as u32)
+            .map(|s| s.doc_count())
             .sum();
 
         let mut data_buf = Vec::new();
@@ -645,10 +516,8 @@ impl SegmentedInvertedIndex {
         let file_size = seg_path.metadata().map(|m| m.len()).unwrap_or(0);
 
         // Remove old seg files
-        let old_filenames: Vec<String> = vec![
-            self.sealed[a_idx].filename(),
-            self.sealed[b_idx].filename(),
-        ];
+        let old_filenames: Vec<String> =
+            vec![self.sealed[a_idx].filename(), self.sealed[b_idx].filename()];
         for fname in &old_filenames {
             let _ = std::fs::remove_file(self.dir.join(fname));
             let del_fname = fname.replace(".seg", ".del");
@@ -656,9 +525,9 @@ impl SegmentedInvertedIndex {
         }
 
         // Remove old chunks from manifest
-        self.manifest.chunks.retain(|c| {
-            !old_filenames.contains(&c.filename)
-        });
+        self.manifest
+            .chunks
+            .retain(|c| !old_filenames.contains(&c.filename));
 
         // Add new merged chunk
         self.manifest.chunks.push(ChunkMeta {
@@ -684,7 +553,6 @@ impl SegmentedInvertedIndex {
         let doc_count = merged.len();
         self.sealed.push(SealedTagSegment {
             seq_no,
-            doc_start,
             index: merged,
             deleted: vec![false; doc_count],
             del_path,
@@ -758,7 +626,8 @@ fn serialize_inverted_index(index: &InvertedIndex, buf: &mut Vec<u8>) -> Result<
     // Write config (placeholder — use defaults when loading)
     w.write_all(&[1u8]).map_err(StorageError::Io)?; // lowercase = true
     w.write_all(&1u32.to_le_bytes()).map_err(StorageError::Io)?; // min_token_length
-    w.write_all(&100u32.to_le_bytes()).map_err(StorageError::Io)?; // max_token_length
+    w.write_all(&100u32.to_le_bytes())
+        .map_err(StorageError::Io)?; // max_token_length
     let sep = " \t\n\r,.;:!?()[]{}\"'`~@#$%^&*-+=<>/\\|";
     let sep_bytes = sep.as_bytes();
     w.write_all(&(sep_bytes.len() as u32).to_le_bytes())
@@ -779,7 +648,8 @@ fn serialize_inverted_index(index: &InvertedIndex, buf: &mut Vec<u8>) -> Result<
             w.write_all(&(key.len() as u32).to_le_bytes())
                 .map_err(StorageError::Io)?;
             w.write_all(key).map_err(StorageError::Io)?;
-            w.write_all(&score.to_le_bytes()).map_err(StorageError::Io)?;
+            w.write_all(&score.to_le_bytes())
+                .map_err(StorageError::Io)?;
         }
     }
 
@@ -837,18 +707,21 @@ fn deserialize_inverted_index(
     cursor.read_exact(&mut buf4)?;
     let max_token_length = u32::from_le_bytes(buf4) as usize;
 
+    // `token_separators` was dropped from `InvertedIndexConfig` in REM-36 (dead
+    // field once `tokenize()`/`index_text()` were deleted as dead code); the
+    // length-prefixed separator string written by `serialize_inverted_index`
+    // below is still consumed here to keep the cursor aligned, same treatment
+    // as sub-task 6b's `BTIX` field-skip handling.
     cursor.read_exact(&mut buf4)?;
     let sep_len = u32::from_le_bytes(buf4) as usize;
     let mut sep_bytes = vec![0u8; sep_len];
     cursor.read_exact(&mut sep_bytes)?;
-    let token_separators =
-        String::from_utf8(sep_bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+    drop(sep_bytes);
 
     let cfg = InvertedIndexConfig {
         lowercase,
         min_token_length,
         max_token_length,
-        token_separators,
     };
 
     // Read token count
@@ -865,8 +738,8 @@ fn deserialize_inverted_index(
         let token_len = u32::from_le_bytes(buf4) as usize;
         let mut token_bytes = vec![0u8; token_len];
         cursor.read_exact(&mut token_bytes)?;
-        let token =
-            String::from_utf8(token_bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let token = String::from_utf8(token_bytes)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         cursor.read_exact(&mut buf4)?;
         let posting_count = u32::from_le_bytes(buf4) as usize;
@@ -933,17 +806,16 @@ mod tests {
     #[test]
     fn test_basic_add_and_search() {
         let dir = tempdir().unwrap();
-        let idx = SegmentedInvertedIndex::new(
-            InvertedIndexConfig::default(),
-            dir.path().to_path_buf(),
-        );
+        let idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
 
-        idx.add_tags(b"doc1".to_vec(), &["rust".to_string(), "programming".to_string()])
+        idx.add_tags(
+            b"doc1".to_vec(),
+            &["rust".to_string(), "programming".to_string()],
+        )
+        .unwrap();
+        idx.add_tags(b"doc2".to_vec(), &["rust".to_string()])
             .unwrap();
-        idx.add_tags(b"doc2".to_vec(), &["rust".to_string()]).unwrap();
-
-        let results = idx.search("rust");
-        assert_eq!(results.len(), 2);
 
         let and_results = idx.search_and(&["rust", "programming"]);
         assert_eq!(and_results.len(), 1);
@@ -953,10 +825,8 @@ mod tests {
     fn test_seal_and_reload() {
         let dir = tempdir().unwrap();
 
-        let mut idx = SegmentedInvertedIndex::new(
-            InvertedIndexConfig::default(),
-            dir.path().to_path_buf(),
-        );
+        let mut idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
 
         for i in 0..5 {
             idx.add_tags(
@@ -970,7 +840,8 @@ mod tests {
         assert_eq!(idx.sealed.len(), 1);
 
         // Add more to growing
-        idx.add_tags(b"doc100".to_vec(), &["new_tag".to_string()]).unwrap();
+        idx.add_tags(b"doc100".to_vec(), &["new_tag".to_string()])
+            .unwrap();
 
         // Reload from disk
         let reloaded = SegmentedInvertedIndex::load_from_dir(
@@ -979,37 +850,19 @@ mod tests {
         );
 
         assert_eq!(reloaded.sealed.len(), 1);
-        // The growing segment is not persisted, so only sealed docs are found
-        let results = reloaded.search("common");
-        assert_eq!(results.len(), 5);
-    }
-
-    #[test]
-    fn test_or_search() {
-        let dir = tempdir().unwrap();
-        let idx = SegmentedInvertedIndex::new(
-            InvertedIndexConfig::default(),
-            dir.path().to_path_buf(),
-        );
-
-        idx.add_tags(b"doc1".to_vec(), &["rust".to_string()]).unwrap();
-        idx.add_tags(b"doc2".to_vec(), &["python".to_string()]).unwrap();
-        idx.add_tags(b"doc3".to_vec(), &["java".to_string()]).unwrap();
-
-        let results = idx.search_or(&["rust", "python"]);
-        assert_eq!(results.len(), 2);
+        assert_eq!(reloaded.search_and(&["common"]).len(), 5);
     }
 
     #[test]
     fn test_remove() {
         let dir = tempdir().unwrap();
-        let idx = SegmentedInvertedIndex::new(
-            InvertedIndexConfig::default(),
-            dir.path().to_path_buf(),
-        );
+        let idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
 
-        idx.add_tags(b"doc1".to_vec(), &["rust".to_string()]).unwrap();
-        idx.add_tags(b"doc2".to_vec(), &["rust".to_string()]).unwrap();
+        idx.add_tags(b"doc1".to_vec(), &["rust".to_string()])
+            .unwrap();
+        idx.add_tags(b"doc2".to_vec(), &["rust".to_string()])
+            .unwrap();
         assert_eq!(idx.len(), 2);
 
         idx.remove(b"doc1").unwrap();

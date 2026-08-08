@@ -277,11 +277,6 @@ pub struct Args {
 
 // ─── Loader ─────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub fn args_default() -> Args {
-    Args { config: None, data_dir: None, port: None, api_key: None, api_key_secondary: None }
-}
-
 pub fn load(args: &Args) -> anyhow::Result<Config> {
     // Start with defaults.
     let mut file = FileConfig::default();
@@ -438,7 +433,13 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn default_args() -> Args {
-        Args { config: None, data_dir: None, port: None, api_key: None, api_key_secondary: None }
+        Args {
+            config: None,
+            data_dir: None,
+            port: None,
+            api_key: None,
+            api_key_secondary: None,
+        }
     }
 
     // ── Defaults ──────────────────────────────────────────────────────────────
@@ -539,14 +540,20 @@ mod tests {
 
     #[test]
     fn cli_port_override() {
-        let args = Args { port: Some(9999), ..default_args() };
+        let args = Args {
+            port: Some(9999),
+            ..default_args()
+        };
         let cfg = load(&args).unwrap();
         assert_eq!(cfg.server.port, 9999);
     }
 
     #[test]
     fn cli_api_key_override() {
-        let args = Args { api_key: Some("secret".into()), ..default_args() };
+        let args = Args {
+            api_key: Some("secret".into()),
+            ..default_args()
+        };
         let cfg = load(&args).unwrap();
         assert_eq!(cfg.server.api_key, "secret");
     }
@@ -597,7 +604,10 @@ auto_discovery_threshold = 0.8
 auto_discovery_top_k = 10
 "#;
         let f = write_toml(toml);
-        let args = Args { config: Some(f.path().to_path_buf()), ..default_args() };
+        let args = Args {
+            config: Some(f.path().to_path_buf()),
+            ..default_args()
+        };
         let cfg = load(&args).unwrap();
 
         assert_eq!(cfg.server.host, "127.0.0.1");
@@ -670,7 +680,10 @@ port = 9000
 api_key = ""
 "#;
         let f = write_toml(toml);
-        let args = Args { config: Some(f.path().to_path_buf()), ..default_args() };
+        let args = Args {
+            config: Some(f.path().to_path_buf()),
+            ..default_args()
+        };
         let cfg = load(&args).unwrap();
 
         assert_eq!(cfg.server.port, 9000);
@@ -684,7 +697,10 @@ api_key = ""
     #[test]
     fn invalid_toml_returns_error() {
         let f = write_toml("not valid toml !!!");
-        let args = Args { config: Some(f.path().to_path_buf()), ..default_args() };
+        let args = Args {
+            config: Some(f.path().to_path_buf()),
+            ..default_args()
+        };
         assert!(load(&args).is_err());
     }
 
@@ -708,13 +724,16 @@ api_key = ""
     #[test]
     #[allow(deprecated)]
     fn cors_origins_parsed_from_env() {
-        std::env::set_var("REMEM_CORS_ORIGINS", "http://localhost:3000, https://app.example.com");
+        std::env::set_var(
+            "REMEM_CORS_ORIGINS",
+            "http://localhost:3000, https://app.example.com",
+        );
         let cfg = load(&default_args()).unwrap();
         std::env::remove_var("REMEM_CORS_ORIGINS");
-        assert_eq!(cfg.server.allowed_origins, vec![
-            "http://localhost:3000",
-            "https://app.example.com",
-        ]);
+        assert_eq!(
+            cfg.server.allowed_origins,
+            vec!["http://localhost:3000", "https://app.example.com",]
+        );
     }
 
     #[test]
@@ -799,7 +818,9 @@ api_key = ""
         let cfg = load(&default_args()).unwrap();
         std::env::remove_var("REMEM_ALLOW_AUTH_DISABLED");
         let violations = validate_production_config(&cfg);
-        assert!(violations.iter().any(|v| v.contains("REMEM_ALLOW_AUTH_DISABLED")));
+        assert!(violations
+            .iter()
+            .any(|v| v.contains("REMEM_ALLOW_AUTH_DISABLED")));
     }
 
     #[test]

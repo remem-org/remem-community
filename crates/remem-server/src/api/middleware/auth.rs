@@ -81,7 +81,9 @@ pub async fn auth_middleware(
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse { detail: "invalid or missing API key".to_string() }),
+            Json(ErrorResponse {
+                detail: "invalid or missing API key".to_string(),
+            }),
         )
             .into_response()
     }

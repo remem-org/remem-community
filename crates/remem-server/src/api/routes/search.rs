@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::error::{AppError, ErrorResponse, Result};
+use crate::error::{AppError, Result};
 use crate::services::search_engine::SearchQuery;
 use crate::services::types::{MemoryFilters, MemoryType, SearchResult, SearchType};
 

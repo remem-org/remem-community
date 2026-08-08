@@ -1,5 +1,4 @@
 //! HNSW (Hierarchical Navigable Small World) index implementation
-#![allow(dead_code)]
 //!
 //! This module implements an HNSW graph for approximate nearest neighbor search.
 //! HNSW provides O(log n) search and insert complexity with high recall.
@@ -19,7 +18,9 @@
 use crate::engine::error::{Result, StorageError};
 use crate::engine::index::dirty::DirtyChunkTracker;
 use crate::engine::index::manifest::{ChunkMeta, SegmentManifest};
-use crate::engine::index::segment_io::{SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_HNSW};
+use crate::engine::index::segment_io::{
+    SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_HNSW,
+};
 use crate::engine::index::HNSW_CHUNK_SIZE;
 use crate::engine::storage::durable_rename::durable_rename;
 use crate::engine::util::simd::DistanceMetric;
@@ -29,9 +30,17 @@ use parking_lot::{Mutex, RwLock};
 use rand::Rng;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+/// One node as it is written to / read back from a `.seg` chunk:
+/// `(external_id, vector, max_layer, neighbors_per_layer)`.
+type NodeRecord = (Bytes, Vec<f32>, usize, Vec<Vec<u32>>);
+
+/// The decoded contents of one HNSW chunk:
+/// `(entry_point, max_layer, start_idx, nodes)`.
+type ParsedChunk = (u32, usize, usize, Vec<NodeRecord>);
 
 /// Configuration for the HNSW index
 #[derive(Debug, Clone)]
@@ -64,10 +73,6 @@ pub struct HnswConfig {
 
     /// Distance metric to use
     pub metric: DistanceMetric,
-
-    /// Maximum number of vectors to store
-    /// Used for pre-allocation
-    pub max_elements: usize,
 }
 
 impl Default for HnswConfig {
@@ -81,7 +86,6 @@ impl Default for HnswConfig {
             ef_search: 50,
             ml: 1.0 / (m as f64).ln(),
             metric: DistanceMetric::default(),
-            max_elements: 1_000_000,
         }
     }
 }
@@ -118,12 +122,6 @@ impl HnswConfig {
     /// Set distance metric
     pub fn metric(mut self, metric: DistanceMetric) -> Self {
         self.metric = metric;
-        self
-    }
-
-    /// Set maximum elements
-    pub fn max_elements(mut self, max_elements: usize) -> Self {
-        self.max_elements = max_elements;
         self
     }
 }
@@ -257,11 +255,6 @@ impl HnswIndex {
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Get the configuration
-    pub fn config(&self) -> &HnswConfig {
-        &self.config
     }
 
     /// Insert a vector into the index
@@ -469,12 +462,6 @@ impl HnswIndex {
         Ok(results)
     }
 
-    /// Get the vector for a given internal ID
-    pub fn get_vector(&self, id: u32) -> Option<Vec<f32>> {
-        let nodes = self.nodes.read();
-        nodes.get(id as usize).map(|n| n.vector.clone())
-    }
-
     /// Get the stored vector for an external key. Returns None if the key is unknown or deleted.
     pub fn get_vector_by_key(&self, key: &[u8]) -> Option<Vec<f32>> {
         let node_id = self.key_to_node.read().get(key).copied()?;
@@ -510,12 +497,6 @@ impl HnswIndex {
         // deletion and resurrecting the vector on restart.
         self.dirty.fetch_add(1, Ordering::Relaxed);
         true
-    }
-
-    /// Get the external ID for a given internal ID
-    pub fn get_external_id(&self, id: u32) -> Option<Bytes> {
-        let nodes = self.nodes.read();
-        nodes.get(id as usize).map(|n| n.external_id.clone())
     }
 
     /// Check if the index has been modified
@@ -578,7 +559,9 @@ impl HnswIndex {
             if offset + 4 > buf.len() {
                 break;
             }
-            set.insert(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()));
+            set.insert(u32::from_le_bytes(
+                buf[offset..offset + 4].try_into().unwrap(),
+            ));
             offset += 4;
         }
         Ok(set)
@@ -598,12 +581,17 @@ impl HnswIndex {
         // Snapshot nodes under read lock
         let (entry_point, max_layer, node_records) = {
             let nodes = self.nodes.read();
-            let records: Vec<(Bytes, Vec<f32>, usize, Vec<Vec<u32>>)> = nodes
+            let records: Vec<NodeRecord> = nodes
                 .iter()
                 .map(|n| {
                     let neighbors: Vec<Vec<u32>> =
                         (0..=n.max_layer).map(|l| n.get_neighbors(l)).collect();
-                    (n.external_id.clone(), n.vector.clone(), n.max_layer, neighbors)
+                    (
+                        n.external_id.clone(),
+                        n.vector.clone(),
+                        n.max_layer,
+                        neighbors,
+                    )
                 })
                 .collect();
             (
@@ -616,8 +604,8 @@ impl HnswIndex {
         let total = node_records.len() as u32;
 
         // Load or create manifest
-        let mut manifest = SegmentManifest::load(dir, "hnsw")?
-            .unwrap_or_else(|| SegmentManifest::new("hnsw"));
+        let mut manifest =
+            SegmentManifest::load(dir, "hnsw")?.unwrap_or_else(|| SegmentManifest::new("hnsw"));
 
         // Determine which chunk indices are dirty
         let dirty_chunk_idxs: Vec<usize> = {
@@ -738,7 +726,7 @@ impl HnswIndex {
         all_chunks.sort_by_key(|c| c.seq_no);
 
         // Collect all nodes sorted by start index
-        let mut node_records: Vec<Option<(Bytes, Vec<f32>, usize, Vec<Vec<u32>>)>> = Vec::new();
+        let mut node_records: Vec<Option<NodeRecord>> = Vec::new();
         let mut global_entry_point = u32::MAX;
         let mut global_max_layer = 0usize;
 
@@ -780,18 +768,16 @@ impl HnswIndex {
         let index = HnswIndex::new(config);
         {
             let mut nodes_guard = index.nodes.write();
-            for (_i, node_opt) in node_records.iter().enumerate() {
-                if let Some((external_id, vector, max_layer, _)) = node_opt {
-                    let node = HnswNode::new(
-                        external_id.clone(),
-                        vector.clone(),
-                        *max_layer,
-                        index.config.m,
-                        index.config.m0,
-                    );
-                    nodes_guard.push(node);
-                    index.count.fetch_add(1, Ordering::Relaxed);
-                }
+            for (external_id, vector, max_layer, _) in node_records.iter().flatten() {
+                let node = HnswNode::new(
+                    external_id.clone(),
+                    vector.clone(),
+                    *max_layer,
+                    index.config.m,
+                    index.config.m0,
+                );
+                nodes_guard.push(node);
+                index.count.fetch_add(1, Ordering::Relaxed);
             }
             // Replay neighbor connections
             for (i, node_opt) in node_records.iter().enumerate() {
@@ -805,7 +791,9 @@ impl HnswIndex {
             }
         }
         if global_entry_point != u32::MAX {
-            index.entry_point.store(global_entry_point, Ordering::Release);
+            index
+                .entry_point
+                .store(global_entry_point, Ordering::Release);
         }
         index.max_layer.store(global_max_layer, Ordering::Release);
         // Grow tracker to cover all loaded nodes (all clean)
@@ -1015,82 +1003,6 @@ impl HnswIndex {
         }
     }
 
-    /// Save the index to a file.
-    ///
-    /// The read lock on `nodes` is held only for the in-memory snapshot, not
-    /// during disk I/O. This prevents checkpoints from blocking inserts for
-    /// the full write duration (which can be seconds for large indexes).
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-
-        // --- Snapshot while holding the read lock (fast, in-memory only) ---
-        // Each entry is (external_id, vector, max_layer, neighbors_per_layer).
-        let (entry_point, max_layer, node_records) = {
-            let nodes = self.nodes.read();
-            let records: Vec<(Bytes, Vec<f32>, usize, Vec<Vec<u32>>)> = nodes
-                .iter()
-                .map(|n| {
-                    let neighbors: Vec<Vec<u32>> =
-                        (0..=n.max_layer).map(|l| n.get_neighbors(l)).collect();
-                    (n.external_id.clone(), n.vector.clone(), n.max_layer, neighbors)
-                })
-                .collect();
-            (
-                self.entry_point.load(Ordering::Relaxed),
-                self.max_layer.load(Ordering::Relaxed),
-                records,
-            )
-            // read lock released here
-        };
-
-        // --- Write snapshot to disk without holding any lock ---
-        let tmp_path = path.with_extension("tmp");
-        let file = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
-        let mut writer = std::io::BufWriter::new(file);
-
-        // Write header
-        writer.write_all(b"HNSW")?;
-        writer.write_all(&1u32.to_le_bytes())?;
-
-        // Write config
-        writer.write_all(&(self.config.dim as u32).to_le_bytes())?;
-        writer.write_all(&(self.config.m as u32).to_le_bytes())?;
-        writer.write_all(&(self.config.m0 as u32).to_le_bytes())?;
-        writer.write_all(&(self.config.ef_construction as u32).to_le_bytes())?;
-        writer.write_all(&(self.config.ef_search as u32).to_le_bytes())?;
-        writer.write_all(&self.config.ml.to_le_bytes())?;
-        writer.write_all(&(self.config.metric as u8).to_le_bytes())?;
-
-        // Write state
-        writer.write_all(&entry_point.to_le_bytes())?;
-        writer.write_all(&(max_layer as u32).to_le_bytes())?;
-
-        // Write nodes
-        writer.write_all(&(node_records.len() as u32).to_le_bytes())?;
-        for (external_id, vector, node_max_layer, neighbors) in &node_records {
-            writer.write_all(&(external_id.len() as u32).to_le_bytes())?;
-            writer.write_all(external_id)?;
-
-            for &v in vector {
-                writer.write_all(&v.to_le_bytes())?;
-            }
-
-            writer.write_all(&(*node_max_layer as u32).to_le_bytes())?;
-            for layer_neighbors in neighbors {
-                writer.write_all(&(layer_neighbors.len() as u32).to_le_bytes())?;
-                for &n in layer_neighbors {
-                    writer.write_all(&n.to_le_bytes())?;
-                }
-            }
-        }
-
-        writer.flush()?;
-        drop(writer);
-        std::fs::rename(&tmp_path, path)?;
-        self.mark_clean();
-        Ok(())
-    }
-
     /// Load an index from a file
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -1157,7 +1069,6 @@ impl HnswIndex {
             ef_search,
             ml,
             metric,
-            max_elements: 1_000_000,
         };
 
         // Read state
@@ -1239,15 +1150,11 @@ impl HnswIndex {
 /// Parse the data section of an HNSW `.seg` file.
 ///
 /// `dim` is the vector dimension (from config, known at load time).
-/// Returns `(entry_point, max_layer, start_idx, nodes)` where `nodes` is a list of
-/// `(external_id, vector, max_layer, neighbors_per_layer)`.
+/// Returns `(entry_point, max_layer, start_idx, nodes)`.
 fn parse_hnsw_chunk(
     data: &[u8],
     dim: usize,
-) -> std::result::Result<
-    (u32, usize, usize, Vec<(Bytes, Vec<f32>, usize, Vec<Vec<u32>>)>),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> std::result::Result<ParsedChunk, Box<dyn std::error::Error + Send + Sync>> {
     let mut cursor = std::io::Cursor::new(data);
     let mut buf4 = [0u8; 4];
 
@@ -1443,37 +1350,6 @@ mod tests {
     }
 
     #[test]
-    fn test_save_load() {
-        let dim = 8;
-        let config = HnswConfig::with_dim(dim);
-        let index = HnswIndex::new(config);
-
-        // Insert some vectors
-        for i in 0..50 {
-            let vec: Vec<f32> = (0..dim).map(|j| (i * dim + j) as f32).collect();
-            index.insert(format!("vec_{}", i), vec).unwrap();
-        }
-
-        // Save to temp file
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test.hnsw");
-        index.save(&path).unwrap();
-
-        // Load back
-        let loaded = HnswIndex::load(&path).unwrap();
-
-        assert_eq!(loaded.len(), index.len());
-        assert_eq!(loaded.config().dim, index.config().dim);
-        assert_eq!(loaded.config().m, index.config().m);
-
-        // Verify search works on loaded index
-        let query: Vec<f32> = (0..dim).map(|i| i as f32).collect();
-        let results = loaded.search(&query, 5).unwrap();
-        assert_eq!(results.len(), 5);
-        assert_eq!(results[0].0.as_ref(), b"vec_0");
-    }
-
-    #[test]
     fn test_cosine_metric() {
         let config = HnswConfig::with_dim(3).metric(DistanceMetric::Cosine);
         let index = HnswIndex::new(config);
@@ -1579,7 +1455,12 @@ mod hnsw_map_tests {
     use super::*;
 
     fn small_index() -> HnswIndex {
-        HnswIndex::new(HnswConfig::with_dim(4).m(4).ef_construction(10).ef_search(4))
+        HnswIndex::new(
+            HnswConfig::with_dim(4)
+                .m(4)
+                .ef_construction(10)
+                .ef_search(4),
+        )
     }
 
     #[test]

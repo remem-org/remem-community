@@ -9,13 +9,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::engine::error::Result;
-use crate::engine::index::{HnswIndex, SegmentedBTreeIndex, SegmentedCsrGraph, SegmentedInvertedIndex};
 use super::compaction::CompactionManager;
 use super::engine::EngineConfig;
 use super::memtable::{ImmutableMemTable, MemTable};
 use super::sstable::{SSTableReader, SSTableWriter};
 use super::wal::WAL;
+use crate::engine::error::Result;
+use crate::engine::index::{
+    HnswIndex, SegmentedBTreeIndex, SegmentedCsrGraph, SegmentedInvertedIndex,
+};
 
 /// Global counter for unique SSTable file names (prevents collisions when
 /// multiple flushes happen within the same millisecond).
@@ -63,11 +65,59 @@ pub(super) fn flush_memtable(
     Ok(())
 }
 
+/// Flush all immutable memtables and truncate the WAL, holding the WAL lock
+/// across the whole span.
+///
+/// This is the safety-critical write barrier: no WAL record can be appended
+/// (every writer's first step is `wal.lock()`) while this runs, and nothing
+/// here can truncate the WAL without every write it covers already being
+/// durable in a flushed SSTable. Shared by `StorageEngine::checkpoint()`
+/// (the foreground/manual path) and the background checkpoint loop below —
+/// see REM-37 / `docs/PROJECT_REVIEW.md` §4.2 for why there must be exactly
+/// one implementation of this span.
+pub(super) fn wal_locked_flush_and_truncate(
+    wal: &Mutex<WAL>,
+    memtable: &RwLock<MemTable>,
+    immutable_memtables: &RwLock<Vec<Arc<ImmutableMemTable>>>,
+    compaction: &CompactionManager,
+    config: &EngineConfig,
+) -> Result<()> {
+    let mut wal_guard = wal.lock();
+
+    let newly_immutable = {
+        let mut mt = memtable.write();
+        if mt.is_empty() {
+            None
+        } else {
+            let old = std::mem::replace(&mut *mt, MemTable::with_capacity(config.memtable_size));
+            Some(Arc::new(ImmutableMemTable::from_memtable(old)))
+        }
+    };
+    if let Some(new_imm) = newly_immutable {
+        immutable_memtables.write().push(Arc::clone(&new_imm));
+    }
+
+    let to_flush: Vec<_> = immutable_memtables.read().clone();
+    for imm in to_flush {
+        flush_memtable(&imm, compaction, config)?;
+        immutable_memtables
+            .write()
+            .retain(|m| !Arc::ptr_eq(m, &imm));
+    }
+
+    wal_guard.truncate()?;
+    Ok(())
+}
+
 /// Spawn the background flush, compaction, and checkpoint tasks.
 ///
 /// Returns `(flush_handle, compaction_handle)` so the engine can await them
 /// during graceful shutdown. The checkpoint task is not tracked — it stops
 /// on its own when the `shutdown` flag is set.
+// Called exactly once, from `StorageEngine::new`. Every argument is a distinct
+// piece of engine state the tasks need to own a handle to; bundling them into a
+// struct would only move the same 11 fields one level down.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start_background_tasks(
     immutable_memtables: Arc<RwLock<Vec<Arc<ImmutableMemTable>>>>,
     memtable: Arc<RwLock<MemTable>>,
@@ -89,11 +139,7 @@ pub(super) fn start_background_tasks(
 
     let flush_handle = tokio::spawn(async move {
         while !shutdown_flush.load(Ordering::Relaxed) {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                flush_rx.recv(),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), flush_rx.recv()).await;
 
             if shutdown_flush.load(Ordering::Relaxed) {
                 break;
@@ -246,58 +292,18 @@ pub(super) fn start_background_tasks(
                 // healthy checkpoint -- rather than promptly on the very
                 // next poll once the underlying problem clears up.
                 let checkpoint_succeeded = if all_saves_ok {
-                    // Hold the WAL lock across the flush+truncate span so no
-                    // write can append a WAL record that isn't reflected in
-                    // either the indexes we just saved or the memtables
-                    // we're about to flush -- otherwise a crash right after
-                    // truncate() would erase that write's only durable
-                    // record while its data lives only in memory. This
-                    // briefly stalls new writes (their first step is always
-                    // wal.lock()).
-                    let mut wal_guard = wal.lock();
-
-                    let kv_flush_ok = 'kv_flush: {
-                        let newly_immutable = {
-                            let mut mt = memtable_cp.write();
-                            if mt.is_empty() {
-                                None
-                            } else {
-                                let old = std::mem::replace(
-                                    &mut *mt,
-                                    MemTable::with_capacity(config.memtable_size),
-                                );
-                                Some(Arc::new(ImmutableMemTable::from_memtable(old)))
-                            }
-                        };
-                        if let Some(new_imm) = newly_immutable {
-                            immutable_cp.write().push(Arc::clone(&new_imm));
+                    match wal_locked_flush_and_truncate(
+                        &wal,
+                        &memtable_cp,
+                        &immutable_cp,
+                        &compaction_cp,
+                        &config,
+                    ) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::error!("Checkpoint flush/truncate failed: {}", e);
+                            false
                         }
-
-                        let to_flush: Vec<_> = immutable_cp.read().clone();
-                        for imm in to_flush {
-                            if let Err(e) = flush_memtable(&imm, &compaction_cp, &config) {
-                                tracing::error!(
-                                    "Pre-checkpoint KV flush failed: {}; WAL truncation skipped \
-                                     to preserve durability",
-                                    e
-                                );
-                                break 'kv_flush false;
-                            }
-                            immutable_cp.write().retain(|m| !Arc::ptr_eq(m, &imm));
-                        }
-                        true
-                    };
-
-                    if kv_flush_ok {
-                        match wal_guard.truncate() {
-                            Ok(()) => true,
-                            Err(e) => {
-                                tracing::error!("Failed to truncate WAL: {}", e);
-                                false
-                            }
-                        }
-                    } else {
-                        false
                     }
                 } else {
                     tracing::warn!(

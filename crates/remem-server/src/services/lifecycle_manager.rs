@@ -38,11 +38,7 @@ impl LifecycleManager {
     pub async fn promote(&self, id: Uuid) -> Result<StoredMemory> {
         let _guard = self.repo.lock(id).await;
 
-        let mut stored = self
-            .repo
-            .load(id)
-            .await?
-            .ok_or(AppError::NotFound(id))?;
+        let mut stored = self.repo.load(id).await?.ok_or(AppError::NotFound(id))?;
 
         if stored.archived {
             return Err(AppError::NotFound(id));
@@ -71,7 +67,9 @@ impl LifecycleManager {
         let mut handled = 0usize;
 
         for (_ts, key_bytes) in entries {
-            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let Some(id) = parse_memory_id(&key_bytes) else {
+                continue;
+            };
             let guard = self.repo.lock(id).await;
 
             let Some(mut stored) = self.repo.load_by_key(&key_bytes).await? else {
@@ -115,7 +113,9 @@ impl LifecycleManager {
         let mut updated = 0usize;
 
         for (_ts, key_bytes) in entries {
-            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let Some(id) = parse_memory_id(&key_bytes) else {
+                continue;
+            };
             let _guard = self.repo.lock(id).await;
 
             let Some(mut stored) = self.repo.load_by_key(&key_bytes).await? else {
@@ -124,7 +124,11 @@ impl LifecycleManager {
             if stored.archived || stored.memory_type != MemoryType::LongTerm {
                 continue;
             }
-            if stored.metadata.flashbulb_until.is_some_and(|until| until > now) {
+            if stored
+                .metadata
+                .flashbulb_until
+                .is_some_and(|until| until > now)
+            {
                 continue;
             }
 
@@ -137,8 +141,7 @@ impl LifecycleManager {
                 continue;
             }
 
-            let new_importance =
-                stored.metadata.importance * decay_factor.powi(age_days as i32);
+            let new_importance = stored.metadata.importance * decay_factor.powi(age_days as i32);
             stored.metadata.importance = new_importance.max(0.0);
             stored.metadata.last_decay_at = Some(now);
 
@@ -160,7 +163,9 @@ impl LifecycleManager {
         let mut handled = 0usize;
 
         for (_ts, key_bytes) in entries {
-            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let Some(id) = parse_memory_id(&key_bytes) else {
+                continue;
+            };
             let _guard = self.repo.lock(id).await;
 
             let Some(mut stored) = self.repo.load_by_key(&key_bytes).await? else {
@@ -169,7 +174,11 @@ impl LifecycleManager {
             if stored.archived {
                 continue;
             }
-            if stored.metadata.flashbulb_until.is_some_and(|until| until > now) {
+            if stored
+                .metadata
+                .flashbulb_until
+                .is_some_and(|until| until > now)
+            {
                 continue;
             }
 
@@ -194,8 +203,8 @@ impl LifecycleManager {
                 MemoryType::ShortTerm => 8.0,
                 MemoryType::LongTerm => 2.0,
             };
-            stored.metadata.health = (stored.metadata.health - daily_decay * age_days as f32)
-                .clamp(0.0, 100.0);
+            stored.metadata.health =
+                (stored.metadata.health - daily_decay * age_days as f32).clamp(0.0, 100.0);
             stored.metadata.last_health_check_at = Some(now);
 
             if stored.metadata.health <= 0.0 {
@@ -235,7 +244,9 @@ impl LifecycleManager {
         let mut deleted = 0usize;
 
         for (_ts, key_bytes) in entries {
-            let Some(id) = parse_memory_id(&key_bytes) else { continue };
+            let Some(id) = parse_memory_id(&key_bytes) else {
+                continue;
+            };
             let _guard = self.repo.lock(id).await;
 
             let Some(stored) = self.repo.load_by_key(&key_bytes).await? else {
@@ -257,11 +268,7 @@ impl LifecycleManager {
     }
 
     /// Re-discover connections for all non-archived memories. Returns total new connections found.
-    pub async fn discover_connections(
-        &self,
-        threshold: f32,
-        top_k: usize,
-    ) -> Result<usize> {
+    pub async fn discover_connections(&self, threshold: f32, top_k: usize) -> Result<usize> {
         const CONCURRENCY: usize = 16;
 
         let now = now_ms();

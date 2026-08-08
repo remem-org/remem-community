@@ -24,8 +24,8 @@ use tower::ServiceExt as _;
 use crate::{
     api::{build_router, AppState},
     config::{
-        Config, ConnectionConfig, EmbeddingConfig, Environment, ServerConfig, TaskConfig,
-        StorageConfig as CfgStorage, VectorConfig as CfgVector,
+        Config, ConnectionConfig, EmbeddingConfig, Environment, ServerConfig,
+        StorageConfig as CfgStorage, TaskConfig, VectorConfig as CfgVector,
     },
     engine::storage::engine::{
         EngineConfig, GraphIndexConfig, TagIndexConfig, TimeSeriesConfig,
@@ -51,14 +51,23 @@ async fn make_test_app() -> (axum::Router, AppState, tempfile::TempDir) {
             hnsw_ef_search: 50,
             metric: DistanceMetric::L2,
         },
-        graph: GraphIndexConfig { enabled: true, directed: true },
+        graph: GraphIndexConfig {
+            enabled: true,
+            directed: true,
+        },
         time_series: TimeSeriesConfig { enabled: true },
-        tag_index: TagIndexConfig { enabled: true, lowercase: true, min_token_length: 1 },
+        tag_index: TagIndexConfig {
+            enabled: true,
+            lowercase: true,
+            min_token_length: 1,
+        },
         ..EngineConfig::default()
     };
 
     let engine = Arc::new(
-        StorageEngine::new(engine_cfg).await.expect("storage engine"),
+        StorageEngine::new(engine_cfg)
+            .await
+            .expect("storage engine"),
     );
 
     let cfg = Config {
@@ -108,7 +117,10 @@ async fn make_test_app() -> (axum::Router, AppState, tempfile::TempDir) {
         .await
         .expect("services (requires embedding model — run with FASTEMBED_CACHE_PATH set)");
 
-    let state = AppState { services, config: Arc::new(cfg) };
+    let state = AppState {
+        services,
+        config: Arc::new(cfg),
+    };
     (build_router(state.clone()), state, tmpdir)
 }
 
@@ -287,7 +299,7 @@ async fn update_memory_content_and_importance() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(&format!("/api/v1/memories/{id}"))
+                .uri(format!("/api/v1/memories/{id}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
@@ -375,22 +387,33 @@ async fn list_memories_sort_by_accessed_at_reorders_by_last_access() {
 
     // Create two memories; "first" is created before "second".
     let first_id = {
-        let resp = app.clone().oneshot(post_json(
-            "/api/v1/memories",
-            serde_json::json!({"content": "first memory"}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                serde_json::json!({"content": "first memory"}),
+            ))
+            .await
+            .unwrap();
         body_json(resp).await["id"].as_str().unwrap().to_owned()
     };
     let second_id = {
-        let resp = app.clone().oneshot(post_json(
-            "/api/v1/memories",
-            serde_json::json!({"content": "second memory"}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/memories",
+                serde_json::json!({"content": "second memory"}),
+            ))
+            .await
+            .unwrap();
         body_json(resp).await["id"].as_str().unwrap().to_owned()
     };
 
     // Touch "first" via GET so its accessed_at becomes the most recent.
-    app.clone().oneshot(get(&format!("/api/v1/memories/{first_id}"))).await.unwrap();
+    app.clone()
+        .oneshot(get(&format!("/api/v1/memories/{first_id}")))
+        .await
+        .unwrap();
 
     // sort_by=accessed_at sorts ascending (oldest-accessed first). "second"
     // was never touched after creation, so its accessed_at predates "first"'s
@@ -512,12 +535,10 @@ async fn mcp_list_recent_memories_tool_honors_sort_by() {
 #[ignore = "requires fastembed ONNX model"]
 async fn mcp_resource_stats_returns_json() {
     let (_app, state, _dir) = make_test_app().await;
-    let result = crate::api::mcp::resources::read(
-        &serde_json::json!({"uri": "memory://stats"}),
-        &state,
-    )
-    .await
-    .unwrap();
+    let result =
+        crate::api::mcp::resources::read(&serde_json::json!({"uri": "memory://stats"}), &state)
+            .await
+            .unwrap();
     let text = result["contents"][0]["text"].as_str().unwrap();
     let data: serde_json::Value = serde_json::from_str(text).unwrap();
     assert!(data["total_memories"].is_number());
@@ -527,11 +548,9 @@ async fn mcp_resource_stats_returns_json() {
 #[ignore = "requires fastembed ONNX model"]
 async fn mcp_resource_unknown_path_errors() {
     let (_app, state, _dir) = make_test_app().await;
-    let result = crate::api::mcp::resources::read(
-        &serde_json::json!({"uri": "memory://nonsense"}),
-        &state,
-    )
-    .await;
+    let result =
+        crate::api::mcp::resources::read(&serde_json::json!({"uri": "memory://nonsense"}), &state)
+            .await;
     assert!(result.is_err());
 }
 
@@ -550,33 +569,69 @@ fn mcp_post(body: Value) -> Request<Body> {
 #[ignore = "requires fastembed ONNX model"]
 async fn mcp_endpoint_requires_auth_when_api_key_set() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let engine = Arc::new(StorageEngine::new(EngineConfig {
-        data_dir: tmpdir.path().to_path_buf(),
-        sync_writes: false,
-        ..EngineConfig::default()
-    }).await.unwrap());
+    let engine = Arc::new(
+        StorageEngine::new(EngineConfig {
+            data_dir: tmpdir.path().to_path_buf(),
+            sync_writes: false,
+            ..EngineConfig::default()
+        })
+        .await
+        .unwrap(),
+    );
     let cfg = Config {
         server: ServerConfig {
-            host: "127.0.0.1".into(), port: 4545, api_key: "test-secret".into(), api_key_secondary: String::new(),
-            allow_auth_disabled: false, allowed_origins: vec![], rate_limit_rps: 0, rate_limit_burst: 50,
-            trust_proxy_headers: false, env: Environment::Development,
+            host: "127.0.0.1".into(),
+            port: 4545,
+            api_key: "test-secret".into(),
+            api_key_secondary: String::new(),
+            allow_auth_disabled: false,
+            allowed_origins: vec![],
+            rate_limit_rps: 0,
+            rate_limit_burst: 50,
+            trust_proxy_headers: false,
+            env: Environment::Development,
         },
-        storage: CfgStorage { data_dir: tmpdir.path().to_path_buf(), sync_writes: false, checkpoint_interval_secs: 300, max_wal_size_mb: 256 },
-        vector: CfgVector { dimension: 384, hnsw_m: 16, hnsw_ef_construction: 200, hnsw_ef_search: 50 },
+        storage: CfgStorage {
+            data_dir: tmpdir.path().to_path_buf(),
+            sync_writes: false,
+            checkpoint_interval_secs: 300,
+            max_wal_size_mb: 256,
+        },
+        vector: CfgVector {
+            dimension: 384,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+        },
         embedding: EmbeddingConfig { cache_size: 100 },
-        connections: ConnectionConfig { auto_discovery_threshold: 0.7, auto_discovery_top_k: 5 },
+        connections: ConnectionConfig {
+            auto_discovery_threshold: 0.7,
+            auto_discovery_top_k: 5,
+        },
         tasks: TaskConfig {
-            expire_short_term_secs: 300, apply_importance_decay_secs: 86400, active_forgetting_secs: 86400,
-            consolidate_similar_secs: 604800, cleanup_archived_secs: 2592000, discover_connections_secs: 3600,
-            discovery_workers: 2, discovery_queue_size: 10_000, active_forgetting_hard_delete: false,
+            expire_short_term_secs: 300,
+            apply_importance_decay_secs: 86400,
+            active_forgetting_secs: 86400,
+            consolidate_similar_secs: 604800,
+            cleanup_archived_secs: 2592000,
+            discover_connections_secs: 3600,
+            discovery_workers: 2,
+            discovery_queue_size: 10_000,
+            active_forgetting_hard_delete: false,
         },
     };
     let services = create_services(Arc::clone(&engine), &cfg).await.unwrap();
-    let app = build_router(AppState { services, config: Arc::new(cfg) });
+    let app = build_router(AppState {
+        services,
+        config: Arc::new(cfg),
+    });
 
-    let resp = app.oneshot(mcp_post(serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
-    }))).await.unwrap();
+    let resp = app
+        .oneshot(mcp_post(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+        })))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -585,11 +640,21 @@ async fn mcp_endpoint_requires_auth_when_api_key_set() {
 async fn mcp_initialize_then_tools_call_round_trip() {
     let (app, _state, _dir) = make_test_app().await;
 
-    let init_resp = app.clone().oneshot(mcp_post(serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
-    }))).await.unwrap();
+    let init_resp = app
+        .clone()
+        .oneshot(mcp_post(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+        })))
+        .await
+        .unwrap();
     assert_eq!(init_resp.status(), StatusCode::OK);
-    let session_id = init_resp.headers().get("Mcp-Session-Id").unwrap().to_str().unwrap().to_owned();
+    let session_id = init_resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     let init_json = body_json(init_resp).await;
     assert_eq!(init_json["result"]["protocolVersion"], "2025-03-26");
 
@@ -598,10 +663,13 @@ async fn mcp_initialize_then_tools_call_round_trip() {
         .uri("/mcp")
         .header("content-type", "application/json")
         .header("Mcp-Session-Id", &session_id)
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "store_memory", "arguments": {"content": "via /mcp"}}
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "store_memory", "arguments": {"content": "via /mcp"}}
+            }))
+            .unwrap(),
+        ))
         .unwrap();
     let call_resp = app.clone().oneshot(call_req).await.unwrap();
     assert_eq!(call_resp.status(), StatusCode::OK);
@@ -619,9 +687,12 @@ async fn mcp_initialize_then_tools_call_round_trip() {
         .method("POST")
         .uri("/mcp")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+            }))
+            .unwrap(),
+        ))
         .unwrap();
     let no_session_resp = app.clone().oneshot(no_session_req).await.unwrap();
     assert_eq!(no_session_resp.status(), StatusCode::BAD_REQUEST);
@@ -810,9 +881,17 @@ async fn auth_required_when_api_key_set() {
             checkpoint_interval_secs: 300,
             max_wal_size_mb: 256,
         },
-        vector: CfgVector { dimension: 384, hnsw_m: 16, hnsw_ef_construction: 200, hnsw_ef_search: 50 },
+        vector: CfgVector {
+            dimension: 384,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+        },
         embedding: EmbeddingConfig { cache_size: 100 },
-        connections: ConnectionConfig { auto_discovery_threshold: 0.7, auto_discovery_top_k: 5 },
+        connections: ConnectionConfig {
+            auto_discovery_threshold: 0.7,
+            auto_discovery_top_k: 5,
+        },
         tasks: TaskConfig {
             expire_short_term_secs: 300,
             apply_importance_decay_secs: 86400,
@@ -827,7 +906,10 @@ async fn auth_required_when_api_key_set() {
     };
 
     let services = create_services(Arc::clone(&engine), &cfg).await.unwrap();
-    let app = build_router(AppState { services, config: Arc::new(cfg) });
+    let app = build_router(AppState {
+        services,
+        config: Arc::new(cfg),
+    });
 
     // No key → 401
     let no_key = app
@@ -913,9 +995,17 @@ async fn misconfigured_server_returns_500() {
             checkpoint_interval_secs: 300,
             max_wal_size_mb: 256,
         },
-        vector: CfgVector { dimension: 384, hnsw_m: 16, hnsw_ef_construction: 200, hnsw_ef_search: 50 },
+        vector: CfgVector {
+            dimension: 384,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+        },
         embedding: EmbeddingConfig { cache_size: 100 },
-        connections: ConnectionConfig { auto_discovery_threshold: 0.7, auto_discovery_top_k: 5 },
+        connections: ConnectionConfig {
+            auto_discovery_threshold: 0.7,
+            auto_discovery_top_k: 5,
+        },
         tasks: TaskConfig {
             expire_short_term_secs: 300,
             apply_importance_decay_secs: 86400,
@@ -930,22 +1020,17 @@ async fn misconfigured_server_returns_500() {
     };
 
     let services = create_services(Arc::clone(&engine), &cfg).await.unwrap();
-    let app = build_router(AppState { services, config: Arc::new(cfg) });
+    let app = build_router(AppState {
+        services,
+        config: Arc::new(cfg),
+    });
 
     // Health must remain available even when misconfigured
-    let health_resp = app
-        .clone()
-        .oneshot(get("/api/v1/health"))
-        .await
-        .unwrap();
+    let health_resp = app.clone().oneshot(get("/api/v1/health")).await.unwrap();
     assert_eq!(health_resp.status(), StatusCode::OK);
 
     // Non-health GET must return 500
-    let list_resp = app
-        .clone()
-        .oneshot(get("/api/v1/memories"))
-        .await
-        .unwrap();
+    let list_resp = app.clone().oneshot(get("/api/v1/memories")).await.unwrap();
     assert_eq!(list_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     // Non-health POST must return 500
@@ -989,7 +1074,7 @@ async fn promote_memory_to_long_term() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(&format!("/api/v1/memories/{id}/promote"))
+                .uri(format!("/api/v1/memories/{id}/promote"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1072,10 +1157,7 @@ async fn backup_endpoint_returns_a_nonempty_gzip_archive() {
         "application/gzip"
     );
     assert_eq!(
-        backup_resp
-            .headers()
-            .get("content-disposition")
-            .unwrap(),
+        backup_resp.headers().get("content-disposition").unwrap(),
         "attachment; filename=\"remem-backup.tar.gz\""
     );
 

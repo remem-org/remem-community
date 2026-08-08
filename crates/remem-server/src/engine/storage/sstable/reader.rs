@@ -1,5 +1,4 @@
 //! SSTable reader implementation
-#![allow(dead_code)]
 
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -28,8 +27,6 @@ pub struct SSTableReader {
     mmap: Mmap,
     /// Parsed header
     header: SSTableHeader,
-    /// Parsed footer
-    footer: SSTableFooter,
     /// Index entries (sparse index)
     index: Vec<IndexEntry>,
     /// Bloom filter
@@ -55,11 +52,6 @@ impl std::fmt::Debug for SSTableReader {
 }
 
 impl SSTableReader {
-    /// Open an SSTable file for reading
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_cache(path, None, 0)
-    }
-
     /// Open an SSTable file with a shared block cache
     pub fn open_with_cache(
         path: impl AsRef<Path>,
@@ -124,7 +116,6 @@ impl SSTableReader {
             path,
             mmap,
             header,
-            footer,
             index,
             bloom,
             compression,
@@ -235,11 +226,6 @@ impl SSTableReader {
         Ok(block)
     }
 
-    /// Check if a key might be in this SSTable (bloom filter check)
-    pub fn may_contain(&self, key: &[u8]) -> bool {
-        self.bloom.may_contain(key)
-    }
-
     /// Get an iterator over all records in the SSTable
     pub fn iter(&self) -> SSTableIterator<'_> {
         SSTableIterator::new(self)
@@ -249,12 +235,10 @@ impl SSTableReader {
     pub fn meta(&self) -> SSTableMeta {
         SSTableMeta {
             path: self.path.clone(),
-            compression: self.compression,
             record_count: self.header.record_count,
             file_size: self.mmap.len() as u64,
             min_key: Bytes::copy_from_slice(&self.header.min_key),
             max_key: Bytes::copy_from_slice(&self.header.max_key),
-            level: self.level,
         }
     }
 
@@ -263,19 +247,9 @@ impl SSTableReader {
         &self.path
     }
 
-    /// Get the number of records
-    pub fn record_count(&self) -> u64 {
-        self.header.record_count
-    }
-
     /// Get the level in the LSM tree
     pub fn level(&self) -> usize {
         self.level
-    }
-
-    /// Get the number of index entries (blocks)
-    pub fn block_count(&self) -> usize {
-        self.index.len()
     }
 }
 
@@ -346,7 +320,7 @@ mod tests {
         path: &Path,
         records: Vec<(Bytes, Option<Bytes>, u64)>,
     ) -> Result<SSTableMeta> {
-        let mut writer = SSTableWriter::new(path, Compression::None)?;
+        let mut writer = SSTableWriter::with_level(path, Compression::None, 0)?;
         for (key, value, ts) in records {
             writer.add(key, value, ts)?;
         }
@@ -364,7 +338,7 @@ mod tests {
         )
         .unwrap();
 
-        let reader = SSTableReader::open(&path).unwrap();
+        let reader = SSTableReader::open_with_cache(&path, None, 0).unwrap();
 
         let record = reader.get(b"key1").unwrap().unwrap();
         assert_eq!(record.key, Bytes::from("key1"));
@@ -392,7 +366,7 @@ mod tests {
 
         create_test_sstable(&path, records).unwrap();
 
-        let reader = SSTableReader::open(&path).unwrap();
+        let reader = SSTableReader::open_with_cache(&path, None, 0).unwrap();
 
         // Test random access
         let record = reader.get(b"key00050").unwrap().unwrap();
@@ -420,28 +394,11 @@ mod tests {
         )
         .unwrap();
 
-        let reader = SSTableReader::open(&path).unwrap();
+        let reader = SSTableReader::open_with_cache(&path, None, 0).unwrap();
 
         let record = reader.get(b"key2").unwrap().unwrap();
         assert!(record.is_tombstone());
         assert_eq!(record.timestamp, 2);
-    }
-
-    #[test]
-    fn test_bloom_filter_negative() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.sst");
-
-        create_test_sstable(
-            &path,
-            vec![(Bytes::from("existing_key"), Some(Bytes::from("value")), 1)],
-        )
-        .unwrap();
-
-        let reader = SSTableReader::open(&path).unwrap();
-
-        // Bloom filter should say the key is not present
-        assert!(!reader.may_contain(b"definitely_not_here_12345"));
     }
 
     #[test]
@@ -461,7 +418,7 @@ mod tests {
 
         create_test_sstable(&path, input_records.clone()).unwrap();
 
-        let reader = SSTableReader::open(&path).unwrap();
+        let reader = SSTableReader::open_with_cache(&path, None, 0).unwrap();
         let records: Vec<_> = reader.iter().collect::<Result<Vec<_>>>().unwrap();
 
         assert_eq!(records.len(), 50);
@@ -477,7 +434,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
 
-        let mut writer = SSTableWriter::new(&path, Compression::Zstd).unwrap();
+        let mut writer = SSTableWriter::with_level(&path, Compression::Zstd, 0).unwrap();
         for i in 0..100 {
             writer
                 .add(
@@ -489,7 +446,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let reader = SSTableReader::open(&path).unwrap();
+        let reader = SSTableReader::open_with_cache(&path, None, 0).unwrap();
 
         let record = reader.get(b"key00050").unwrap().unwrap();
         assert_eq!(record.value.unwrap(), Bytes::from("value50".repeat(10)));

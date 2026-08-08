@@ -18,7 +18,11 @@ use crate::client::RememClient;
 #[command(name = "remem-mcp", about = "Remem MCP server (stdio transport)")]
 struct Args {
     /// URL of the remem-server REST API.
-    #[arg(long, env = "REMEM_SERVER_URL", default_value = "http://localhost:4545")]
+    #[arg(
+        long,
+        env = "REMEM_SERVER_URL",
+        default_value = "http://localhost:4545"
+    )]
     server_url: String,
 
     /// API key for authenticating with remem-server. Empty = no auth header (dev only).

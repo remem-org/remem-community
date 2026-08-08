@@ -80,9 +80,9 @@ network transport; `crates/remem-mcp/` still exists separately for stdio only
 
 - `impl Into<Bytes>` params (put, add_edge, etc.): pass owned `String` or `.clone()` — never `&str`
 - `impl AsRef<[u8]>` params (get, get_neighbors, etc.): pass `&key` or `key.as_bytes()`
-- `BooleanMode`, `MergeStrategyType`: in `remem_storage::query`, not re-exported from root
+- `BooleanMode`: in `engine::query`, not re-exported from the crate root (`MergeStrategyType` was deleted with the unreachable planner — RRF is the only fusion strategy, see REM-72)
 - **Preferred write**: `engine.store_memory_core(key, value, embedding, timestamp, tags)` — single WAL lock + fsync
-- **Batch edges**: `engine.add_edges_batch(edges)` — single WAL lock for all edges
+- **Batch edges**: `engine.add_edges_batch(edges, created_at_ms)` — single WAL lock for all edges, shared timestamp across the batch
 
 ## WAL Record Types
 

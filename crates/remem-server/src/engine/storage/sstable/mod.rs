@@ -1,5 +1,4 @@
 //! SSTable: Sorted String Table implementation
-#![allow(unused_imports)]
 //!
 //! SSTables are immutable, sorted files that store key-value pairs on disk.
 //! They are the persistent storage layer of the LSM-tree.
@@ -27,7 +26,7 @@ mod format;
 mod reader;
 mod writer;
 
-pub use block::{Block, BlockCache};
-pub use format::{Compression, IndexEntry, Record, SSTableMeta, BLOCK_SIZE, MAGIC};
+pub use block::BlockCache;
+pub use format::{Compression, Record};
 pub use reader::SSTableReader;
 pub use writer::SSTableWriter;

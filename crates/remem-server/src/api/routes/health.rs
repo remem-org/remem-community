@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
 use crate::api::AppState;
-use crate::error::{ErrorResponse, Result};
+use crate::error::Result;
 use crate::services::types::MemoryType;
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -78,9 +78,7 @@ pub async fn health() -> Json<HealthResponse> {
     ),
     tag = "system"
 )]
-pub async fn ready(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<ReadyResponse>) {
+pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
     let storage_stats = state.services.engine.stats();
     let storage = StorageReadiness {
         ok: true,
@@ -126,7 +124,11 @@ pub(crate) async fn compute_stats(state: &AppState) -> Result<Stats> {
     }
 
     let short_term = total - long_term;
-    let avg_importance = if total > 0 { importance_sum / total as f32 } else { 0.0 };
+    let avg_importance = if total > 0 {
+        importance_sum / total as f32
+    } else {
+        0.0
+    };
 
     // Count edges where both source and target are non-archived in KV.
     // Verify targets via KV (same as connection_manager::list_all) rather than
@@ -135,7 +137,7 @@ pub(crate) async fn compute_stats(state: &AppState) -> Result<Stats> {
     let mut total_connections = 0usize;
     for key_bytes in &active_entry_keys {
         let neighbors = state.services.engine.get_neighbors(key_bytes)?;
-        for (target, _, _) in neighbors {
+        for (target, _, _, _) in neighbors {
             let Ok(tgt) = state.services.repo.load_by_key(target.as_ref()).await else {
                 continue;
             };
@@ -167,7 +169,10 @@ pub(crate) async fn compute_stats(state: &AppState) -> Result<Stats> {
 )]
 pub async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>> {
     let stats = compute_stats(&state).await?;
-    Ok(Json(StatsResponse { success: true, stats }))
+    Ok(Json(StatsResponse {
+        success: true,
+        stats,
+    }))
 }
 
 #[utoipa::path(
@@ -181,24 +186,48 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>>
 )]
 pub async fn deep_health(State(state): State<AppState>) -> (StatusCode, Json<DeepHealthResponse>) {
     // Check 1: KV layer is readable
-    let storage_read = match state.services.engine.get(b"__deep_health_check__" as &[u8]).await {
-        Ok(_) => DeepHealthCheck { ok: true, detail: None },
-        Err(e) => DeepHealthCheck { ok: false, detail: Some(e.to_string()) },
+    let storage_read = match state
+        .services
+        .engine
+        .get(b"__deep_health_check__" as &[u8])
+        .await
+    {
+        Ok(_) => DeepHealthCheck {
+            ok: true,
+            detail: None,
+        },
+        Err(e) => DeepHealthCheck {
+            ok: false,
+            detail: Some(e.to_string()),
+        },
     };
 
     // Check 2: vector index is queryable (only if vectors exist)
     let vector_search = if state.services.engine.stats().vector_count == 0 {
-        DeepHealthCheck { ok: true, detail: None }
+        DeepHealthCheck {
+            ok: true,
+            detail: None,
+        }
     } else {
         let zero_vec = vec![0.0f32; 384];
         match state.services.engine.vector_search(&zero_vec, 1).await {
-            Ok(_) => DeepHealthCheck { ok: true, detail: None },
-            Err(e) => DeepHealthCheck { ok: false, detail: Some(e.to_string()) },
+            Ok(_) => DeepHealthCheck {
+                ok: true,
+                detail: None,
+            },
+            Err(e) => DeepHealthCheck {
+                ok: false,
+                detail: Some(e.to_string()),
+            },
         }
     };
 
     let all_ok = storage_read.ok && vector_search.ok;
-    let http_status = if all_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let http_status = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
 
     (
         http_status,

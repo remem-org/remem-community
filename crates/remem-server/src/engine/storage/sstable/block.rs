@@ -1,5 +1,4 @@
 //! Block cache for SSTable data blocks
-#![allow(dead_code)]
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -48,16 +47,6 @@ impl Block {
         // Since records are sorted, we could use binary search
         // For now, linear search is fine for small blocks
         self.records.iter().find(|r| r.key.as_ref() == key)
-    }
-
-    /// Get the number of records in this block
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Check if the block is empty
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
     }
 
     /// Get the raw data size
@@ -131,72 +120,14 @@ impl BlockCache {
         }
     }
 
-    /// Get or load a block
-    ///
-    /// If the block is in the cache, return it. Otherwise, call the loader
-    /// function to load it, cache it, and return it.
-    pub fn get_or_load<F>(&self, key: BlockCacheKey, loader: F) -> Option<Arc<Block>>
-    where
-        F: FnOnce() -> Option<Block>,
-    {
-        // Check cache first
-        if let Some(block) = self.get(&key) {
-            return Some(block);
-        }
-
-        // Load the block
-        let block = loader()?;
-        let block = Arc::new(block);
-
-        // Insert into cache
-        self.insert(key, Arc::clone(&block));
-
-        Some(block)
-    }
-
-    /// Clear the cache
-    pub fn clear(&self) {
-        let mut cache = self.cache.lock();
-        let mut current_size = self.current_size.lock();
-        cache.clear();
-        *current_size = 0;
-    }
-
-    /// Get the current cache size in bytes
-    pub fn size(&self) -> usize {
-        *self.current_size.lock()
-    }
-
     /// Get the number of cached blocks
+    ///
+    /// Test-only: `sstable::reader::tests::test_with_block_cache` asserts on this
+    /// after a cache-populating read, to verify the reader actually populates the cache.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cache.lock().len()
     }
-
-    /// Check if the cache is empty
-    pub fn is_empty(&self) -> bool {
-        self.cache.lock().is_empty()
-    }
-
-    /// Get cache statistics
-    pub fn stats(&self) -> BlockCacheStats {
-        let cache = self.cache.lock();
-        BlockCacheStats {
-            entries: cache.len(),
-            size_bytes: *self.current_size.lock(),
-            max_size_bytes: self.max_size,
-        }
-    }
-}
-
-/// Statistics about the block cache
-#[derive(Debug, Clone)]
-pub struct BlockCacheStats {
-    /// Number of entries in the cache
-    pub entries: usize,
-    /// Current size in bytes
-    pub size_bytes: usize,
-    /// Maximum size in bytes
-    pub max_size_bytes: usize,
 }
 
 impl Default for BlockCache {
@@ -228,7 +159,7 @@ mod tests {
         // Parse the block
         let block = Block::parse(Bytes::from(data)).unwrap();
 
-        assert_eq!(block.len(), 3);
+        assert_eq!(block.iter().count(), 3);
 
         let r1 = block.get(b"key1").unwrap();
         assert_eq!(r1.value.as_ref().unwrap().as_ref(), b"value1");
@@ -261,7 +192,7 @@ mod tests {
 
         // Now it should be found
         let cached = cache.get(&key).unwrap();
-        assert_eq!(cached.len(), 1);
+        assert_eq!(cached.iter().count(), 1);
     }
 
     #[test]
@@ -309,34 +240,5 @@ mod tests {
         let first_two_cached =
             cache.get(&key1).is_some() as i32 + cache.get(&key2).is_some() as i32;
         assert!(first_two_cached <= 1);
-    }
-
-    #[test]
-    fn test_get_or_load() {
-        let cache = BlockCache::new(1024 * 1024);
-
-        let key = BlockCacheKey {
-            path: PathBuf::from("/test/file.sst"),
-            offset: 0,
-        };
-
-        let mut load_count = 0;
-
-        // First call should load
-        let block = cache.get_or_load(key.clone(), || {
-            load_count += 1;
-            let record = Record::new(Bytes::from("k"), Bytes::from("v"), 1);
-            Block::parse(Bytes::from(record.encode()))
-        });
-        assert!(block.is_some());
-        assert_eq!(load_count, 1);
-
-        // Second call should use cache
-        let block2 = cache.get_or_load(key.clone(), || {
-            load_count += 1;
-            None // Shouldn't be called
-        });
-        assert!(block2.is_some());
-        assert_eq!(load_count, 1); // Still 1, loader not called
     }
 }

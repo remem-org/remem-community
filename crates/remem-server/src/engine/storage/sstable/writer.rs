@@ -1,5 +1,4 @@
 //! SSTable writer implementation
-#![allow(dead_code)]
 
 use bytes::Bytes;
 use std::fs::File;
@@ -52,16 +51,9 @@ pub struct SSTableWriter {
     block_first_key: Option<Bytes>,
     /// CRC32 hasher for the entire file
     file_hasher: crc32fast::Hasher,
-    /// Level in the LSM tree
-    level: usize,
 }
 
 impl SSTableWriter {
-    /// Create a new SSTable writer
-    pub fn new(path: impl AsRef<Path>, compression: Compression) -> Result<Self> {
-        Self::with_level(path, compression, 0)
-    }
-
     /// Create a new SSTable writer for a specific level
     pub fn with_level(
         path: impl AsRef<Path>,
@@ -70,6 +62,7 @@ impl SSTableWriter {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let tmp_path = path.with_extension("sst.tmp");
+        tracing::trace!(level, path = %path.display(), "creating sstable writer");
 
         let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
@@ -100,7 +93,6 @@ impl SSTableWriter {
             max_key: None,
             block_first_key: None,
             file_hasher,
-            level,
         })
     }
 
@@ -141,7 +133,11 @@ impl SSTableWriter {
     }
 
     /// Add a record from a MemTable entry
-    pub fn add_entry(&mut self, key: Bytes, entry: &crate::engine::storage::memtable::Entry) -> Result<()> {
+    pub fn add_entry(
+        &mut self,
+        key: Bytes,
+        entry: &crate::engine::storage::memtable::Entry,
+    ) -> Result<()> {
         self.add(key, entry.value.clone(), entry.timestamp)
     }
 
@@ -258,12 +254,10 @@ impl SSTableWriter {
 
         Ok(SSTableMeta {
             path: self.path,
-            compression: self.compression,
             record_count: self.record_count,
             file_size,
             min_key: self.min_key.unwrap_or_default(),
             max_key: self.max_key.unwrap_or_default(),
-            level: self.level,
         })
     }
 
@@ -304,7 +298,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.sst");
 
-        let writer = SSTableWriter::new(&path, Compression::None).unwrap();
+        let writer = SSTableWriter::with_level(&path, Compression::None, 0).unwrap();
         let meta = writer.finish().unwrap();
 
         assert_eq!(meta.record_count, 0);
@@ -316,7 +310,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("single.sst");
 
-        let mut writer = SSTableWriter::new(&path, Compression::None).unwrap();
+        let mut writer = SSTableWriter::with_level(&path, Compression::None, 0).unwrap();
         writer
             .add(Bytes::from("key1"), Some(Bytes::from("value1")), 1)
             .unwrap();
@@ -332,7 +326,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.sst");
 
-        let mut writer = SSTableWriter::new(&path, Compression::None).unwrap();
+        let mut writer = SSTableWriter::with_level(&path, Compression::None, 0).unwrap();
 
         // Add records in sorted order
         for i in 0..100 {
@@ -355,7 +349,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tombstones.sst");
 
-        let mut writer = SSTableWriter::new(&path, Compression::None).unwrap();
+        let mut writer = SSTableWriter::with_level(&path, Compression::None, 0).unwrap();
 
         writer
             .add(Bytes::from("key1"), Some(Bytes::from("value1")), 1)
@@ -386,14 +380,14 @@ mod tests {
             .collect();
 
         // Write without compression
-        let mut writer = SSTableWriter::new(&path_none, Compression::None).unwrap();
+        let mut writer = SSTableWriter::with_level(&path_none, Compression::None, 0).unwrap();
         for (key, value) in &data {
             writer.add(key.clone(), Some(value.clone()), 1).unwrap();
         }
         let meta_none = writer.finish().unwrap();
 
         // Write with compression
-        let mut writer = SSTableWriter::new(&path_zstd, Compression::Zstd).unwrap();
+        let mut writer = SSTableWriter::with_level(&path_zstd, Compression::Zstd, 0).unwrap();
         for (key, value) in &data {
             writer.add(key.clone(), Some(value.clone()), 1).unwrap();
         }

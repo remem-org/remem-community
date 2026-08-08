@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -61,7 +61,7 @@ const TASKS: &[(&str, &str)] = &[
 ];
 
 impl TaskRegistry {
-    pub fn new(data_dir: &PathBuf) -> Self {
+    pub fn new(data_dir: &Path) -> Self {
         let log_dir = data_dir.join("task_logs");
         if let Err(e) = fs::create_dir_all(&log_dir) {
             tracing::warn!(dir = %log_dir.display(), error = %e, "could not create task_logs dir");
@@ -72,12 +72,18 @@ impl TaskRegistry {
             let history = Self::load_history(&log_dir, name);
             let (last_started_ms, last_run_ms, last_count, last_error) = history
                 .last()
-                .map(|l| (
-                    if l.started_ms > 0 { Some(l.started_ms) } else { None },
-                    Some(l.run_ms),
-                    Some(l.count),
-                    l.error.clone(),
-                ))
+                .map(|l| {
+                    (
+                        if l.started_ms > 0 {
+                            Some(l.started_ms)
+                        } else {
+                            None
+                        },
+                        Some(l.run_ms),
+                        Some(l.count),
+                        l.error.clone(),
+                    )
+                })
                 .unwrap_or((None, None, None, None));
 
             map.insert(
@@ -107,7 +113,7 @@ impl TaskRegistry {
         }
     }
 
-    fn load_history(log_dir: &PathBuf, name: &str) -> Vec<RunLog> {
+    fn load_history(log_dir: &Path, name: &str) -> Vec<RunLog> {
         let path = log_dir.join(format!("{name}.jsonl"));
         let Ok(file) = fs::File::open(&path) else {
             return Vec::new();
@@ -134,16 +140,14 @@ impl TaskRegistry {
     fn append_to_disk(&self, name: &str, log: &RunLog) {
         let path = self.log_dir.join(format!("{name}.jsonl"));
         match serde_json::to_string(log) {
-            Ok(json) => {
-                match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(mut file) => {
-                        if let Err(e) = writeln!(file, "{json}") {
-                            tracing::warn!(task = name, error = %e, "failed to append run log");
-                        }
+            Ok(json) => match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(e) = writeln!(file, "{json}") {
+                        tracing::warn!(task = name, error = %e, "failed to append run log");
                     }
-                    Err(e) => tracing::warn!(task = name, error = %e, "failed to open log file"),
                 }
-            }
+                Err(e) => tracing::warn!(task = name, error = %e, "failed to open log file"),
+            },
             Err(e) => tracing::warn!(task = name, error = %e, "failed to serialize run log"),
         }
     }
@@ -161,7 +165,12 @@ impl TaskRegistry {
 
     pub fn record_result(&self, name: &str, count: i64, error: Option<String>) {
         let run_ms = now_ms();
-        let mut log = RunLog { started_ms: 0, run_ms, count, error: error.clone() };
+        let mut log = RunLog {
+            started_ms: 0,
+            run_ms,
+            count,
+            error: error.clone(),
+        };
 
         // Update in-memory state while holding the lock.
         if let Ok(mut map) = self.inner.lock() {
@@ -205,15 +214,6 @@ impl TaskRegistry {
             .lock()
             .ok()
             .and_then(|map| map.get(name).map(|e| e.is_paused))
-            .unwrap_or(false)
-    }
-
-    /// Returns true if the named task is currently executing.
-    pub fn is_running_now(&self, name: &str) -> bool {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|map| map.get(name).map(|e| e.status.is_running))
             .unwrap_or(false)
     }
 
@@ -302,14 +302,22 @@ mod pause_tests {
     }
 
     #[test]
-    fn is_running_now_reflects_set_running() {
+    fn set_running_and_record_result_toggle_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let r = TaskRegistry::new(&tmp.path().to_path_buf());
+        let r = TaskRegistry::new(tmp.path());
 
-        assert!(!r.is_running_now("expire_short_term"));
+        let is_running = |r: &TaskRegistry| {
+            r.list()
+                .into_iter()
+                .find(|t| t.name == "expire_short_term")
+                .unwrap()
+                .is_running
+        };
+
+        assert!(!is_running(&r));
         r.set_running("expire_short_term");
-        assert!(r.is_running_now("expire_short_term"));
+        assert!(is_running(&r));
         r.record_result("expire_short_term", 0, None);
-        assert!(!r.is_running_now("expire_short_term"));
+        assert!(!is_running(&r));
     }
 }

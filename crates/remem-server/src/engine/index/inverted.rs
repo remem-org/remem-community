@@ -1,5 +1,4 @@
 //! Inverted index for tag and text search
-#![allow(dead_code)]
 //!
 //! This module implements an inverted index optimized for:
 //! - Tag-based lookups: Find records with specific tags
@@ -17,7 +16,7 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -32,8 +31,6 @@ pub struct InvertedIndexConfig {
     pub min_token_length: usize,
     /// Maximum token length to index
     pub max_token_length: usize,
-    /// Characters that separate tokens (default: whitespace + punctuation)
-    pub token_separators: String,
 }
 
 impl Default for InvertedIndexConfig {
@@ -42,22 +39,11 @@ impl Default for InvertedIndexConfig {
             lowercase: true,
             min_token_length: 1,
             max_token_length: 100,
-            token_separators: " \t\n\r,.;:!?()[]{}\"'`~@#$%^&*-+=<>/\\|".to_string(),
         }
     }
 }
 
 impl InvertedIndexConfig {
-    /// Create a config for exact tag matching (no normalization)
-    pub fn exact_tags() -> Self {
-        Self {
-            lowercase: false,
-            min_token_length: 1,
-            max_token_length: 200,
-            token_separators: String::new(),
-        }
-    }
-
     /// Set lowercase normalization
     pub fn lowercase(mut self, lowercase: bool) -> Self {
         self.lowercase = lowercase;
@@ -174,11 +160,6 @@ impl InvertedIndex {
         }
     }
 
-    /// Get the minimum token length configuration
-    pub fn min_token_length(&self) -> usize {
-        self.config.min_token_length
-    }
-
     /// Normalize a token according to config
     fn normalize_token(&self, token: &str) -> Option<String> {
         let token = if self.config.lowercase {
@@ -193,20 +174,6 @@ impl InvertedIndex {
         }
 
         Some(token)
-    }
-
-    /// Tokenize text into individual tokens
-    fn tokenize(&self, text: &str) -> Vec<String> {
-        if self.config.token_separators.is_empty() {
-            // No tokenization, treat as single token
-            return self.normalize_token(text).into_iter().collect();
-        }
-
-        let separator_chars: HashSet<char> = self.config.token_separators.chars().collect();
-
-        text.split(|c| separator_chars.contains(&c))
-            .filter_map(|t| self.normalize_token(t))
-            .collect()
     }
 
     /// Add a tag to a document (preserves existing tags)
@@ -236,10 +203,7 @@ impl InvertedIndex {
         // Add to posting list
         {
             let mut index = self.index.write();
-            index
-                .entry(token)
-                .or_insert_with(PostingList::new)
-                .add(key, 1.0);
+            index.entry(token).or_default().add(key, 1.0);
         }
 
         if was_new_doc {
@@ -274,18 +238,6 @@ impl InvertedIndex {
         if tokens.is_empty() {
             // If no valid tokens, just remove the document
             self.remove(&key)?;
-            return Ok(());
-        }
-
-        self.index_tokens(key, tokens)
-    }
-
-    /// Index text content for a document
-    pub fn index_text(&self, key: impl Into<Bytes>, text: &str) -> Result<()> {
-        let key = key.into();
-        let tokens = self.tokenize(text);
-
-        if tokens.is_empty() {
             return Ok(());
         }
 
@@ -333,7 +285,7 @@ impl InvertedIndex {
                 let score = freq as f32;
                 index
                     .entry(token.to_string())
-                    .or_insert_with(PostingList::new)
+                    .or_default()
                     .add(key.clone(), score);
             }
 
@@ -454,31 +406,6 @@ impl InvertedIndex {
         result_set.into_iter().collect()
     }
 
-    /// Search for documents containing ANY of the given tokens (OR query)
-    pub fn search_or(&self, queries: &[&str]) -> Vec<Bytes> {
-        let tokens: Vec<String> = queries
-            .iter()
-            .filter_map(|q| self.normalize_token(q))
-            .collect();
-
-        if tokens.is_empty() {
-            return Vec::new();
-        }
-
-        let index = self.index.read();
-        let mut result_set: HashSet<Bytes> = HashSet::new();
-
-        for token in &tokens {
-            if let Some(pl) = index.get(token) {
-                for key in pl.get_keys() {
-                    result_set.insert(key);
-                }
-            }
-        }
-
-        result_set.into_iter().collect()
-    }
-
     /// Search with OR and scoring (results sorted by number of matching tokens)
     pub fn search_or_scored(&self, queries: &[&str]) -> Vec<(Bytes, f32)> {
         let tokens: Vec<String> = queries
@@ -518,35 +445,10 @@ impl InvertedIndex {
         key_to_tokens.contains_key(key)
     }
 
-    /// Check if a document has a specific tag/token
-    pub fn has_token(&self, key: &[u8], token: &str) -> bool {
-        let normalized = match self.normalize_token(token) {
-            Some(t) => t,
-            None => return false,
-        };
-
-        let key_to_tokens = self.key_to_tokens.read();
-        key_to_tokens
-            .get(key)
-            .map(|tokens| tokens.contains(&normalized))
-            .unwrap_or(false)
-    }
-
     /// Get all unique tokens in the index
     pub fn all_tokens(&self) -> Vec<String> {
         let index = self.index.read();
         index.keys().cloned().collect()
-    }
-
-    /// Get token count for a specific token
-    pub fn token_doc_count(&self, token: &str) -> usize {
-        let normalized = match self.normalize_token(token) {
-            Some(t) => t,
-            None => return 0,
-        };
-
-        let index = self.index.read();
-        index.get(&normalized).map(|pl| pl.len()).unwrap_or(0)
     }
 
     /// Get number of indexed documents
@@ -559,108 +461,9 @@ impl InvertedIndex {
         self.len() == 0
     }
 
-    /// Get number of unique tokens
-    pub fn unique_token_count(&self) -> usize {
-        self.index.read().len()
-    }
-
     /// Check if the index has been modified
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
-    }
-
-    /// Mark the index as clean
-    pub fn mark_clean(&self) {
-        self.dirty.store(false, Ordering::Relaxed);
-    }
-
-    /// Save the index to a file.
-    ///
-    /// Both read locks (`index` and `key_to_tokens`) are held simultaneously
-    /// only for the in-memory snapshot, not during disk I/O. This gives a
-    /// consistent point-in-time view and releases locks before any blocking
-    /// writes.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-
-        // --- Snapshot while holding both read locks simultaneously ---
-        // Type aliases keep the snapshot types readable.
-        // index_snap: Vec<(token, Vec<(key, score)>)>
-        // ktt_snap:   Vec<(key, Vec<token>)>
-        let (index_snap, ktt_snap) = {
-            let index = self.index.read();
-            let key_to_tokens = self.key_to_tokens.read();
-
-            let idx: Vec<(String, Vec<(Bytes, f32)>)> = index
-                .iter()
-                .map(|(token, pl)| {
-                    let postings = pl
-                        .get_postings()
-                        .iter()
-                        .map(|p| (p.key.clone(), p.score))
-                        .collect();
-                    (token.clone(), postings)
-                })
-                .collect();
-
-            let ktt: Vec<(Bytes, Vec<String>)> = key_to_tokens
-                .iter()
-                .map(|(k, ts)| (k.clone(), ts.clone()))
-                .collect();
-
-            (idx, ktt)
-            // both read locks released here
-        };
-
-        // --- Write snapshot to disk without holding any lock ---
-        let tmp_path = path.with_extension("tmp");
-        let file = std::fs::File::create(&tmp_path)?;
-        let mut writer = std::io::BufWriter::new(file);
-
-        // Write header
-        writer.write_all(b"INVI")?;
-        writer.write_all(&1u32.to_le_bytes())?;
-
-        // Write config
-        writer.write_all(&[self.config.lowercase as u8])?;
-        writer.write_all(&(self.config.min_token_length as u32).to_le_bytes())?;
-        writer.write_all(&(self.config.max_token_length as u32).to_le_bytes())?;
-        let sep_bytes = self.config.token_separators.as_bytes();
-        writer.write_all(&(sep_bytes.len() as u32).to_le_bytes())?;
-        writer.write_all(sep_bytes)?;
-
-        // Write index
-        writer.write_all(&(index_snap.len() as u32).to_le_bytes())?;
-        for (token, postings) in &index_snap {
-            let token_bytes = token.as_bytes();
-            writer.write_all(&(token_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(token_bytes)?;
-            writer.write_all(&(postings.len() as u32).to_le_bytes())?;
-            for (key, score) in postings {
-                writer.write_all(&(key.len() as u32).to_le_bytes())?;
-                writer.write_all(key)?;
-                writer.write_all(&score.to_le_bytes())?;
-            }
-        }
-
-        // Write key_to_tokens mapping
-        writer.write_all(&(ktt_snap.len() as u32).to_le_bytes())?;
-        for (key, tokens) in &ktt_snap {
-            writer.write_all(&(key.len() as u32).to_le_bytes())?;
-            writer.write_all(key)?;
-            writer.write_all(&(tokens.len() as u32).to_le_bytes())?;
-            for token in tokens {
-                let token_bytes = token.as_bytes();
-                writer.write_all(&(token_bytes.len() as u32).to_le_bytes())?;
-                writer.write_all(token_bytes)?;
-            }
-        }
-
-        writer.flush()?;
-        drop(writer);
-        std::fs::rename(&tmp_path, path)?;
-        self.mark_clean();
-        Ok(())
     }
 
     /// Load an index from a file
@@ -701,18 +504,23 @@ impl InvertedIndex {
         file.read_exact(&mut buf4)?;
         let max_token_length = u32::from_le_bytes(buf4) as usize;
 
+        // `token_separators` was dropped from `InvertedIndexConfig` in REM-36
+        // (dead field once `tokenize()`/`index_text()` -- its only readers --
+        // were deleted as dead code). The on-disk `.idx` format still has a
+        // length-prefixed separator string at this position, so the bytes
+        // must still be consumed to keep the reader aligned for the fields
+        // that follow, even though the value itself is now discarded. Same
+        // treatment as the `BTIX` field-skip handling from sub-task 6b.
         file.read_exact(&mut buf4)?;
         let sep_len = u32::from_le_bytes(buf4) as usize;
         let mut sep_bytes = vec![0u8; sep_len];
         file.read_exact(&mut sep_bytes)?;
-        let token_separators =
-            String::from_utf8(sep_bytes).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        drop(sep_bytes);
 
         let config = InvertedIndexConfig {
             lowercase,
             min_token_length,
             max_token_length,
-            token_separators,
         };
 
         // Read index
@@ -788,15 +596,6 @@ impl InvertedIndex {
             dirty: AtomicBool::new(false),
         })
     }
-
-    /// Clear all entries
-    pub fn clear(&self) {
-        self.index.write().clear();
-        self.key_to_tokens.write().clear();
-        self.doc_count.store(0, Ordering::Relaxed);
-        self.token_count.store(0, Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Relaxed);
-    }
 }
 
 #[cfg(test)]
@@ -828,40 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_tags() {
-        let index = InvertedIndex::new(InvertedIndexConfig::default());
-
-        index
-            .add_tags(
-                b"doc1".to_vec(),
-                &["rust".to_string(), "programming".to_string()],
-            )
-            .unwrap();
-
-        assert!(index.has_token(b"doc1", "rust"));
-        assert!(index.has_token(b"doc1", "programming"));
-        assert!(!index.has_token(b"doc1", "java"));
-    }
-
-    #[test]
-    fn test_index_text() {
-        let index = InvertedIndex::new(InvertedIndexConfig::default());
-
-        index
-            .index_text(b"doc1".to_vec(), "The quick brown fox")
-            .unwrap();
-        index
-            .index_text(b"doc2".to_vec(), "The lazy brown dog")
-            .unwrap();
-
-        let quick_docs = index.search("quick");
-        assert_eq!(quick_docs.len(), 1);
-
-        let brown_docs = index.search("brown");
-        assert_eq!(brown_docs.len(), 2);
-    }
-
-    #[test]
     fn test_case_insensitive() {
         let index = InvertedIndex::new(InvertedIndexConfig::default());
 
@@ -874,21 +639,6 @@ mod tests {
 
         let docs = index.search("RUST");
         assert_eq!(docs.len(), 3);
-    }
-
-    #[test]
-    fn test_exact_tags() {
-        let index = InvertedIndex::new(InvertedIndexConfig::exact_tags());
-
-        index.add_tag(b"doc1".to_vec(), "Rust").unwrap();
-        index.add_tag(b"doc2".to_vec(), "rust").unwrap();
-
-        // Case-sensitive
-        let docs = index.search("Rust");
-        assert_eq!(docs.len(), 1);
-
-        let docs = index.search("rust");
-        assert_eq!(docs.len(), 1);
     }
 
     #[test]
@@ -914,28 +664,31 @@ mod tests {
     }
 
     #[test]
-    fn test_or_query() {
-        let index = InvertedIndex::new(InvertedIndexConfig::default());
-
-        index.add_tag(b"doc1".to_vec(), "rust").unwrap();
-        index.add_tag(b"doc2".to_vec(), "python").unwrap();
-        index.add_tag(b"doc3".to_vec(), "java").unwrap();
-
-        let docs = index.search_or(&["rust", "python"]);
-        assert_eq!(docs.len(), 2);
-    }
-
-    #[test]
     fn test_scored_search() {
         let index = InvertedIndex::new(InvertedIndexConfig::default());
 
-        // Doc1 has "rust" twice
+        // Doc1 has "rust" twice (set_tags/index_tokens computes TF, so a
+        // repeated tag in the same call counts twice -- was originally
+        // written with the now-deleted `index_text("rust rust programming")`;
+        // `index_text`/`tokenize` were dead code cascaded from REM-36's
+        // removal of `StorageEngine::index_text`, but the TF-scoring
+        // behavior under test here is unrelated and still live).
         index
-            .index_text(b"doc1".to_vec(), "rust rust programming")
+            .set_tags(
+                b"doc1".to_vec(),
+                &[
+                    "rust".to_string(),
+                    "rust".to_string(),
+                    "programming".to_string(),
+                ],
+            )
             .unwrap();
         // Doc2 has "rust" once
         index
-            .index_text(b"doc2".to_vec(), "rust programming")
+            .set_tags(
+                b"doc2".to_vec(),
+                &["rust".to_string(), "programming".to_string()],
+            )
             .unwrap();
 
         let results = index.search_scored("rust");
@@ -980,6 +733,34 @@ mod tests {
     }
 
     #[test]
+    fn test_set_tags_replaces_existing_tags() {
+        let index = InvertedIndex::new(InvertedIndexConfig::default());
+
+        index
+            .set_tags(b"doc1".to_vec(), &["old".to_string()])
+            .unwrap();
+        assert_eq!(index.get_tokens(b"doc1"), vec!["old".to_string()]);
+
+        // set_tags replaces the previous tag set rather than merging with it
+        index
+            .set_tags(b"doc1".to_vec(), &["new".to_string()])
+            .unwrap();
+        let tokens = index.get_tokens(b"doc1");
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens.contains(&"new".to_string()));
+        assert!(!tokens.contains(&"old".to_string()));
+
+        // add_tags, by contrast, preserves existing tags
+        index
+            .add_tags(b"doc1".to_vec(), &["another".to_string()])
+            .unwrap();
+        let tokens = index.get_tokens(b"doc1");
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&"new".to_string()));
+        assert!(tokens.contains(&"another".to_string()));
+    }
+
+    #[test]
     fn test_all_tokens() {
         let index = InvertedIndex::new(InvertedIndexConfig::default());
 
@@ -992,76 +773,30 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load() {
-        let index = InvertedIndex::new(InvertedIndexConfig::default());
-
-        index.add_tag(b"doc1".to_vec(), "rust").unwrap();
-        index.index_text(b"doc2".to_vec(), "hello world").unwrap();
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test.inv");
-
-        index.save(&path).unwrap();
-
-        let loaded = InvertedIndex::load(&path).unwrap();
-        assert_eq!(loaded.len(), 2);
-
-        let rust_docs = loaded.search("rust");
-        assert_eq!(rust_docs.len(), 1);
-
-        let hello_docs = loaded.search("hello");
-        assert_eq!(hello_docs.len(), 1);
-    }
-
-    #[test]
-    fn test_update_document() {
-        let index = InvertedIndex::new(InvertedIndexConfig::default());
-
-        index
-            .set_tags(b"doc1".to_vec(), &["old".to_string()])
-            .unwrap();
-        assert!(index.has_token(b"doc1", "old"));
-
-        // Update with new tags (set_tags replaces all tags)
-        index
-            .set_tags(b"doc1".to_vec(), &["new".to_string()])
-            .unwrap();
-        assert!(!index.has_token(b"doc1", "old"));
-        assert!(index.has_token(b"doc1", "new"));
-
-        // Verify add_tags preserves existing
-        index
-            .add_tags(b"doc1".to_vec(), &["another".to_string()])
-            .unwrap();
-        assert!(index.has_token(b"doc1", "new"));
-        assert!(index.has_token(b"doc1", "another"));
-    }
-
-    #[test]
     fn test_min_token_length() {
         let config = InvertedIndexConfig::default().min_token_length(3);
         let index = InvertedIndex::new(config);
 
-        index.index_text(b"doc1".to_vec(), "a ab abc abcd").unwrap();
+        // Was originally written with the now-deleted `index_text("a ab abc
+        // abcd")`; `normalize_token` (called by `add_tags` too, not just the
+        // deleted `tokenize`/`index_text`) applies the same `min_token_length`
+        // filter, so `add_tags` exercises the identical behavior.
+        index
+            .add_tags(
+                b"doc1".to_vec(),
+                &[
+                    "a".to_string(),
+                    "ab".to_string(),
+                    "abc".to_string(),
+                    "abcd".to_string(),
+                ],
+            )
+            .unwrap();
 
         // Short tokens should be filtered out
         assert!(index.search("a").is_empty());
         assert!(index.search("ab").is_empty());
         assert!(!index.search("abc").is_empty());
         assert!(!index.search("abcd").is_empty());
-    }
-
-    #[test]
-    fn test_clear() {
-        let index = InvertedIndex::new(InvertedIndexConfig::default());
-
-        index.add_tag(b"doc1".to_vec(), "rust").unwrap();
-        index.add_tag(b"doc2".to_vec(), "python").unwrap();
-
-        assert_eq!(index.len(), 2);
-
-        index.clear();
-        assert!(index.is_empty());
-        assert_eq!(index.unique_token_count(), 0);
     }
 }

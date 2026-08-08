@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Guidance for Claude Code when working in the remem repository.
+Guidance for Codex when working in the remem repository.
 
 # Memory 
 USE remem-mcp for you own memory
@@ -114,7 +114,7 @@ Remem is a persistent memory system for LLMs and AI agents. It provides semantic
 │  MCP Server — stdio transport only            │
 │  8 tools | 3 resources | JSON-RPC 2.0        │
 │  crates/remem-mcp/  (Rust)                   │
-│  → crates/remem-mcp/CLAUDE.md               │
+│  → crates/remem-mcp/AGENTS.md               │
 └──────────────────────────────────────────────┘
                       │  REST (HTTP)
 ┌──────────────────────────────────────────────┐
@@ -123,15 +123,15 @@ Remem is a persistent memory system for LLMs and AI agents. It provides semantic
 │  + in-process MCP (Streamable HTTP) at /mcp  │
 │  HNSW | CSR Graph | BTree | InvertedTag | LSM│
 │  crates/remem-server/  (Rust)                │
-│  → crates/remem-server/CLAUDE.md            │
+│  → crates/remem-server/AGENTS.md            │
 └──────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────┐
 │        Backoffice  (ports 3000 / 8002)       │
 │  React SPA + FastAPI + PostgreSQL            │
 │  src/backoffice/  (Python + TypeScript)      │
-│  → src/backoffice/backend/CLAUDE.md         │
-│  → src/backoffice/frontend/CLAUDE.md        │
+│  → src/backoffice/backend/AGENTS.md         │
+│  → src/backoffice/frontend/AGENTS.md        │
 └──────────────────────────────────────────────┘
 ```
 

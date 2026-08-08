@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::error::{AppError, ErrorResponse, Result};
-use crate::services::types::{Memory, MemoryFilters, MemoryType, RelationshipType, SortBy};
+use crate::error::{AppError, Result};
 use crate::services::memory_manager::CreateOpts;
+use crate::services::types::{Memory, MemoryFilters, MemoryType, RelationshipType, SortBy};
 
 pub(crate) const MAX_CONTENT_BYTES: usize = 100_000;
 pub(crate) const MAX_TAGS: usize = 50;
@@ -21,39 +21,54 @@ const MAX_GRAPH_RELATIONSHIPS: usize = 200;
 
 /// Deserialize a comma-separated string into `Vec<String>`.
 /// Missing field → empty vec; `tags=` (empty) → empty vec.
-fn deserialize_comma_list<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+fn deserialize_comma_list<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<String>, D::Error> {
     let s = String::deserialize(d)?;
     Ok(if s.is_empty() {
         Vec::new()
     } else {
-        s.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect()
+        s.split(',')
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect()
     })
 }
 
 /// Deserialize an optional `MemoryType` from a string, returning a clear error
 /// on unknown values instead of propagating a generic 500.
-fn deserialize_opt_memory_type<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<MemoryType>, D::Error> {
+fn deserialize_opt_memory_type<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<MemoryType>, D::Error> {
     let s: Option<String> = Option::deserialize(d)?;
     match s {
         None => Ok(None),
-        Some(s) => MemoryType::try_from(s.as_str()).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => MemoryType::try_from(s.as_str())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
 /// Deserialize an optional `SortBy` from a string, returning a clear error
 /// on unknown values instead of propagating a generic 500.
-fn deserialize_opt_sort_by<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<SortBy>, D::Error> {
+fn deserialize_opt_sort_by<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<SortBy>, D::Error> {
     let s: Option<String> = Option::deserialize(d)?;
     match s {
         None => Ok(None),
-        Some(s) => SortBy::try_from(s.as_str()).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => SortBy::try_from(s.as_str())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
 /// Deserialize an optional RFC-3339 timestamp string into milliseconds since epoch.
 /// Accepts RFC-3339 with timezone (e.g. `2024-01-01T00:00:00Z`) or timezone-naive
 /// ISO 8601 (e.g. `2024-01-01T00:00:00.123456`), treating the latter as UTC.
-fn deserialize_opt_rfc3339_ms<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+fn deserialize_opt_rfc3339_ms<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<u64>, D::Error> {
     let s: Option<String> = Option::deserialize(d)?;
     match s {
         None => Ok(None),
@@ -183,7 +198,8 @@ pub(crate) fn validate_create_memory(body: &CreateMemoryRequest) -> Result<()> {
     if let Some(tags) = &body.tags {
         if tags.len() > MAX_TAGS {
             return Err(AppError::Validation(format!(
-                "too many tags: maximum is {MAX_TAGS}, got {}", tags.len()
+                "too many tags: maximum is {MAX_TAGS}, got {}",
+                tags.len()
             )));
         }
     }
@@ -205,7 +221,10 @@ pub(crate) fn validate_create_memory(body: &CreateMemoryRequest) -> Result<()> {
 /// Create a memory, process optional graph extraction, and fire auto-discovery.
 /// Shared by the REST handler below and the in-process MCP `store_memory` tool
 /// (`crate::api::mcp::tools`) so the two transports can never drift on behavior.
-pub(crate) async fn create_memory_core(state: &AppState, body: CreateMemoryRequest) -> Result<Memory> {
+pub(crate) async fn create_memory_core(
+    state: &AppState,
+    body: CreateMemoryRequest,
+) -> Result<Memory> {
     let memory_type = body
         .memory_type
         .as_deref()
@@ -238,17 +257,22 @@ pub(crate) async fn create_memory_core(state: &AppState, body: CreateMemoryReque
     // If the channel is full, discovery is skipped for this memory (not an error).
     let threshold = state.config.connections.auto_discovery_threshold;
     let top_k = state.config.connections.auto_discovery_top_k;
-    if let Err(e) = state.services.discovery_tx.try_send(
-        crate::services::connection_manager::DiscoveryTask {
-            memory_id: memory.id,
-            embedding,
-            threshold,
-            top_k,
-        },
-    ) {
+    if let Err(e) =
+        state
+            .services
+            .discovery_tx
+            .try_send(crate::services::connection_manager::DiscoveryTask {
+                memory_id: memory.id,
+                embedding,
+                threshold,
+                top_k,
+            })
+    {
         match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                state.services.dropped_discovery_count
+                state
+                    .services
+                    .dropped_discovery_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(memory_id = %memory.id, "discovery queue full; skipping auto_discover");
             }
@@ -333,7 +357,8 @@ pub async fn update_memory(
     if let Some(tags) = &body.tags {
         if tags.len() > MAX_TAGS {
             return Err(AppError::Validation(format!(
-                "too many tags: maximum is {MAX_TAGS}, got {}", tags.len()
+                "too many tags: maximum is {MAX_TAGS}, got {}",
+                tags.len()
             )));
         }
     }
@@ -411,7 +436,11 @@ pub async fn list_memories(
     let filters = build_filters(&q);
     let include_connections = q.include_connections.unwrap_or(false);
 
-    let (mut memories, total) = state.services.memory.list(&filters, sort_by, limit, offset).await?;
+    let (mut memories, total) = state
+        .services
+        .memory
+        .list(&filters, sort_by, limit, offset)
+        .await?;
 
     if include_connections {
         for mem in &mut memories {
@@ -471,10 +500,7 @@ async fn process_graph_extraction(
                 &content,
                 CreateOpts {
                     memory_type: MemoryType::LongTerm,
-                    tags: vec![
-                        "__entity__".to_owned(),
-                        format!("entity:{entity_type}"),
-                    ],
+                    tags: vec!["__entity__".to_owned(), format!("entity:{entity_type}")],
                     importance: 0.6,
                     emotional_valence: 0.0,
                     arousal: 0.0,
@@ -490,15 +516,30 @@ async fn process_graph_extraction(
         let _ = state
             .services
             .connection
-            .create(memory_id, entity_memory.id, RelationshipType::References, 1.0)
+            .create(
+                memory_id,
+                entity_memory.id,
+                RelationshipType::References,
+                1.0,
+            )
             .await;
     }
 
-    for relation in extraction.relationships.iter().take(MAX_GRAPH_RELATIONSHIPS) {
-        let Some(source_id) = entity_ids.get(&relation.source.trim().to_lowercase()).copied() else {
+    for relation in extraction
+        .relationships
+        .iter()
+        .take(MAX_GRAPH_RELATIONSHIPS)
+    {
+        let Some(source_id) = entity_ids
+            .get(&relation.source.trim().to_lowercase())
+            .copied()
+        else {
             continue;
         };
-        let Some(target_id) = entity_ids.get(&relation.target.trim().to_lowercase()).copied() else {
+        let Some(target_id) = entity_ids
+            .get(&relation.target.trim().to_lowercase())
+            .copied()
+        else {
             continue;
         };
         let rel = relation

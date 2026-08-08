@@ -1,5 +1,4 @@
 //! Compaction manager for LSM-tree
-#![allow(dead_code)]
 //!
 //! Compaction merges SSTables to:
 //! - Reclaim space from deleted records (tombstones)
@@ -53,8 +52,6 @@ impl Default for CompactionConfig {
 /// A level in the LSM tree
 #[derive(Debug)]
 pub struct Level {
-    /// Level number (0 = newest)
-    pub level: usize,
     /// SSTables in this level
     pub sstables: Vec<Arc<SSTableReader>>,
     /// Total size in bytes
@@ -63,9 +60,8 @@ pub struct Level {
 
 impl Level {
     /// Create a new empty level
-    pub fn new(level: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            level,
             sstables: Vec::new(),
             total_size: 0,
         }
@@ -129,8 +125,8 @@ impl CompactionManager {
         }
 
         let mut levels = Vec::new();
-        for level in 0..config.max_levels {
-            levels.push(Level::new(level));
+        for _ in 0..config.max_levels {
+            levels.push(Level::new());
         }
 
         Ok(Self {
@@ -416,19 +412,6 @@ impl CompactionManager {
 
         Ok(None)
     }
-
-    /// Get statistics about all levels
-    pub fn stats(&self) -> Vec<LevelStats> {
-        let levels = self.levels.read();
-        levels
-            .iter()
-            .map(|level| LevelStats {
-                level: level.level,
-                file_count: level.sstables.len(),
-                total_size: level.total_size,
-            })
-            .collect()
-    }
 }
 
 /// Result of a compaction operation
@@ -444,17 +427,6 @@ pub struct CompactionResult {
     pub output_level: usize,
 }
 
-/// Statistics for a level
-#[derive(Debug)]
-pub struct LevelStats {
-    /// Level number
-    pub level: usize,
-    /// Number of files
-    pub file_count: usize,
-    /// Total size in bytes
-    pub total_size: u64,
-}
-
 /// Merge iterator for compaction.
 ///
 /// Pre-collects all records from every input SSTable into a min-heap ordered
@@ -468,9 +440,6 @@ struct MergeIterator {
 
 struct IteratorEntry {
     record: Record,
-    /// Which input SSTable produced this record (used only for ordering
-    /// tie-breaking between SSTables; not needed for correctness).
-    iter_idx: usize,
 }
 
 impl PartialEq for IteratorEntry {
@@ -505,10 +474,10 @@ impl MergeIterator {
         // Eagerly drain every SSTable iterator.  This avoids the self-referential
         // lifetime problem (SSTableIterator<'_> borrows from SSTableReader) while
         // keeping the correct heap-ordered merge semantics.
-        for (idx, sst) in sstables.iter().enumerate() {
+        for sst in sstables {
             for result in sst.iter() {
                 let record = result?;
-                heap.push(IteratorEntry { record, iter_idx: idx });
+                heap.push(IteratorEntry { record });
             }
         }
 
@@ -579,8 +548,11 @@ mod tests {
 
         manager.add_l0_sstable(sst);
 
-        let stats = manager.stats();
-        assert_eq!(stats[0].file_count, 1);
+        let record = manager
+            .get(b"key1")
+            .unwrap()
+            .expect("key1 should be findable after add_l0_sstable");
+        assert_eq!(record.value, Some(Bytes::from("value1")));
     }
 
     #[test]

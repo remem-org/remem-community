@@ -5,7 +5,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::error::{ErrorResponse, Result};
+use crate::error::Result;
 use crate::services::types::Memory;
 
 #[utoipa::path(

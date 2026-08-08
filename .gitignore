@@ -251,6 +251,10 @@ neo4j_data/
 qdrant_data/
 redis_data/
 
+# Stray root-level memory-tool directory (REM-41) — old memory-tool
+# convention, superseded by the per-project memory dir under ~/.claude/
+/memory/
+
 # Temporary files
 tmp/
 temp/

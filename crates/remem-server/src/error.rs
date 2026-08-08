@@ -24,10 +24,6 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    #[allow(dead_code)]
-    #[error("unauthorized")]
-    Unauthorized,
-
     #[error("embedding error: {0}")]
     Embedding(String),
 
@@ -47,7 +43,6 @@ impl IntoResponse for AppError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Conflict(_) => StatusCode::CONFLICT,
-            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Embedding(_)
             | AppError::Storage(_)
             | AppError::Serialization(_)

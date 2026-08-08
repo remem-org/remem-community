@@ -54,16 +54,14 @@ impl SearchEngine {
         // When a graph context is requested, route through the QueryEngine so that
         // connected memories are boosted via RRF alongside the vector results.
         if let Some(related_id) = query.related_to {
-            use crate::engine::query::{MergeStrategyType};
-            use crate::engine::{HybridQuery, Query};
+            use crate::engine::HybridQuery;
 
             let node_key = memory_key(related_id);
-            let hybrid = HybridQuery::vector(embedding, k)
+            let hybrid = HybridQuery::new(embedding, k)
                 .with_graph_context(node_key, 2)
-                .with_merge_strategy(MergeStrategyType::Rrf)
                 .with_limit(k);
 
-            let qr = self.query_engine.execute(Query::Hybrid(hybrid)).await?;
+            let qr = self.query_engine.execute(hybrid).await?;
             return self.collect_results(qr.items, query).await;
         }
 
@@ -222,14 +220,18 @@ impl SearchEngine {
             }
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(query.limit);
         Ok(results)
     }
 
     async fn hybrid_search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
-        use crate::engine::query::{BooleanMode, MergeStrategyType};
-        use crate::engine::{HybridQuery, Query};
+        use crate::engine::query::BooleanMode;
+        use crate::engine::HybridQuery;
 
         let embedding = self.embedding.embed(&query.query).await?;
         let tokens: Vec<String> = query
@@ -240,9 +242,7 @@ impl SearchEngine {
 
         let k = (query.limit * 3).max(20);
 
-        let mut hybrid = HybridQuery::vector(embedding, k)
-            .with_merge_strategy(MergeStrategyType::Rrf)
-            .with_limit(k);
+        let mut hybrid = HybridQuery::new(embedding, k).with_limit(k);
 
         if !tokens.is_empty() {
             hybrid = hybrid.with_tags(tokens, BooleanMode::Or);
@@ -252,8 +252,7 @@ impl SearchEngine {
             hybrid = hybrid.with_graph_context(memory_key(related_id), 2);
         }
 
-        let qr = self.query_engine.execute(Query::Hybrid(hybrid)).await?;
+        let qr = self.query_engine.execute(hybrid).await?;
         self.collect_results(qr.items, query).await
     }
 }
-

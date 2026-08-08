@@ -1,5 +1,4 @@
 //! Write-Ahead Log (WAL) for durability
-#![allow(dead_code)]
 //!
 //! The WAL ensures durability by logging all operations before they are
 //! applied to the MemTable. In case of a crash, the WAL can be replayed
@@ -21,11 +20,11 @@
 //! - `value_len`: Length of the value (0 for deletes)
 //! - `value`: Value bytes (empty for deletes)
 
+use crate::engine::error::{Result, StorageError};
 use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use crate::engine::error::{Result, StorageError};
 
 /// Operation type for WAL records
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,8 +363,7 @@ impl WalRecord {
         }
 
         // Encode tags for AddTags and SetTags records (same wire format, different semantics)
-        if self.record_type == WalRecordType::AddTags
-            || self.record_type == WalRecordType::SetTags
+        if self.record_type == WalRecordType::AddTags || self.record_type == WalRecordType::SetTags
         {
             buf.extend_from_slice(&tags_data);
         }
@@ -547,8 +545,7 @@ impl WalRecord {
         };
 
         // Decode tags for AddTags and SetTags records (same wire format)
-        let tags = if record_type == WalRecordType::AddTags
-            || record_type == WalRecordType::SetTags
+        let tags = if record_type == WalRecordType::AddTags || record_type == WalRecordType::SetTags
         {
             if data.len() < current_offset + 4 {
                 return Err(StorageError::InvalidArgument(
@@ -701,6 +698,10 @@ impl WalRecord {
 /// - Durability: All operations are logged before being applied
 /// - Recovery: Operations can be replayed after a crash
 /// - Sync: Data can be synced to disk for crash consistency
+// `WAL` is the domain spelling used throughout the engine and its docs; renaming
+// the type to `Wal` would desynchronise ~23 references and every doc mention for
+// no readability gain.
+#[allow(clippy::upper_case_acronyms)]
 pub struct WAL {
     /// Path to the WAL file
     path: PathBuf,
@@ -735,7 +736,6 @@ impl WAL {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
-            .write(true)
             .append(true)
             .open(&path)?;
 
@@ -777,11 +777,6 @@ impl WAL {
         Ok(())
     }
 
-    /// Get the path to the WAL file
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Get the current size of the WAL
     pub fn size(&self) -> u64 {
         self.size
@@ -805,7 +800,6 @@ impl WAL {
 /// Iterator over WAL records
 pub struct WalIterator {
     reader: BufReader<File>,
-    path: PathBuf,
     offset: u64,
 }
 
@@ -816,11 +810,7 @@ impl WalIterator {
         let file = File::open(&path)?;
         let reader = BufReader::with_capacity(64 * 1024, file);
 
-        Ok(Self {
-            reader,
-            path,
-            offset: 0,
-        })
+        Ok(Self { reader, offset: 0 })
     }
 
     /// Read the next record from the WAL
@@ -875,23 +865,6 @@ impl Iterator for WalIterator {
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
-    }
-}
-
-/// Async WAL operations
-impl WAL {
-    /// Async version of sync
-    pub async fn sync_async(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = File::open(&path)?;
-            file.sync_all()?;
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
-        Ok(())
     }
 }
 
@@ -1366,11 +1339,7 @@ mod tests {
         let (mut wal, f) = make_wal();
 
         let records = vec![
-            WalRecord::insert(
-                Bytes::from("key1"),
-                Bytes::from("value1"),
-                100,
-            ),
+            WalRecord::insert(Bytes::from("key1"), Bytes::from("value1"), 100),
             WalRecord::set_timestamp(Bytes::from("key2"), 999, 101),
             WalRecord::add_tags(
                 Bytes::from("key3"),

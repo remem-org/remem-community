@@ -25,7 +25,9 @@ impl ConnectionManager {
         strength: f32,
     ) -> Result<Connection> {
         if source_id == target_id {
-            return Err(AppError::Validation("source_id and target_id must differ".into()));
+            return Err(AppError::Validation(
+                "source_id and target_id must differ".into(),
+            ));
         }
 
         let source = self
@@ -49,18 +51,20 @@ impl ConnectionManager {
         let src_key = memory_key(source_id);
         let dst_key = memory_key(target_id);
 
+        let created_at_ms = now_ms();
         self.repo.engine.add_edge(
             src_key,
             dst_key,
             Some(rel.to_string()),
             Some(strength.clamp(0.0, 1.0)),
+            created_at_ms,
         )?;
 
         Ok(Connection {
             target_id,
             relationship_type: rel,
             strength: strength.clamp(0.0, 1.0),
-            created_at: ms_to_dt(now_ms()),
+            created_at: ms_to_dt(created_at_ms),
         })
     }
 
@@ -120,7 +124,7 @@ impl ConnectionManager {
             .get_neighbors(key.as_bytes())
             .unwrap_or_default()
             .into_iter()
-            .map(|(target_key, _, _)| target_key)
+            .map(|(target_key, _, _, _)| target_key)
             .collect();
 
         let candidates: Vec<(Uuid, f32)> = candidates
@@ -149,9 +153,10 @@ impl ConnectionManager {
             })
             .collect();
 
-        self.repo.engine.add_edges_batch(edges)?;
+        let created_at_ms = now_ms();
+        self.repo.engine.add_edges_batch(edges, created_at_ms)?;
 
-        let now = ms_to_dt(now_ms());
+        let now = ms_to_dt(created_at_ms);
         Ok(candidates
             .into_iter()
             .map(|(target_id, score)| Connection {
@@ -177,10 +182,10 @@ impl ConnectionManager {
             Some(types.iter().map(|r| r.to_string()).collect())
         };
 
-        let traversal = self
-            .repo
-            .engine
-            .traverse_graph(key.as_bytes(), depth, type_strings.as_deref())?;
+        let traversal =
+            self.repo
+                .engine
+                .traverse_graph(key.as_bytes(), depth, type_strings.as_deref())?;
 
         let mut results = Vec::new();
         for node in traversal {
@@ -195,19 +200,19 @@ impl ConnectionManager {
                 continue;
             }
 
-            let (rel, strength) = if let Some(meta) = node.edge_metadata {
+            let (rel, strength, edge_ts) = if let Some(meta) = node.edge_metadata {
                 let rel = RelationshipType::try_from(meta.edge_type.as_str())
                     .unwrap_or(RelationshipType::RelatedTo);
-                (rel, meta.weight)
+                (rel, meta.weight, meta.timestamp)
             } else {
-                (RelationshipType::RelatedTo, 1.0)
+                (RelationshipType::RelatedTo, 1.0, now_ms())
             };
 
             let conn = Connection {
                 target_id: stored.id,
                 relationship_type: rel,
                 strength,
-                created_at: ms_to_dt(now_ms()),
+                created_at: ms_to_dt(edge_ts),
             };
             let memory = stored.into_api(Vec::new());
             results.push((memory, conn));
@@ -233,23 +238,39 @@ impl ConnectionManager {
             let key = key_bytes.as_ref();
 
             // Verify source exists in KV.
-            let Ok(key_str) = std::str::from_utf8(key) else { continue };
-            let Some(uuid_str) = key_str.strip_prefix("memory:") else { continue };
-            let Ok(source_id) = Uuid::parse_str(uuid_str) else { continue };
-            let Some(src_stored) = self.repo.load_by_key(key).await? else { continue };
-            if src_stored.archived { continue; }
+            let Ok(key_str) = std::str::from_utf8(key) else {
+                continue;
+            };
+            let Some(uuid_str) = key_str.strip_prefix("memory:") else {
+                continue;
+            };
+            let Ok(source_id) = Uuid::parse_str(uuid_str) else {
+                continue;
+            };
+            let Some(src_stored) = self.repo.load_by_key(key).await? else {
+                continue;
+            };
+            if src_stored.archived {
+                continue;
+            }
 
             let neighbors = self.repo.engine.get_neighbors(key)?;
-            for (target_key, rel_type, strength) in neighbors {
+            for (target_key, rel_type, strength, edge_ts) in neighbors {
                 // Verify target exists in KV.
                 let Some(tgt_stored) = self.repo.load_by_key(target_key.as_ref()).await? else {
                     continue;
                 };
-                if tgt_stored.archived { continue; }
+                if tgt_stored.archived {
+                    continue;
+                }
 
                 let target_str = String::from_utf8_lossy(&target_key);
-                let Some(target_uuid_str) = target_str.strip_prefix("memory:") else { continue };
-                let Ok(target_id) = Uuid::parse_str(target_uuid_str) else { continue };
+                let Some(target_uuid_str) = target_str.strip_prefix("memory:") else {
+                    continue;
+                };
+                let Ok(target_id) = Uuid::parse_str(target_uuid_str) else {
+                    continue;
+                };
                 let relationship_type = RelationshipType::try_from(rel_type.as_str())
                     .unwrap_or(RelationshipType::RelatedTo);
                 all.push((
@@ -258,7 +279,7 @@ impl ConnectionManager {
                         target_id,
                         relationship_type,
                         strength,
-                        created_at: ms_to_dt(now_ms()),
+                        created_at: ms_to_dt(edge_ts),
                     },
                 ));
             }
@@ -283,9 +304,12 @@ pub struct DiscoveryTask {
 mod tests {
     use super::*;
 
-    // Ensures auto_discover accepts &[f32] (compile-time check)
+    // Ensures auto_discover accepts &[f32] (compile-time check).
+    // The future is deliberately never awaited — only its type is asserted. It
+    // is bound to a name rather than `_` so it is not dropped mid-statement,
+    // which is also what keeps `clippy::let_underscore_future` quiet.
     fn _assert_auto_discover_takes_embedding_slice(_mgr: &ConnectionManager) {
-        let _: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> =
+        let _fut: std::pin::Pin<Box<dyn std::future::Future<Output = _>>> =
             Box::pin(_mgr.auto_discover(uuid::Uuid::nil(), &[0.0f32; 384], 0.7, 5));
     }
 
@@ -304,7 +328,8 @@ mod tests {
 
         // Simulate: memory A already has edge to B.
         // auto_discover proposes [B, C]. After filtering, only C is new.
-        let existing_targets: HashSet<Bytes> = [Bytes::from(memory_key(id_b))].into_iter().collect();
+        let existing_targets: HashSet<Bytes> =
+            [Bytes::from(memory_key(id_b))].into_iter().collect();
 
         let candidates: Vec<(Uuid, f32)> = vec![(id_b, 0.9f32), (id_c, 0.85f32)];
 
@@ -318,5 +343,79 @@ mod tests {
 
         assert_eq!(new_candidates.len(), 1);
         assert_eq!(new_candidates[0].0, id_c);
+    }
+
+    use crate::services::types::{MemoryType, StoredMemory, StoredMetadata};
+
+    async fn test_connection_manager() -> (Arc<MemoryRepository>, ConnectionManager) {
+        let engine = Arc::new(
+            crate::engine::storage::engine::StorageEngine::new(
+                crate::engine::storage::engine::EngineConfig {
+                    data_dir: tempfile::tempdir().unwrap().keep(),
+                    sync_writes: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let repo = Arc::new(MemoryRepository::new(Arc::clone(&engine)));
+        let mgr = ConnectionManager::new(Arc::clone(&repo));
+        (repo, mgr)
+    }
+
+    async fn store_test_memory(repo: &MemoryRepository, content: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let created = now_ms();
+        let stored = StoredMemory {
+            id,
+            content: content.into(),
+            memory_type: MemoryType::ShortTerm,
+            metadata: StoredMetadata {
+                created_at: created,
+                updated_at: created,
+                accessed_at: created,
+                access_count: 0,
+                source: None,
+                tags: vec![],
+                importance: 0.5,
+                emotional_valence: 0.0,
+                arousal: 0.0,
+                health: 100.0,
+                last_recalled_at: None,
+                flashbulb_until: None,
+                ttl: None,
+                last_decay_at: None,
+                last_health_check_at: None,
+            },
+            archived: false,
+        };
+        repo.store(&stored).await.unwrap();
+        repo.engine.add_timestamp(memory_key(id), created).unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn list_all_reports_real_edge_creation_time_not_read_time() {
+        let (repo, mgr) = test_connection_manager().await;
+        let a = store_test_memory(&repo, "a").await;
+        let b = store_test_memory(&repo, "b").await;
+
+        let before_create_ms = now_ms();
+        mgr.create(a, b, RelationshipType::RelatedTo, 0.9)
+            .await
+            .unwrap();
+
+        // Simulate time passing between edge creation and this read.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let (page, _total) = mgr.list_all(10, 0).await.unwrap();
+        let conn = page.iter().find(|(src, _)| *src == a).unwrap();
+        let reported_ms = conn.1.created_at.timestamp_millis() as u64;
+
+        assert!(
+            reported_ms >= before_create_ms && reported_ms < now_ms(),
+            "created_at must be the edge's actual creation time, not now() at read time"
+        );
     }
 }

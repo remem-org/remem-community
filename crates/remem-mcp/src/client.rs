@@ -23,19 +23,27 @@ impl RememClient {
     // ── Private request builders ─────────────────────────────────────────────
 
     fn get(&self, path: &str, request_id: &str) -> reqwest::RequestBuilder {
-        self.client.get(self.url(path)).header("X-Request-ID", request_id)
+        self.client
+            .get(self.url(path))
+            .header("X-Request-ID", request_id)
     }
 
     fn post(&self, path: &str, request_id: &str) -> reqwest::RequestBuilder {
-        self.client.post(self.url(path)).header("X-Request-ID", request_id)
+        self.client
+            .post(self.url(path))
+            .header("X-Request-ID", request_id)
     }
 
     fn put(&self, path: &str, request_id: &str) -> reqwest::RequestBuilder {
-        self.client.put(self.url(path)).header("X-Request-ID", request_id)
+        self.client
+            .put(self.url(path))
+            .header("X-Request-ID", request_id)
     }
 
     fn delete(&self, path: &str, request_id: &str) -> reqwest::RequestBuilder {
-        self.client.delete(self.url(path)).header("X-Request-ID", request_id)
+        self.client
+            .delete(self.url(path))
+            .header("X-Request-ID", request_id)
     }
 
     // ── Public API ───────────────────────────────────────────────────────────
@@ -76,7 +84,12 @@ impl RememClient {
     }
 
     /// `GET /api/v1/memories/{id}` — retrieve a memory by ID, optionally with connections.
-    pub async fn get_memory(&self, id: &str, include_connections: bool, request_id: &str) -> anyhow::Result<Value> {
+    pub async fn get_memory(
+        &self,
+        id: &str,
+        include_connections: bool,
+        request_id: &str,
+    ) -> anyhow::Result<Value> {
         let mut req = self.get(&format!("/api/v1/memories/{id}"), request_id);
         if include_connections {
             req = req.query(&[("include_connections", "true")]);
@@ -94,7 +107,12 @@ impl RememClient {
     }
 
     /// `PUT /api/v1/memories/{id}` — update a memory's content, tags, or metadata.
-    pub async fn update_memory(&self, id: &str, body: Value, request_id: &str) -> anyhow::Result<()> {
+    pub async fn update_memory(
+        &self,
+        id: &str,
+        body: Value,
+        request_id: &str,
+    ) -> anyhow::Result<()> {
         let resp = self
             .put(&format!("/api/v1/memories/{id}"), request_id)
             .json(&body)
@@ -112,7 +130,12 @@ impl RememClient {
     }
 
     /// `DELETE /api/v1/memories/{id}` — soft archive or hard delete a memory.
-    pub async fn delete_memory(&self, id: &str, hard: bool, request_id: &str) -> anyhow::Result<()> {
+    pub async fn delete_memory(
+        &self,
+        id: &str,
+        hard: bool,
+        request_id: &str,
+    ) -> anyhow::Result<()> {
         let resp = self
             .delete(&format!("/api/v1/memories/{id}"), request_id)
             .query(&[("hard", if hard { "true" } else { "false" })])
@@ -130,7 +153,13 @@ impl RememClient {
     }
 
     /// `GET /api/v1/memories/{id}/related` — traverse the connection graph to find related memories.
-    pub async fn find_related(&self, id: &str, depth: i64, limit: i64, request_id: &str) -> anyhow::Result<Value> {
+    pub async fn find_related(
+        &self,
+        id: &str,
+        depth: i64,
+        limit: i64,
+        request_id: &str,
+    ) -> anyhow::Result<Value> {
         let resp = self
             .get(&format!("/api/v1/memories/{id}/related"), request_id)
             .query(&[("depth", depth), ("limit", limit)])
@@ -174,10 +203,8 @@ impl RememClient {
         sort_by: Option<&str>,
         request_id: &str,
     ) -> anyhow::Result<Value> {
-        let mut query: Vec<(&str, String)> = vec![
-            ("limit", limit.to_string()),
-            ("offset", offset.to_string()),
-        ];
+        let mut query: Vec<(&str, String)> =
+            vec![("limit", limit.to_string()), ("offset", offset.to_string())];
         if let Some(mt) = memory_type {
             query.push(("memory_type", mt.to_string()));
         }

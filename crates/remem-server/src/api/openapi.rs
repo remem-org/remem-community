@@ -5,7 +5,10 @@ use crate::api::routes::{
         ConnectionResponse, CreateConnectionRequest, DeleteConnectionResponse,
         ListConnectionsResponse, RelatedItem, RelatedResponse,
     },
-    health::{DeepHealthCheck, DeepHealthResponse, HealthResponse, ReadyResponse, StorageReadiness, Stats, StatsResponse},
+    health::{
+        DeepHealthCheck, DeepHealthResponse, HealthResponse, ReadyResponse, Stats, StatsResponse,
+        StorageReadiness,
+    },
     memories::{
         CreateMemoryRequest, DeleteResponse, ExtractedEntity, ExtractedRelationship,
         GraphExtraction, MemoryListResponse, UpdateMemoryRequest,
@@ -15,7 +18,7 @@ use crate::api::routes::{
 };
 use crate::error::ErrorResponse;
 use crate::services::types::{
-    Connection, Memory, Metadata, MemoryType, RelationshipType, SearchResult,
+    Connection, Memory, MemoryType, Metadata, RelationshipType, SearchResult,
 };
 use crate::tasks::registry::{RunLog, TaskStatus};
 
