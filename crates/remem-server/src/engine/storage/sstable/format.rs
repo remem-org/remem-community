@@ -265,6 +265,40 @@ pub struct SSTableMeta {
     pub max_key: Bytes,
 }
 
+impl SSTableMeta {
+    /// Whether this file could hold `key`, used to skip files a lookup cannot
+    /// possibly need.
+    ///
+    /// `min_key`/`max_key` are not the real bounds. The header stores a fixed
+    /// `[u8; 16]`, so a bound longer than that arrives truncated, and one
+    /// shorter arrives zero-padded. Comparing a whole key against such a value
+    /// as though it were exact is wrong in both directions:
+    ///
+    /// * a key sharing `max_key`'s truncated prefix but running longer sorts
+    ///   *after* it, so the file is skipped though it may hold the key --
+    ///   harmless while keys diverged early, and total once every key carries
+    ///   the same `partition:<tenant>:<partition>:` prefix, which is identical
+    ///   for the first 16 bytes;
+    /// * a key equal to a short `min_key` sorts *before* that bound's zero
+    ///   padding, so the file is skipped though the key is exactly its
+    ///   smallest.
+    ///
+    /// Comparing only over the width the two have in common avoids both: it
+    /// can widen the range and cause a needless read, never narrow it and lose
+    /// a record.
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        let lower = key.len().min(self.min_key.len());
+        if key[..lower] < self.min_key[..lower] {
+            return false;
+        }
+        let upper = key.len().min(self.max_key.len());
+        if key[..upper] > self.max_key[..upper] {
+            return false;
+        }
+        true
+    }
+}
+
 /// Record stored in an SSTable data block
 #[derive(Debug, Clone)]
 pub struct Record {

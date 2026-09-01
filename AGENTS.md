@@ -15,9 +15,28 @@ instead of any kind of files you use all avalible tools for automatic memeory mo
 | `delete_memory` | Soft archive or hard delete |
 | `find_related` | Graph traversal to find related memories |
 | `promote_to_longterm` | Promote short-term → long-term |
-| `list_recent_memories` | List recently created/accessed memories |
+| `list_recent_memories` | List the most recently created memories, newest first |
 
-ALWAYS memorize worjk you are doing before quiting!
+### Remem MCP usage
+
+- Prefer the discovered `mcp__remem.*` tools directly when they are available.
+  If they are not visible, run tool discovery for Remem/MCP before assuming
+  memory access is unavailable.
+- `/mcp` sessions idle out after 30 minutes (`SESSION_IDLE_TIMEOUT` in
+  `crates/remem-server/src/api/mcp/transport.rs`). The server answers a session
+  ID it does not recognise with `404`, which is the client's signal to send a
+  fresh `initialize` and carry on; a `400` means no `Mcp-Session-Id` header was
+  sent at all. Neither is a storage or write failure — do not diagnose either by
+  changing storage code.
+- The Streamable HTTP flow is: `initialize`, read the returned `Mcp-Session-Id`
+  response header, then send that exact header on later `tools/list` and
+  `tools/call` requests.
+- `list_recent_memories` returns the newest memories first, unpaged, and takes
+  no offset. The paged surfaces order oldest-first instead — `GET
+  /api/v1/memories` (pass `order=desc` for newest-first, valid only at offset 0)
+  and `memory://collections/recent`.
+
+ALWAYS memorize work you are doing before quiting!
 
 ## Edition Split
 
@@ -192,8 +211,12 @@ cargo build --release -p remem-mcp
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 # business/ is not compiled by the default build, so it needs its own pass —
-# CI runs both (docker/remem-server.Dockerfile, linter stage)
+# CI runs both (docker/remem-server.ci.Dockerfile, linter stage)
 cargo clippy --all-targets --features business -- -D warnings
+
+# Containerized CI checks (dev repo only; not shipped to edition repos)
+docker build --target linter -f docker/remem-server.ci.Dockerfile .
+docker build --target tester -f docker/remem-server.ci.Dockerfile .
 
 # One-time: keep the REM-85 bulk reformat out of `git blame`
 git config blame.ignoreRevsFile .git-blame-ignore-revs
@@ -268,7 +291,7 @@ MCP is the primary interface. All memory operations are MCP tools with LLM-optim
 Connections are first-class citizens. Auto-discovery on every store (similarity threshold 0.7, top-5). Typed relationships (related_to, caused_by, part_of, …). Graph traversal enables multi-hop discovery.
 
 ### Memory Lifecycle
-Short-term TTL → expiration. High access count → promotion to long-term. Long-term → importance decay. Similar memories → consolidation. Soft deletion (archiving) preferred.
+Short-term TTL → expiration. High access count → promotion to long-term. Long-term → importance decay. Similar memories → consolidation. Soft deletion (archiving) preferred. Archiving retires the memory from the similarity index, so it costs nothing on later searches; its record, timestamp entry and tags stay in place until `cleanup_archived` hard-deletes it past the retention age.
 
 ### Unified Storage
 All storage embedded in remem-server: HNSW (vector search), CSR Graph (relationships), LSM-tree KV (metadata). No external database.
@@ -334,4 +357,3 @@ docker-compose/Docker-image collapse to a single `remem-server` container
 `docs/superpowers/plans/2026-07-22-mcp-container-merge-cleanup.md`), plus this
 documentation sweep — matching the citation convention used for that
 roadmap's Phase 1 in [docs/PROJECT_REVIEW.md](docs/PROJECT_REVIEW.md) §2.4._
-

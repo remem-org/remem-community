@@ -8,31 +8,40 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::memtable::MemTable;
+use super::partitioned_hnsw::PartitionedHnswIndexes;
+use super::partitioned_indexes::{PartitionedTagIndex, PartitionedTimeSeriesIndex};
 use super::wal::WAL;
+use crate::engine::attr::index::AttrIndexes;
+use crate::engine::attr::schema::AttrSchema;
 use crate::engine::error::Result;
-use crate::engine::index::{
-    EdgeMetadata, GraphIndex, HnswIndex, SegmentedBTreeIndex, SegmentedInvertedIndex,
-};
+use crate::engine::index::{EdgeMetadata, GraphIndex};
 
 /// Replay a WAL file into the given MemTable and indexes.
 ///
 /// Called during engine startup to recover state since the last checkpoint.
 /// Safe to call when `wal_path` does not exist — returns `Ok(())` immediately.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn replay_wal(
     wal_path: &Path,
     memtable: &Arc<RwLock<MemTable>>,
-    hnsw_index: Option<&Arc<HnswIndex>>,
-    time_series_index: Option<&Arc<RwLock<SegmentedBTreeIndex>>>,
-    tag_index: Option<&Arc<RwLock<SegmentedInvertedIndex>>>,
+    hnsw_index: Option<&Arc<PartitionedHnswIndexes>>,
+    time_series_index: Option<&Arc<RwLock<PartitionedTimeSeriesIndex>>>,
+    tag_index: Option<&Arc<RwLock<PartitionedTagIndex>>>,
     graph_index: Option<&Arc<RwLock<GraphIndex>>>,
-) -> Result<()> {
+    attr_indexes: Option<&Arc<AttrIndexes>>,
+    attr_schema: Option<&AttrSchema>,
+) -> Result<u64> {
     if !wal_path.exists() {
-        return Ok(());
+        return Ok(0);
     }
 
     let wal = WAL::open(wal_path)?;
     let memtable = memtable.write();
 
+    // The highest record version this log carries. Startup seeds the store's
+    // counter above it, so a version issued after recovery still sorts after
+    // everything the log replayed.
+    let mut max_version = 0u64;
     let mut record_count = 0u64;
     let mut embedding_count = 0u64;
     let mut timestamp_count = 0u64;
@@ -64,6 +73,7 @@ pub(super) fn replay_wal(
             Err(e) => return Err(e),
         };
         record_count += 1;
+        max_version = max_version.max(record.timestamp);
 
         match record.record_type {
             super::wal::WalRecordType::Insert => {
@@ -76,7 +86,7 @@ pub(super) fn replay_wal(
                     record.timestamp,
                 )?;
                 if let (Some(embedding), Some(index)) = (record.embedding, hnsw_index) {
-                    index.insert(record.key, embedding)?;
+                    index.insert_for_key(record.key, embedding)?;
                     embedding_count += 1;
                 }
             }
@@ -85,19 +95,19 @@ pub(super) fn replay_wal(
             }
             super::wal::WalRecordType::SetTimestamp => {
                 if let (Some(ts), Some(index)) = (record.ts_timestamp, time_series_index) {
-                    index.read().insert(ts, record.key)?;
+                    index.write().insert(ts, record.key)?;
                     timestamp_count += 1;
                 }
             }
             super::wal::WalRecordType::AddTags => {
                 if let (Some(tags), Some(index)) = (record.tags, tag_index) {
-                    index.read().add_tags(record.key, &tags)?;
+                    index.write().add_tags(record.key, &tags)?;
                     tag_count += 1;
                 }
             }
             super::wal::WalRecordType::SetTags => {
                 if let (Some(tags), Some(index)) = (record.tags, tag_index) {
-                    index.read().set_tags(record.key, &tags)?;
+                    index.write().set_tags(record.key, &tags)?;
                     tag_count += 1;
                 }
             }
@@ -131,21 +141,65 @@ pub(super) fn replay_wal(
             }
             super::wal::WalRecordType::RemoveTimestamp => {
                 if let Some(index) = time_series_index {
-                    if let Err(e) = index.read().remove(&record.key) {
+                    if let Err(e) = index.write().remove(&record.key) {
                         tracing::warn!("Failed to replay RemoveTimestamp from WAL: {}", e);
                     }
                 }
             }
             super::wal::WalRecordType::RemoveTags => {
                 if let Some(index) = tag_index {
-                    if let Err(e) = index.read().remove(&record.key) {
+                    if let Err(e) = index.write().remove(&record.key) {
                         tracing::warn!("Failed to replay RemoveTags from WAL: {}", e);
                     }
                 }
             }
             super::wal::WalRecordType::RemoveVector => {
                 if let Some(index) = hnsw_index {
-                    index.remove(&record.key);
+                    index.remove(&record.key)?;
+                }
+            }
+            super::wal::WalRecordType::RemoveAttrIndexEntry => {
+                // Retires one slot's entry and leaves the row alone. Replayed
+                // after the `PutAttrs` that wrote the row -- WAL order is the
+                // order the writes happened -- so an archived record's row is
+                // restored and then its ordering entry taken away again,
+                // exactly as it stood before the crash.
+                if let Some(indexes) = attr_indexes {
+                    match record.attr_index_slot() {
+                        Some(slot) => {
+                            if let Err(e) = indexes.retire_slot_entry(&record.key, slot) {
+                                tracing::warn!(
+                                    key = ?record.key,
+                                    "Failed to replay RemoveAttrIndexEntry from WAL: {}",
+                                    e
+                                );
+                            }
+                        }
+                        None => tracing::warn!(
+                            key = ?record.key,
+                            "RemoveAttrIndexEntry record carries no decodable slot; skipping"
+                        ),
+                    }
+                }
+            }
+            super::wal::WalRecordType::PutAttrs => {
+                // Restores the attribute sidecar row into the memtable under
+                // its derived sidecar key, then rebuilds the ordered index
+                // for it. A decode failure warns and continues rather than
+                // aborting recovery, matching the neighbouring index arms.
+                let akey = crate::engine::attr::attr_key(&record.key);
+                memtable.insert_with_timestamp(akey, record.value.clone(), record.timestamp)?;
+                if let (Some(indexes), Some(schema)) = (attr_indexes, attr_schema) {
+                    match crate::engine::attr::row::AttrRow::decode(&record.value, schema) {
+                        Ok(row) => indexes.apply_row(&record.key, &row)?,
+                        Err(e) => {
+                            tracing::warn!(
+                                key = ?record.key,
+                                "Failed to replay PutAttrs from WAL: {}",
+                                e
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -162,7 +216,7 @@ pub(super) fn replay_wal(
         );
     }
 
-    Ok(())
+    Ok(max_version)
 }
 
 #[cfg(test)]
@@ -183,6 +237,7 @@ mod torn_tail_tests {
                 hnsw_ef_construction: 10,
                 hnsw_ef_search: 4,
                 metric: crate::engine::util::DistanceMetric::L2,
+                hnsw_resident_budget_bytes: None,
             },
             ..Default::default()
         }

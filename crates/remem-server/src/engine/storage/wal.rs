@@ -26,6 +26,50 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Magic bytes identifying a remem WAL file.
+pub const WAL_MAGIC: [u8; 8] = *b"REMEMWAL";
+
+/// Version of the WAL file layout (the header, not the record encoding).
+pub const WAL_FORMAT_VERSION: u16 = 1;
+
+/// Bytes reserved at the start of every WAL file.
+pub const WAL_HEADER_LEN: u64 = 16;
+
+/// Build the 16-byte file header: magic, version, then reserved padding.
+pub(super) fn encode_wal_header() -> [u8; WAL_HEADER_LEN as usize] {
+    let mut buf = [0u8; WAL_HEADER_LEN as usize];
+    buf[..8].copy_from_slice(&WAL_MAGIC);
+    buf[8..10].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+    buf
+}
+
+/// Reject a file that is not a WAL this binary can read.
+fn validate_wal_header(path: &Path) -> Result<()> {
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; WAL_HEADER_LEN as usize];
+    file.read_exact(&mut buf).map_err(|_| {
+        StorageError::invalid_format(path, "file is shorter than the 16-byte WAL header")
+    })?;
+
+    if buf[..8] != WAL_MAGIC {
+        return Err(StorageError::invalid_format(
+            path,
+            "missing WAL magic: this file predates the versioned WAL format and has not \
+             been migrated",
+        ));
+    }
+
+    let version = u16::from_le_bytes([buf[8], buf[9]]);
+    if version != WAL_FORMAT_VERSION {
+        return Err(StorageError::invalid_format(
+            path,
+            format!("unsupported WAL format version {version}, expected {WAL_FORMAT_VERSION}"),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Operation type for WAL records
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -52,6 +96,12 @@ pub enum WalRecordType {
     RemoveTags = 10,
     /// Remove a key from the HNSW vector index (for index recovery)
     RemoveVector = 11,
+    /// Write a record's attribute sidecar row (for attribute index recovery)
+    PutAttrs = 12,
+    /// Retire a record's entry from one attribute ordering index. The slot id
+    /// travels in `value` as two little-endian bytes; the row itself is left
+    /// alone, which is the whole point of the record.
+    RemoveAttrIndexEntry = 13,
 }
 
 impl TryFrom<u8> for WalRecordType {
@@ -70,6 +120,8 @@ impl TryFrom<u8> for WalRecordType {
             9 => Ok(Self::RemoveTimestamp),
             10 => Ok(Self::RemoveTags),
             11 => Ok(Self::RemoveVector),
+            12 => Ok(Self::PutAttrs),
+            13 => Ok(Self::RemoveAttrIndexEntry),
             _ => Err(StorageError::InvalidArgument(format!(
                 "Invalid WAL record type: {}",
                 value
@@ -287,6 +339,32 @@ impl WalRecord {
         }
     }
 
+    /// Create a retire-ordering-entry record (signals attribute ordering index
+    /// cleanup on replay). The slot travels in `value`, which every record type
+    /// already encodes, so this needs no wire-format change of its own.
+    pub fn remove_attr_index_entry(key: Bytes, slot: u16, timestamp: u64) -> Self {
+        Self {
+            record_type: WalRecordType::RemoveAttrIndexEntry,
+            timestamp,
+            key,
+            value: Bytes::copy_from_slice(&slot.to_le_bytes()),
+            embedding: None,
+            ts_timestamp: None,
+            tags: None,
+            edge_source: None,
+            edge_target: None,
+            edge_type: None,
+            edge_weight: None,
+        }
+    }
+
+    /// The slot a `RemoveAttrIndexEntry` record names, or `None` if its payload
+    /// is not the two bytes that encoding writes.
+    pub fn attr_index_slot(&self) -> Option<u16> {
+        let bytes: [u8; 2] = self.value.as_ref().try_into().ok()?;
+        Some(u16::from_le_bytes(bytes))
+    }
+
     /// Create a remove-vector record (signals HNSW index cleanup on replay)
     pub fn remove_vector(key: Bytes, timestamp: u64) -> Self {
         Self {
@@ -294,6 +372,28 @@ impl WalRecord {
             timestamp,
             key,
             value: Bytes::new(),
+            embedding: None,
+            ts_timestamp: None,
+            tags: None,
+            edge_source: None,
+            edge_target: None,
+            edge_type: None,
+            edge_weight: None,
+        }
+    }
+
+    /// A record's attribute sidecar row.
+    ///
+    /// `key` is the *record* key, not the sidecar key — the reader derives
+    /// the sidecar key with `attr_key`, so the prefix convention lives in one
+    /// place. The encoded row travels in `value`, reusing the plain key+value
+    /// wire shape that `Insert` uses.
+    pub fn put_attrs(key: Bytes, row: Bytes, timestamp: u64) -> Self {
+        Self {
+            record_type: WalRecordType::PutAttrs,
+            timestamp,
+            key,
+            value: row,
             embedding: None,
             ts_timestamp: None,
             tags: None,
@@ -702,6 +802,7 @@ impl WalRecord {
 // the type to `Wal` would desynchronise ~23 references and every doc mention for
 // no readability gain.
 #[allow(clippy::upper_case_acronyms)]
+#[derive(Debug)]
 pub struct WAL {
     /// Path to the WAL file
     path: PathBuf,
@@ -712,7 +813,7 @@ pub struct WAL {
 }
 
 impl WAL {
-    /// Create a new WAL file
+    /// Create a new WAL file, writing its header.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
@@ -722,16 +823,33 @@ impl WAL {
             .truncate(true)
             .open(&path)?;
 
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        writer.write_all(&encode_wal_header())?;
+        writer.flush()?;
+
         Ok(Self {
             path,
-            writer: BufWriter::with_capacity(64 * 1024, file),
-            size: 0,
+            writer,
+            size: WAL_HEADER_LEN,
         })
     }
 
-    /// Open an existing WAL file for appending
+    /// Open an existing WAL file for appending.
+    ///
+    /// Rejects a file without a valid header: the adoption migration
+    /// guarantees every WAL on disk has one, so a missing header means the
+    /// file is not ours, not that it is old.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+
+        // A zero-length file is a crash artifact rather than a WAL; give it a
+        // header instead of failing on a header that was never written.
+        let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if existing_len == 0 {
+            return Self::create(&path);
+        }
+
+        validate_wal_header(&path)?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -749,6 +867,7 @@ impl WAL {
     }
 
     /// Append a record to the WAL
+    #[cfg(test)]
     pub fn append(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = record.encode();
         self.writer.write_all(&encoded)?;
@@ -787,12 +906,21 @@ impl WAL {
         WalIterator::new(&self.path)
     }
 
-    /// Truncate the WAL (after flushing to SSTable)
+    /// Truncate the WAL (after flushing to SSTable).
+    ///
+    /// Rewrites the header: `set_len(0)` removes it along with the records,
+    /// and a WAL left headerless here would fail to open on the next restart.
+    /// Fsyncs before returning: a crash where `set_len(0)` and the header
+    /// write reach metadata but not data would otherwise leave a 16-byte NUL
+    /// file, and the next boot would refuse to start on a missing WAL magic.
     pub fn truncate(&mut self) -> Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().set_len(0)?;
         self.writer.get_ref().seek(SeekFrom::Start(0))?;
-        self.size = 0;
+        self.writer.write_all(&encode_wal_header())?;
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        self.size = WAL_HEADER_LEN;
         Ok(())
     }
 }
@@ -804,13 +932,18 @@ pub struct WalIterator {
 }
 
 impl WalIterator {
-    /// Create a new iterator over a WAL file
+    /// Create a new iterator over a WAL file, starting past the header.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path)?;
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::Start(WAL_HEADER_LEN))?;
         let reader = BufReader::with_capacity(64 * 1024, file);
 
-        Ok(Self { reader, offset: 0 })
+        // Offsets are reported against the file, so start at the header end.
+        Ok(Self {
+            reader,
+            offset: WAL_HEADER_LEN,
+        })
     }
 
     /// Read the next record from the WAL
@@ -972,7 +1105,7 @@ mod tests {
         assert!(wal.size() > 0);
 
         wal.truncate().unwrap();
-        assert_eq!(wal.size(), 0);
+        assert_eq!(wal.size(), WAL_HEADER_LEN);
 
         // Read should return no records
         let records: Vec<_> = wal.iter().unwrap().collect();
@@ -1363,5 +1496,153 @@ mod tests {
         assert_eq!(read_back[0].key, Bytes::from("key1"));
         assert_eq!(read_back[1].ts_timestamp, Some(999));
         assert_eq!(read_back[2].tags.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn create_writes_a_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+        let wal = WAL::create(&path).unwrap();
+        assert_eq!(wal.size(), WAL_HEADER_LEN);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], &WAL_MAGIC);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), WAL_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn open_rejects_a_headerless_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+        std::fs::write(&path, b"not a wal file at all, no magic here").unwrap();
+
+        let err = WAL::open(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("magic"),
+            "error should say what is missing: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_an_unknown_header_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+        let mut header = encode_wal_header();
+        header[8..10].copy_from_slice(&99u16.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let err = WAL::open(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("99"),
+            "error should report the found version: {err}"
+        );
+    }
+
+    #[test]
+    fn open_gives_a_zero_length_file_a_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+        std::fs::write(&path, b"").unwrap();
+
+        let wal = WAL::open(&path).unwrap();
+        assert_eq!(wal.size(), WAL_HEADER_LEN);
+    }
+
+    #[test]
+    fn records_round_trip_past_the_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+
+        let mut wal = WAL::create(&path).unwrap();
+        wal.append(&WalRecord::insert(Bytes::from("k"), Bytes::from("v"), 7))
+            .unwrap();
+        wal.sync().unwrap();
+
+        let reopened = WAL::open(&path).unwrap();
+        let records: Vec<_> = reopened
+            .iter()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, Bytes::from("k"));
+    }
+
+    /// The trap: `truncate` resets the file, so it must put the header back.
+    /// Without this the first checkpoint after boot produces a headerless WAL
+    /// that fails to open on the next restart.
+    #[test]
+    fn truncate_rewrites_the_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+
+        let mut wal = WAL::create(&path).unwrap();
+        wal.append(&WalRecord::insert(Bytes::from("k"), Bytes::from("v"), 7))
+            .unwrap();
+        wal.sync().unwrap();
+        wal.truncate().unwrap();
+        wal.sync().unwrap();
+        assert_eq!(wal.size(), WAL_HEADER_LEN);
+        drop(wal);
+
+        let reopened = WAL::open(&path).unwrap();
+        let records: Vec<_> = reopened
+            .iter()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn append_after_truncate_replays() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("current.wal");
+
+        let mut wal = WAL::create(&path).unwrap();
+        wal.append(&WalRecord::insert(Bytes::from("old"), Bytes::from("v"), 1))
+            .unwrap();
+        wal.sync().unwrap();
+        wal.truncate().unwrap();
+        wal.append(&WalRecord::insert(Bytes::from("new"), Bytes::from("v"), 2))
+            .unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let reopened = WAL::open(&path).unwrap();
+        let records: Vec<_> = reopened
+            .iter()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, Bytes::from("new"));
+    }
+
+    #[test]
+    fn put_attrs_round_trips_through_the_wal_codec() {
+        let row = Bytes::from(vec![1u8, 0, 0, 1, 0b0000_0101, 7, 9]);
+        let record = WalRecord::put_attrs(Bytes::from("memory:abc"), row.clone(), 99);
+
+        let encoded = record.encode();
+        // Skip the 4-byte length prefix, matching the other encode/decode tests in
+        // this module — `decode` takes the checksum + inner bytes, not the raw
+        // buffer including the length prefix.
+        let decoded = WalRecord::decode(&encoded[4..]).unwrap();
+
+        assert_eq!(decoded.record_type, WalRecordType::PutAttrs);
+        assert_eq!(decoded.key, Bytes::from("memory:abc"));
+        assert_eq!(decoded.value, row);
+        assert_eq!(decoded.timestamp, 99);
+    }
+
+    #[test]
+    fn put_attrs_discriminant_is_stable() {
+        // Persisted in the WAL; renumbering silently reinterprets old records.
+        assert_eq!(WalRecordType::PutAttrs as u8, 12);
+        assert_eq!(
+            WalRecordType::try_from(12u8).unwrap(),
+            WalRecordType::PutAttrs
+        );
     }
 }

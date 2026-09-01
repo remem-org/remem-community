@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::engine::query::SourceKind;
+use crate::engine::storage::partition::decode_record_key;
+use crate::engine::util::DistanceMetric;
+
 // ─── Enums ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -87,10 +91,50 @@ pub enum SearchType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// How a listing is ordered.
+///
+/// One variant, deliberately. An ordering key has to be immutable, or a
+/// record can move between one page and the next and be returned twice or
+/// skipped entirely; `created_at` is written once and never reassigned.
+/// Ordering by recency of retrieval was removed for exactly that reason --
+/// reading a memory changed where it sat in the list (REM-79).
 pub enum SortBy {
     #[default]
     CreatedAt,
-    AccessedAt,
+}
+
+/// Which end of the ordering key a listing starts from.
+///
+/// Separate from [`SortBy`] on purpose: the key and the direction are
+/// independent choices, and leaving the direction implicit is what let
+/// `list_recent_memories` return the *oldest* memories for as long as it did.
+/// Callers state it, so the answer is visible at the call site.
+///
+/// `Ascending` stays the default because it is what stable offset pagination
+/// wants: records are appended in `created_at` order, so an ascending page
+/// boundary keeps its meaning as the corpus grows, while a descending one
+/// shifts by one for every record written after the first page was read.
+/// A caller that wants newest-first and pages through results has to accept
+/// that drift -- or ask for a single unpaged page, as `list_recent_memories`
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+impl TryFrom<&str> for SortOrder {
+    type Error = String;
+
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "asc" => Ok(SortOrder::Ascending),
+            "desc" => Ok(SortOrder::Descending),
+            other => Err(format!("unknown order: {other}; use asc or desc")),
+        }
+    }
 }
 
 impl TryFrom<&str> for SortBy {
@@ -99,11 +143,36 @@ impl TryFrom<&str> for SortBy {
     fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
         match s {
             "created_at" => Ok(SortBy::CreatedAt),
-            "accessed_at" => Ok(SortBy::AccessedAt),
-            other => Err(format!(
-                "unknown sort_by: {other}; use created_at or accessed_at"
-            )),
+            other => Err(format!("unknown sort_by: {other}; use created_at")),
         }
+    }
+}
+
+#[cfg(test)]
+mod sort_order_tests {
+    use super::SortOrder;
+
+    #[test]
+    fn parses_known_values() {
+        assert_eq!(SortOrder::try_from("asc").unwrap(), SortOrder::Ascending);
+        assert_eq!(SortOrder::try_from("desc").unwrap(), SortOrder::Descending);
+    }
+
+    #[test]
+    fn rejects_unknown_value() {
+        let err = SortOrder::try_from("sideways").unwrap_err();
+        assert!(
+            err.contains("sideways"),
+            "the error names what was asked for: {err}"
+        );
+        assert!(err.contains("asc"), "and what is available: {err}");
+    }
+
+    /// Ascending is what a paged listing needs, so it is what a caller that
+    /// says nothing gets.
+    #[test]
+    fn default_is_ascending() {
+        assert_eq!(SortOrder::default(), SortOrder::Ascending);
     }
 }
 
@@ -114,12 +183,23 @@ mod sort_by_tests {
     #[test]
     fn parses_known_values() {
         assert_eq!(SortBy::try_from("created_at").unwrap(), SortBy::CreatedAt);
-        assert_eq!(SortBy::try_from("accessed_at").unwrap(), SortBy::AccessedAt);
     }
 
     #[test]
     fn rejects_unknown_value() {
         assert!(SortBy::try_from("popularity").is_err());
+    }
+
+    /// Ordering by recency of retrieval is gone, and a caller asking for it
+    /// is told so rather than quietly served a different order.
+    #[test]
+    fn rejects_ordering_by_access_time() {
+        let err = SortBy::try_from("accessed_at").unwrap_err();
+        assert!(
+            err.contains("accessed_at"),
+            "the error names what was asked for: {err}"
+        );
+        assert!(err.contains("created_at"), "and what is available: {err}");
     }
 
     #[test]
@@ -216,10 +296,168 @@ pub struct Connection {
     pub created_at: DateTime<Utc>,
 }
 
+/// Which index a result surfaced from.
+///
+/// `Content` is the full-corpus text scan: the query engine plans it as an
+/// explicit `ExecutionStep::ContentScan` step (`engine/query/planner.rs`)
+/// and executes it via `StorageEngine::content_scan`
+/// (`engine/storage/engine.rs`) on every keyword query, unconditionally
+/// alongside the tag search rather than only when tags under-deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceName {
+    Vector,
+    Tag,
+    Graph,
+    Content,
+}
+
+impl From<SourceKind> for SourceName {
+    fn from(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::Vector => SourceName::Vector,
+            SourceKind::Tag => SourceName::Tag,
+            SourceKind::Graph => SourceName::Graph,
+            SourceKind::Content => SourceName::Content,
+        }
+    }
+}
+
+/// One index's contribution to a search result.
+///
+/// `rank` is reported alongside `score` because rank fusion works on positions,
+/// not scores: re-fusing results across shards needs the rank an item held in
+/// each node's list, which cannot be recovered from the score.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ResultSource {
+    /// Index that produced this contribution
+    pub source: SourceName,
+
+    /// That index's own relevance score, normalized to 0-1
+    pub score: f32,
+
+    /// Zero-based rank the result held within this index's ranked list
+    pub rank: usize,
+
+    /// Cosine similarity, when the vector index reported a convertible distance
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cosine: Option<f32>,
+
+    /// Raw distance from the vector index, in its configured metric
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+
+    /// Hop count from the graph traversal start node
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+
+    /// Query tokens that matched this memory's tags
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matching_tags: Option<Vec<String>>,
+}
+
+impl ResultSource {
+    /// Base constructor; evidence fields are filled in by the `with_*` helpers.
+    pub fn new(source: SourceName, score: f32, rank: usize) -> Self {
+        Self {
+            source,
+            score,
+            rank,
+            cosine: None,
+            distance: None,
+            depth: None,
+            matching_tags: None,
+        }
+    }
+
+    /// Attach vector evidence, converting the raw distance under `metric`.
+    pub fn with_vector_evidence(mut self, metric: DistanceMetric, distance: f32) -> Self {
+        self.distance = Some(distance);
+        self.cosine = cosine_from_distance(metric, distance);
+        self
+    }
+
+    /// Attach graph traversal depth
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = Some(depth);
+        self
+    }
+
+    /// Attach the query tokens that matched this memory's tags
+    pub fn with_matching_tags(mut self, tags: Vec<String>) -> Self {
+        self.matching_tags = Some(tags);
+        self
+    }
+}
+
+/// A search result, carrying both the ordering and the evidence behind it.
+///
+/// Construct via [`SearchResult::from_sources`] — the fields are derived from
+/// the contributions rather than set independently, so no search path can
+/// report a score that its sources do not support. Before REM-74 each path
+/// assembled this struct itself and `score` drifted into meaning four different
+/// things depending on which branch produced it.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct SearchResult {
     pub memory: Memory,
+
+    /// Relevance, 0-1, comparable across search types.
+    ///
+    /// Note this is deliberately *not* monotonic with response order: results
+    /// are ordered by `fused_score`.
     pub score: f32,
+
+    /// Rank-fusion value that determined ordering. A function of rank position,
+    /// not similarity — not comparable across requests.
+    pub fused_score: f32,
+
+    /// Per-index contributions, best-scoring first. Omitted entirely when the
+    /// caller did not request an explanation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<ResultSource>,
+}
+
+impl SearchResult {
+    /// Build a result from the contributions that produced it, deriving
+    /// `score` from them.
+    ///
+    /// Relevance is the best content-matching source's score. Graph proximity
+    /// is deliberately excluded unless it is the only contribution: being one
+    /// hop from the anchor memory is context, not evidence that the content
+    /// matches the query, and letting it set relevance would report 0.5 for an
+    /// unrelated neighbour.
+    pub fn from_sources(memory: Memory, sources: Vec<ResultSource>, fused_score: f32) -> Self {
+        let best = |filter: &dyn Fn(&ResultSource) -> bool| -> Option<f32> {
+            sources
+                .iter()
+                .filter(|s| filter(s))
+                .map(|s| s.score)
+                .fold(None, |acc: Option<f32>, s| {
+                    Some(acc.map_or(s, |a| a.max(s)))
+                })
+        };
+
+        let score = best(&|s: &ResultSource| s.source != SourceName::Graph)
+            .or_else(|| best(&|_: &ResultSource| true))
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+
+        Self {
+            memory,
+            score,
+            fused_score,
+            sources,
+        }
+    }
+
+    /// Drop the per-source detail, keeping the scores.
+    ///
+    /// Used by the MCP surface, where every field is context the model pays for
+    /// on each search; callers that want the evidence pass `explain`.
+    pub fn without_sources(mut self) -> Self {
+        self.sources.clear();
+        self
+    }
 }
 
 // ─── Query / filter types ────────────────────────────────────────────────────
@@ -232,6 +470,25 @@ pub struct MemoryFilters {
     pub max_importance: Option<f32>,
     pub created_after: Option<u64>,  // Unix ms
     pub created_before: Option<u64>, // Unix ms
+}
+
+impl MemoryFilters {
+    /// Whether the caller asked to narrow anything.
+    ///
+    /// Note what this does *not* count: excluding archived memories is not a
+    /// caller's filter, it is what every user-facing read does, so a search
+    /// with no filters at all still carries the `archived` predicate. This
+    /// only decides how far ahead retrieval fetches — a request that narrows
+    /// nothing has nothing to lose candidates to, so it need not over-fetch
+    /// against that possibility (REM-78, design D9).
+    pub fn narrows_nothing(&self) -> bool {
+        self.memory_type.is_none()
+            && self.tags.is_empty()
+            && self.min_importance.is_none()
+            && self.max_importance.is_none()
+            && self.created_after.is_none()
+            && self.created_before.is_none()
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -253,7 +510,11 @@ pub fn memory_key(id: Uuid) -> String {
 /// there's no window between "index scan finds this key" and "we know
 /// which id to lock."
 pub fn parse_memory_id(key: &[u8]) -> Option<Uuid> {
-    std::str::from_utf8(key)
+    let logical_key = match decode_record_key(key).ok()? {
+        Some(decoded) => decoded.logical_key().to_vec(),
+        None => key.to_vec(),
+    };
+    std::str::from_utf8(&logical_key)
         .ok()?
         .strip_prefix("memory:")?
         .parse()
@@ -265,8 +526,40 @@ pub fn default_memory_health() -> f32 {
 }
 
 /// Convert HNSW distance (any metric) to a [0,1] relevance score.
+///
+/// Monotonic in distance, so it orders correctly under every metric — but it is
+/// an ordering value, not a calibrated similarity. Use
+/// [`cosine_from_distance`] for a number that means the same thing across
+/// search types.
 pub fn distance_to_score(distance: f32) -> f32 {
     1.0 / (1.0 + distance)
+}
+
+/// Recover cosine similarity from a raw index distance, when the configured
+/// metric permits it.
+///
+/// Embeddings are L2-normalized on the way in (`embedding::l2_normalize`), so
+/// for unit vectors `squared_l2 = 2 - 2·cos` and the conversion is exact.
+/// Returns `None` for metrics where no bounded similarity can be recovered.
+///
+/// This is preferred over [`distance_to_score`] as the reported relevance
+/// because `1/(1+d)` floors at 1/3 for orthogonal vectors and never approaches
+/// zero, which makes it a poor threshold (REM-74).
+pub fn cosine_from_distance(metric: DistanceMetric, distance: f32) -> Option<f32> {
+    match metric {
+        // Squared L2 over unit vectors: d = 2 - 2·cos
+        DistanceMetric::L2 => Some((1.0 - distance / 2.0).clamp(0.0, 1.0)),
+        // Already 1 - cos
+        DistanceMetric::Cosine => Some((1.0 - distance).clamp(0.0, 1.0)),
+        // Negated dot product; equals cosine for unit vectors, but the index
+        // does not guarantee normalization, so it is not reported as cosine.
+        DistanceMetric::DotProduct => None,
+    }
+}
+
+/// Relevance score for a vector hit, preferring cosine where recoverable.
+pub fn vector_relevance(metric: DistanceMetric, distance: f32) -> f32 {
+    cosine_from_distance(metric, distance).unwrap_or_else(|| distance_to_score(distance))
 }
 
 #[cfg(test)]
@@ -434,6 +727,206 @@ mod tests {
         );
     }
 
+    // ── REM-74: search result contract ────────────────────────────────────────
+
+    fn make_memory() -> Memory {
+        let now = Utc::now();
+        Memory {
+            id: Uuid::nil(),
+            content: "content".to_string(),
+            memory_type: MemoryType::LongTerm,
+            metadata: Metadata {
+                created_at: now,
+                updated_at: now,
+                accessed_at: now,
+                access_count: 0,
+                source: None,
+                tags: Vec::new(),
+                importance: 0.5,
+                emotional_valence: 0.0,
+                arousal: 0.0,
+                health: 100.0,
+                last_recalled_at: None,
+                flashbulb_until: None,
+                ttl: None,
+            },
+            connections: Vec::new(),
+        }
+    }
+
+    fn source(name: SourceName, score: f32) -> ResultSource {
+        ResultSource::new(name, score, 0)
+    }
+
+    #[test]
+    fn cosine_from_l2_matches_the_normalized_identity() {
+        // Embeddings are unit vectors, so squared L2 d = 2 - 2·cos.
+        let cases: [(f32, f32); 5] = [
+            (0.0, 1.0),  // identical
+            (0.4, 0.8),  // cos 0.8
+            (1.0, 0.5),  // cos 0.5
+            (2.0, 0.0),  // orthogonal
+            (4.0, -1.0), // opposite, clamped to 0
+        ];
+        for (distance, expected_cos) in cases {
+            let got = cosine_from_distance(DistanceMetric::L2, distance).unwrap();
+            let want = expected_cos.max(0.0_f32);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "distance {distance} → cosine {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_is_not_reported_for_dot_product() {
+        // The index does not guarantee normalized vectors under this metric, so
+        // no bounded similarity can be recovered.
+        assert!(cosine_from_distance(DistanceMetric::DotProduct, 0.5).is_none());
+    }
+
+    #[test]
+    fn vector_relevance_falls_back_when_cosine_is_unrecoverable() {
+        // Falls back to the monotonic ordering score rather than inventing one.
+        assert_eq!(
+            vector_relevance(DistanceMetric::DotProduct, 1.0),
+            distance_to_score(1.0)
+        );
+    }
+
+    #[test]
+    fn cosine_discriminates_where_distance_to_score_floors() {
+        // The reason cosine is the reported relevance: 1/(1+d) never drops
+        // below 1/3 for orthogonal-or-worse vectors, so it cannot express
+        // "this is a bad match".
+        assert!(distance_to_score(2.0) > 0.33);
+        assert_eq!(cosine_from_distance(DistanceMetric::L2, 2.0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn score_is_the_best_content_matching_source() {
+        let result = SearchResult::from_sources(
+            make_memory(),
+            vec![
+                source(SourceName::Vector, 0.80),
+                source(SourceName::Tag, 0.50),
+            ],
+            0.0328,
+        );
+        assert_eq!(result.score, 0.80);
+        assert_eq!(result.fused_score, 0.0328);
+    }
+
+    #[test]
+    fn graph_proximity_does_not_set_relevance() {
+        // Being one hop from the anchor is context, not evidence that the
+        // content matches — otherwise an unrelated neighbour reports 0.5.
+        let result = SearchResult::from_sources(
+            make_memory(),
+            vec![
+                source(SourceName::Vector, 0.20),
+                source(SourceName::Graph, 0.50),
+            ],
+            0.0328,
+        );
+        assert_eq!(result.score, 0.20);
+    }
+
+    #[test]
+    fn graph_only_hit_falls_back_to_graph_score() {
+        // With nothing else to report, the graph score is the honest answer.
+        let result =
+            SearchResult::from_sources(make_memory(), vec![source(SourceName::Graph, 0.5)], 0.0164);
+        assert_eq!(result.score, 0.5);
+    }
+
+    #[test]
+    fn score_is_comparable_across_search_types() {
+        // The bug this contract exists to fix: the same memory matching equally
+        // well must report the same relevance whether it was fused or not.
+        let semantic =
+            SearchResult::from_sources(make_memory(), vec![source(SourceName::Vector, 0.8)], 0.8);
+        let hybrid = SearchResult::from_sources(
+            make_memory(),
+            vec![
+                source(SourceName::Vector, 0.8),
+                source(SourceName::Tag, 0.5),
+            ],
+            0.0328,
+        );
+
+        assert_eq!(semantic.score, hybrid.score);
+        // ...while the ordering values remain wildly different, as they should.
+        assert!(semantic.fused_score > hybrid.fused_score * 10.0);
+    }
+
+    #[test]
+    fn score_is_clamped_to_unit_range() {
+        let result = SearchResult::from_sources(
+            make_memory(),
+            vec![
+                source(SourceName::Tag, 4.0),
+                source(SourceName::Content, -1.0),
+            ],
+            1.0,
+        );
+        assert_eq!(result.score, 1.0);
+    }
+
+    #[test]
+    fn sourceless_result_scores_zero_rather_than_panicking() {
+        let result = SearchResult::from_sources(make_memory(), Vec::new(), 0.0);
+        assert_eq!(result.score, 0.0);
+    }
+
+    #[test]
+    fn without_sources_keeps_both_scores() {
+        let result = SearchResult::from_sources(
+            make_memory(),
+            vec![source(SourceName::Vector, 0.8)],
+            0.0164,
+        )
+        .without_sources();
+
+        assert!(result.sources.is_empty());
+        assert_eq!(result.score, 0.8);
+        assert_eq!(result.fused_score, 0.0164);
+    }
+
+    #[test]
+    fn evidence_fields_are_omitted_when_absent() {
+        // Keeps the payload lean, and matters most on the MCP surface where
+        // every field costs the model context.
+        let json = serde_json::to_value(source(SourceName::Tag, 0.5)).unwrap();
+        assert!(json.get("cosine").is_none());
+        assert!(json.get("distance").is_none());
+        assert!(json.get("depth").is_none());
+        assert!(json.get("matching_tags").is_none());
+
+        let vector = serde_json::to_value(
+            source(SourceName::Vector, 0.8).with_vector_evidence(DistanceMetric::L2, 0.4),
+        )
+        .unwrap();
+        assert!((vector["distance"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!((vector["cosine"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn source_names_serialize_as_snake_case() {
+        // The frontend and both MCP copies match on these strings.
+        let names = serde_json::to_value(vec![
+            SourceName::Vector,
+            SourceName::Tag,
+            SourceName::Graph,
+            SourceName::Content,
+        ])
+        .unwrap();
+        assert_eq!(
+            names,
+            serde_json::json!(["vector", "tag", "graph", "content"])
+        );
+    }
+
     // ── StoredMemory::is_expired ──────────────────────────────────────────────
 
     fn make_stored(memory_type: MemoryType, ttl: Option<u64>, created_ms_ago: u64) -> StoredMemory {
@@ -594,6 +1087,16 @@ mod tests {
         let id = Uuid::new_v4();
         let key = memory_key(id);
         assert_eq!(parse_memory_id(key.as_bytes()), Some(id));
+    }
+
+    #[test]
+    fn parse_memory_id_accepts_partitioned_record_keys() {
+        let id = Uuid::new_v4();
+        let binding = crate::engine::storage::partition::PartitionBinding::legacy_default();
+        let key =
+            crate::engine::storage::partition::encode_record_key(&binding, memory_key(id)).unwrap();
+
+        assert_eq!(parse_memory_id(key.as_ref()), Some(id));
     }
 
     #[test]

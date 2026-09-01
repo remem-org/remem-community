@@ -30,5 +30,5 @@ pub fn load_graph_index(config: GraphConfig, dir: PathBuf) -> Result<GraphIndex>
     return KuzuGraphIndex::load_from_dir(config, dir);
 
     #[cfg(not(feature = "kuzu"))]
-    return Ok(SegmentedCsrGraph::load_from_dir(config, dir));
+    return SegmentedCsrGraph::load_from_dir(config, dir);
 }

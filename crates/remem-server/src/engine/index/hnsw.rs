@@ -215,8 +215,21 @@ pub struct HnswIndex {
     /// Current maximum layer in the graph
     max_layer: AtomicUsize,
 
-    /// Number of elements in the index
-    count: AtomicUsize,
+    /// Number of node slots ever allocated, including soft-deleted ones.
+    ///
+    /// This is the physical size of `nodes`, not the live vector count — chunk
+    /// bookkeeping is addressed by slot index, so it must not shrink on delete.
+    /// `len()` subtracts `deleted_count` to get the live count.
+    slots: AtomicUsize,
+
+    /// Cardinality of `deleted_nodes`, tracked alongside the set so `len()`
+    /// stays lock-free.
+    ///
+    /// Kept in step with the set rather than decremented per `remove` call:
+    /// removing the same key twice must not count twice, and a reload must
+    /// restore this from the persisted set or `len()` silently re-counts
+    /// deleted vectors after every restart.
+    deleted_count: AtomicUsize,
 
     /// Whether the index has been modified since last save
     dirty: AtomicUsize,
@@ -229,6 +242,11 @@ pub struct HnswIndex {
 
     /// Internal node IDs that have been soft-deleted. Excluded from search results.
     deleted_nodes: RwLock<HashSet<u32>>,
+
+    /// Test-only counter scoped to this graph, avoiding interference from
+    /// parallel test searches in unrelated indexes.
+    #[cfg(test)]
+    distance_evaluations: AtomicUsize,
 }
 
 impl HnswIndex {
@@ -239,17 +257,65 @@ impl HnswIndex {
             nodes: RwLock::new(Vec::new()),
             entry_point: AtomicU32::new(u32::MAX),
             max_layer: AtomicUsize::new(0),
-            count: AtomicUsize::new(0),
+            slots: AtomicUsize::new(0),
+            deleted_count: AtomicUsize::new(0),
             dirty: AtomicUsize::new(0),
             chunk_dirty: Mutex::new(DirtyChunkTracker::new(HNSW_CHUNK_SIZE)),
             key_to_node: RwLock::new(HashMap::new()),
             deleted_nodes: RwLock::new(HashSet::new()),
+            #[cfg(test)]
+            distance_evaluations: AtomicUsize::new(0),
         }
+    }
+
+    /// Node slots the graph holds, tombstoned ones included.
+    ///
+    /// This, not [`Self::len`], is how many entries a traversal can actually
+    /// step over: a tombstone is excluded from the *results* but still
+    /// occupies a slot and still consumes candidate budget. A caller deciding
+    /// whether it has seen everything the index can offer has to reason about
+    /// this figure, or it will conclude the graph is exhausted while most of
+    /// what it holds has never been visited.
+    pub fn node_count(&self) -> usize {
+        self.slots.load(Ordering::Relaxed)
     }
 
     /// Get the number of vectors in the index
     pub fn len(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
+        self.slots
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.deleted_count.load(Ordering::Relaxed))
+    }
+
+    /// Bytes this index occupies in memory.
+    ///
+    /// Measured by walking the materialized nodes rather than estimated from a
+    /// per-vector constant: the per-node cost varies with the layer a node was
+    /// assigned and with how full its neighbour lists are, so a constant would
+    /// need calibrating against a workload and would drift when either changes.
+    ///
+    /// The walk is affordable because it only ever runs right after a load,
+    /// which has just touched every node anyway.
+    pub fn resident_bytes(&self) -> usize {
+        let nodes = self.nodes.read();
+        let mut total = std::mem::size_of::<HnswNode>() * nodes.capacity();
+
+        for node in nodes.iter() {
+            total += node.vector.capacity() * std::mem::size_of::<f32>();
+            // `external_id` is a refcounted `Bytes`; charging its length to the
+            // one index holding it is the honest attribution here.
+            total += node.external_id.len();
+            total += node.neighbors.capacity() * std::mem::size_of::<RwLock<Vec<u32>>>();
+            for layer in &node.neighbors {
+                total += layer.read().capacity() * std::mem::size_of::<u32>();
+            }
+        }
+
+        total += self.key_to_node.read().capacity()
+            * (std::mem::size_of::<Bytes>() + std::mem::size_of::<u32>());
+        total += self.deleted_nodes.read().capacity() * std::mem::size_of::<u32>();
+
+        total
     }
 
     /// Check if the index is empty
@@ -315,13 +381,13 @@ impl HnswIndex {
         // Register the external_id → node_id mapping
         self.key_to_node.write().insert(external_id, node_id);
 
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.slots.fetch_add(1, Ordering::Relaxed);
         self.dirty.fetch_add(1, Ordering::Relaxed);
 
         // Mark the containing chunk as dirty
         {
             let mut tracker = self.chunk_dirty.lock();
-            let total = self.count.load(Ordering::Relaxed) as u32;
+            let total = self.slots.load(Ordering::Relaxed) as u32;
             tracker.grow_to(total);
             tracker.mark_dirty(node_id);
         }
@@ -472,6 +538,18 @@ impl HnswIndex {
         nodes.get(node_id as usize).map(|n| n.vector.clone())
     }
 
+    /// Return all non-deleted external IDs and vectors.
+    pub fn vectors(&self) -> Vec<(Bytes, Vec<f32>)> {
+        let deleted = self.deleted_nodes.read();
+        let nodes = self.nodes.read();
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !deleted.contains(&(*idx as u32)))
+            .map(|(_, node)| (node.external_id.clone(), node.vector.clone()))
+            .collect()
+    }
+
     /// Soft-delete a node by external key. Returns false if the key is not found.
     /// The node is excluded from search results and get_vector_by_key returns None.
     /// The node id is added to the deleted-nodes set (persisted via
@@ -483,10 +561,10 @@ impl HnswIndex {
             Some(id) => id,
             None => return false,
         };
-        self.deleted_nodes.write().insert(node_id);
-        // Saturating sub guards against underflow on double-remove.
-        if self.count.load(Ordering::Relaxed) > 0 {
-            self.count.fetch_sub(1, Ordering::Relaxed);
+        // Only a node that was not already tombstoned changes the live count;
+        // `HashSet::insert` reporting false means this key was removed before.
+        if self.deleted_nodes.write().insert(node_id) {
+            self.deleted_count.fetch_add(1, Ordering::Relaxed);
         }
         self.chunk_dirty.lock().mark_dirty(node_id);
         // Mark the index dirty the same way `insert` does. Without this, a
@@ -777,7 +855,7 @@ impl HnswIndex {
                     index.config.m0,
                 );
                 nodes_guard.push(node);
-                index.count.fetch_add(1, Ordering::Relaxed);
+                index.slots.fetch_add(1, Ordering::Relaxed);
             }
             // Replay neighbor connections
             for (i, node_opt) in node_records.iter().enumerate() {
@@ -796,8 +874,11 @@ impl HnswIndex {
                 .store(global_entry_point, Ordering::Release);
         }
         index.max_layer.store(global_max_layer, Ordering::Release);
-        // Grow tracker to cover all loaded nodes (all clean)
-        index.chunk_dirty.lock().grow_to(index.len() as u32);
+        // Grow tracker to cover all loaded nodes (all clean). Slots, not
+        // `len()`: chunk bookkeeping is addressed by slot index, and `len()`
+        // excludes tombstoned slots.
+        let loaded_slots = index.slots.load(Ordering::Relaxed) as u32;
+        index.chunk_dirty.lock().grow_to(loaded_slots);
         // Build key_to_node map from loaded nodes.
         {
             let nodes = index.nodes.read();
@@ -807,7 +888,9 @@ impl HnswIndex {
             }
         }
         index.mark_clean();
-        *index.deleted_nodes.write() = Self::load_deleted_nodes(dir)?;
+        let deleted = Self::load_deleted_nodes(dir)?;
+        index.deleted_count.store(deleted.len(), Ordering::Relaxed);
+        *index.deleted_nodes.write() = deleted;
 
         tracing::info!(
             "HNSW: loaded {} nodes from {} chunks in {:?}",
@@ -831,7 +914,19 @@ impl HnswIndex {
     /// Calculate distance between query and a node
     #[inline]
     fn distance(&self, query: &[f32], node: &HnswNode) -> f32 {
+        #[cfg(test)]
+        self.distance_evaluations.fetch_add(1, Ordering::Relaxed);
         self.config.metric.distance(query, &node.vector)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_distance_evaluations(&self) {
+        self.distance_evaluations.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn distance_evaluations(&self) -> usize {
+        self.distance_evaluations.load(Ordering::Relaxed)
     }
 
     /// Search a single layer to find the closest node (greedy traversal)
@@ -1004,6 +1099,7 @@ impl HnswIndex {
     }
 
     /// Load an index from a file
+    #[allow(dead_code)] // REM-76 task 3.4 uses this for legacy shared-HNSW migration.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = std::fs::File::open(path).map_err(StorageError::Io)?;
@@ -1125,11 +1221,14 @@ impl HnswIndex {
             nodes: RwLock::new(nodes),
             entry_point: AtomicU32::new(entry_point),
             max_layer: AtomicUsize::new(max_layer),
-            count: AtomicUsize::new(node_count),
+            slots: AtomicUsize::new(node_count),
+            deleted_count: AtomicUsize::new(0),
             dirty: AtomicUsize::new(0),
             chunk_dirty: Mutex::new(DirtyChunkTracker::new(HNSW_CHUNK_SIZE)),
             key_to_node: RwLock::new(HashMap::new()),
             deleted_nodes: RwLock::new(HashSet::new()),
+            #[cfg(test)]
+            distance_evaluations: AtomicUsize::new(0),
         };
         // Initialize tracker to cover all loaded nodes (all clean)
         index.chunk_dirty.lock().grow_to(node_count as u32);
@@ -1368,6 +1467,60 @@ mod tests {
         // 'c' should be closer than 'b' to [1,0,0]
         assert_eq!(results[1].0.as_ref(), b"c");
         assert_eq!(results[2].0.as_ref(), b"b");
+    }
+
+    #[test]
+    fn live_count_survives_a_reload_with_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HnswConfig::with_dim(4);
+        let index = HnswIndex::new(config.clone());
+
+        for (i, key) in [b"a", b"b", b"c"].iter().enumerate() {
+            let mut v = vec![0.0; 4];
+            v[i] = 1.0;
+            index.insert(key.to_vec(), v).unwrap();
+        }
+        assert!(index.remove(b"b"));
+        let before = index.len();
+        assert_eq!(before, 2, "live count must exclude the tombstoned vector");
+
+        let index_dir = dir.path().join("index");
+        index.save_dirty_chunks(&index_dir).unwrap();
+        index.save_deleted_nodes(&index_dir).unwrap();
+
+        let reloaded = HnswIndex::load_chunked(&index_dir, config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.len(),
+            before,
+            "live count changed across a reload: tombstoned vectors are being \
+             counted again, which re-inflates vector_count and the widening \
+             bound in query::executor after every restart"
+        );
+    }
+
+    #[test]
+    fn removing_the_same_key_twice_counts_once() {
+        let config = HnswConfig::with_dim(4);
+        let index = HnswIndex::new(config);
+
+        index
+            .insert(b"a".to_vec(), vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        index
+            .insert(b"b".to_vec(), vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+
+        assert!(index.remove(b"a"));
+        assert_eq!(index.len(), 1);
+        index.remove(b"a");
+        assert_eq!(
+            index.len(),
+            1,
+            "a repeated remove of an already-tombstoned key must not decrement \
+             the live count a second time"
+        );
     }
 
     #[test]

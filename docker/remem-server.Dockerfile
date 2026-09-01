@@ -1,4 +1,6 @@
-# Build remem-server from the local workspace
+# Build the production remem-server image from the local workspace.
+#
+# Formatter, clippy, and test targets live in docker/remem-server.ci.Dockerfile.
 FROM rust:1.85-slim AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -37,29 +39,22 @@ COPY crates/remem-mcp/Cargo.toml crates/remem-mcp/
 COPY crates/remem-server/Cargo.toml crates/remem-server/
 
 # Create stub source files so `cargo fetch` can resolve all dependencies.
-RUN mkdir -p crates/remem-mcp/src crates/remem-server/src crates/remem-server/src/bin && \
+# Every target `Cargo.toml` declares needs a stub, benches included: cargo
+# parses the manifest before it fetches anything, and a declared target with
+# no file on disk fails the parse outright.
+RUN mkdir -p crates/remem-mcp/src crates/remem-server/src crates/remem-server/src/bin \
+        crates/remem-server/benches && \
     echo "fn main() {}" > crates/remem-mcp/src/main.rs && \
     echo "fn main() {}" > crates/remem-server/src/main.rs && \
     echo "fn main() {}" > crates/remem-server/src/bin/download_model.rs && \
+    echo "fn main() {}" > crates/remem-server/benches/write_path.rs && \
+    echo "fn main() {}" > crates/remem-server/benches/vector_retrieval.rs && \
     cargo fetch
 
 # Copy actual source code and proto files
 COPY crates/ crates/
 
 ENV ORT_LIB_LOCATION=/ort-libs
-
-# ── Lint stage (used by CI / docker build --target linter) ───────────────────
-FROM builder AS linter
-RUN cargo fmt --all -- --check
-RUN cargo clippy --all-targets -- -D warnings
-# Business-gated code is not compiled by the default build, so it needs its own
-# pass or lints in crates/remem-server/src/business/ reach main unchecked.
-RUN cargo clippy --all-targets --features business -- -D warnings
-
-# ── Test stage (used by CI / docker build --target tester) ───────────────────
-FROM builder AS tester
-ENV LD_LIBRARY_PATH=/ort-libs
-RUN cargo test -p remem-server
 
 # ── Binary build stage ────────────────────────────────────────────────────────
 FROM builder AS release-builder

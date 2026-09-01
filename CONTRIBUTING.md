@@ -44,3 +44,13 @@ Accepted PRs are imported into the dev repository and will appear in the next re
 - Rust: `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` must pass.
 - No new dependencies without discussion — the storage engine is intentionally dependency-light.
 - Write tests for new behavior.
+
+In the dev repository, production image builds and CI checks use separate
+Dockerfiles. `docker/remem-server.Dockerfile` is the production image Dockerfile
+that ships to edition source snapshots. `docker/remem-server.ci.Dockerfile` is
+dev-repo-only and provides `linter` and `tester` targets for containerized CI:
+
+```bash
+docker build --target linter -f docker/remem-server.ci.Dockerfile .
+docker build --target tester -f docker/remem-server.ci.Dockerfile .
+```

@@ -59,7 +59,7 @@ pub fn list() -> Value {
             },
             {
                 "name": "search_memories",
-                "description": "Search memories using semantic, keyword, or hybrid search. When related_to is provided, memories connected in the graph to that memory ID are boosted in results.",
+                "description": "Search memories using semantic, keyword, or hybrid search. When related_to is provided, memories connected in the graph to that memory ID are boosted in results. Each result carries a `score` from 0 to 1 measuring how well it matches the query — comparable across all search types, so it can be used to judge relevance and discard weak matches. `matched` lists which indexes surfaced the result (vector = semantic similarity, tag = tag match, content = text match, graph = connected to the related_to memory rather than matching the query itself). A `truncated` field of true means the search stopped at its internal limit before finding everything that matches, so more matching memories may exist beyond what is returned — do not treat such a result as a complete picture; narrow the query or add filters and search again. When it is false the result set is complete for the requested limit.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -67,6 +67,7 @@ pub fn list() -> Value {
                         "search_type": {"type": "string", "enum": ["semantic", "keyword", "hybrid"]},
                         "limit": {"type": "integer"},
                         "related_to": {"type": "string", "description": "UUID of a memory whose graph neighbours should be boosted in results"},
+                        "explain": {"type": "boolean", "description": "Return the full per-index breakdown behind each ranking (native scores, ranks and evidence) instead of the compact `matched` list. Defaults to false."},
                         "filters": {
                             "type": "object",
                             "properties": {
@@ -148,13 +149,13 @@ pub fn list() -> Value {
             },
             {
                 "name": "list_recent_memories",
-                "description": "List recently created or accessed memories.",
+                "description": "List the most recently created memories, newest first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer"},
                         "memory_type": {"type": "string", "enum": ["short_term", "long_term"]},
-                        "sort_by": {"type": "string", "enum": ["created_at", "accessed_at"]}
+                        "sort_by": {"type": "string", "enum": ["created_at"]}
                     }
                 }
             }
@@ -254,17 +255,78 @@ async fn search_memories(
 
     let data = client.search_memories(body, request_id).await?;
     let count = data["results"].as_array().map(|a| a.len()).unwrap_or(0);
+    let explain = args
+        .get("explain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let results = shape_results_for_llm(data["results"].clone(), explain);
+    // Forwarded from the server's search response: the search stopped at its
+    // effort bound before finding everything it was asked for, so further
+    // matches may exist (REM-78). Absent on an older server, which is treated
+    // as "not truncated" — the behaviour that server actually had.
+    let truncated = data
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Ok(json!({
         "success": true,
         "query": query,
         "results_count": count,
-        "results": data["results"],
-        "summary": if count > 0 {
-            format!("Found {count} memories for '{query}'")
-        } else {
-            format!("No memories found for '{query}'")
+        "results": results,
+        "truncated": truncated,
+        // The summary is what the model reads. A bare count after a search
+        // that stopped early reads as exhaustive, and an agent that believes
+        // it will answer "everything I know about X" from a partial recall.
+        // Kept identical to the copy in
+        // `crates/remem-server/src/api/mcp/tools.rs`.
+        "summary": match (count, truncated) {
+            (0, false) => format!("No memories found for '{query}'"),
+            (0, true) => format!(
+                "No memories found for '{query}' within the search limit; \
+                 matches may exist beyond it. Narrow the query or add filters."
+            ),
+            (_, false) => format!("Found {count} memories for '{query}'"),
+            (_, true) => format!(
+                "Found {count} memories for '{query}', but the search stopped \
+                 at its limit before finding everything — more matches may exist."
+            ),
         }
     }))
+}
+
+/// Trim search results for LLM consumption.
+///
+/// Every field here is context the model pays for on each search, so the
+/// default keeps `score` (which it can act on) and a compact `matched` list of
+/// contributing indexes, and drops the per-source evidence. `explain: true`
+/// returns the full breakdown. Kept identical to the copy in
+/// `crates/remem-server/src/api/mcp/tools.rs`.
+fn shape_results_for_llm(results: Value, explain: bool) -> Value {
+    if explain {
+        return results;
+    }
+    let Value::Array(items) = results else {
+        return results;
+    };
+    Value::Array(
+        items
+            .into_iter()
+            .map(|mut item| {
+                let matched: Vec<Value> = item
+                    .get("sources")
+                    .and_then(|s| s.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.get("source").cloned()).collect())
+                    .unwrap_or_default();
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("sources");
+                    obj.remove("fused_score");
+                    obj.insert("matched".to_string(), Value::Array(matched));
+                }
+                item
+            })
+            .collect(),
+    )
 }
 
 async fn get_memory(client: &RememClient, args: &Value, request_id: &str) -> anyhow::Result<Value> {
@@ -373,13 +435,14 @@ async fn list_recent_memories(
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
     let memory_type = args.get("memory_type").and_then(|v| v.as_str());
     let sort_by = args.get("sort_by").and_then(|v| v.as_str());
+    // Newest-first, and offset 0 -- the REST listing offers `desc` only on an
+    // unpaged read, because a descending page boundary moves as memories are
+    // written. This tool never pages, so the restriction costs it nothing.
     let data = client
-        .list_memories(limit, 0, memory_type, sort_by, request_id)
+        .list_memories(limit, 0, memory_type, sort_by, Some("desc"), request_id)
         .await?;
     let count = data["memories"].as_array().map(|a| a.len()).unwrap_or(0);
-    Ok(
-        json!({"success": true, "count": count, "total": data["total"], "memories": data["memories"]}),
-    )
+    Ok(json!({"success": true, "count": count, "memories": data["memories"]}))
 }
 
 #[cfg(test)]

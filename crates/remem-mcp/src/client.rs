@@ -201,6 +201,7 @@ impl RememClient {
         offset: i64,
         memory_type: Option<&str>,
         sort_by: Option<&str>,
+        order: Option<&str>,
         request_id: &str,
     ) -> anyhow::Result<Value> {
         let mut query: Vec<(&str, String)> =
@@ -210,6 +211,9 @@ impl RememClient {
         }
         if let Some(sb) = sort_by {
             query.push(("sort_by", sb.to_string()));
+        }
+        if let Some(o) = order {
+            query.push(("order", o.to_string()));
         }
         let resp = self
             .get("/api/v1/memories", request_id)

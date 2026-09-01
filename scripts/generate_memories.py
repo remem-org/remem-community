@@ -13,6 +13,9 @@ Defaults:
 
 import argparse
 import asyncio
+from collections import Counter
+import os
+from pathlib import Path
 import random
 import sys
 import time
@@ -119,6 +122,22 @@ SOURCES = [
 MEMORY_TYPES = ["short_term", "long_term"]
 
 
+def default_api_key() -> str:
+    """Read the API key from the environment or the repository's .env file."""
+    if api_key := os.environ.get("REMEM_API_KEY", "").strip():
+        return api_key
+
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        for line in env_path.read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "REMEM_API_KEY":
+                return value.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return ""
+
+
 def random_content() -> str:
     subject = random.choice(SUBJECTS)
     verb = random.choice(VERBS)
@@ -160,34 +179,67 @@ async def post_memory(
     url: str,
     semaphore: asyncio.Semaphore,
     counter: list[int],  # mutable int via list
-    errors: list[int],
+    errors: Counter[str],
+    error_samples: dict[str, str],
     total: int,
+    max_retries: int,
 ) -> None:
     async with semaphore:
         payload = random_memory()
-        try:
-            response = await client.post(url, json=payload, timeout=30.0)
-            if response.status_code not in (200, 201):
-                errors[0] += 1
-        except Exception:
-            errors[0] += 1
-        finally:
-            counter[0] += 1
-            done = counter[0]
-            if done % 1000 == 0 or done == total:
-                pct = done / total * 100
-                err_rate = errors[0] / done * 100
-                print(
-                    f"\r  {done:>7}/{total}  ({pct:5.1f}%)  errors: {errors[0]} ({err_rate:.1f}%)",
-                    end="",
-                    flush=True,
-                )
+        error_key: str | None = None
+        error_detail = ""
+        for attempt in range(max_retries + 1):
+            try:
+                response = await client.post(url, json=payload, timeout=30.0)
+                if response.status_code in (200, 201):
+                    error_key = None
+                    break
+
+                error_key = f"HTTP {response.status_code}"
+                error_detail = response.text[:500]
+                retryable = response.status_code == 429 or response.status_code in (502, 503, 504)
+                if not retryable or attempt == max_retries:
+                    break
+
+                retry_after = response.headers.get("retry-after")
+                delay = float(retry_after) if retry_after else min(0.25 * (2 ** attempt), 5.0)
+                await asyncio.sleep(delay)
+            except httpx.ConnectError as exc:
+                error_key = type(exc).__name__
+                error_detail = str(exc)
+                if attempt == max_retries:
+                    break
+                await asyncio.sleep(min(0.25 * (2 ** attempt), 5.0))
+            except Exception as exc:
+                # Do not retry ambiguous failures such as read timeouts: the
+                # server may already have committed the memory.
+                error_key = type(exc).__name__
+                error_detail = str(exc)
+                break
+
+        if error_key is not None:
+            errors[error_key] += 1
+            error_samples.setdefault(error_key, error_detail)
+
+        counter[0] += 1
+        done = counter[0]
+        if done % 1000 == 0 or done == total:
+            pct = done / total * 100
+            error_count = sum(errors.values())
+            err_rate = error_count / done * 100
+            print(
+                f"\r  {done:>7}/{total}  ({pct:5.1f}%)  errors: {error_count} ({err_rate:.1f}%)",
+                end="",
+                flush=True,
+            )
 
 
-async def run(url: str, count: int, concurrency: int) -> None:
+async def run(url: str, count: int, concurrency: int, api_key: str, max_retries: int) -> None:
     semaphore = asyncio.Semaphore(concurrency)
     counter: list[int] = [0]
-    errors: list[int] = [0]
+    errors: Counter[str] = Counter()
+    error_samples: dict[str, str] = {}
+    headers = {"X-API-Key": api_key} if api_key else {}
 
     print(f"Generating {count:,} memories -> {url}")
     print(f"Concurrency: {concurrency}")
@@ -195,9 +247,32 @@ async def run(url: str, count: int, concurrency: int) -> None:
 
     start = time.perf_counter()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=headers) as client:
+        health_url = url.rsplit("/memories", 1)[0] + "/health"
+        try:
+            health = await client.get(health_url, timeout=5.0)
+            health.raise_for_status()
+        except Exception as exc:
+            print(f"Cannot reach a healthy remem-server at {health_url}: {exc}", file=sys.stderr)
+            print("Start remem-server and verify port 4545 before generating memories.", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        try:
+            auth_check = await client.get(url, params={"limit": 1}, timeout=5.0)
+            auth_check.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:500]
+            print(
+                f"remem-server rejected the API preflight: HTTP {exc.response.status_code} — {detail}",
+                file=sys.stderr,
+            )
+            print("Set REMEM_API_KEY in .env, export it, or pass --api-key.", file=sys.stderr)
+            raise SystemExit(2) from exc
+
         tasks = [
-            post_memory(client, url, semaphore, counter, errors, count)
+            post_memory(
+                client, url, semaphore, counter, errors, error_samples, count, max_retries
+            )
             for _ in range(count)
         ]
         await asyncio.gather(*tasks)
@@ -208,8 +283,12 @@ async def run(url: str, count: int, concurrency: int) -> None:
     print()  # newline after progress line
     print()
     print(f"Done in {elapsed:.1f}s  ({rps:.0f} req/s)")
-    print(f"  Successes : {count - errors[0]:,}")
-    print(f"  Errors    : {errors[0]:,}")
+    error_count = sum(errors.values())
+    print(f"  Successes : {count - error_count:,}")
+    print(f"  Errors    : {error_count:,}")
+    for kind, amount in errors.most_common():
+        detail = error_samples.get(kind) or "no response detail"
+        print(f"    {kind}: {amount:,} — {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +316,20 @@ def main() -> None:
         default=100,
         help="Maximum concurrent requests (default: 100)",
     )
+    parser.add_argument(
+        "--api-key",
+        default=default_api_key(),
+        help="API key (default: REMEM_API_KEY environment variable or repository .env)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Retries for 429/502/503/504 and connection failures (default: 5)",
+    )
     args = parser.parse_args()
 
-    asyncio.run(run(args.url, args.count, args.concurrency))
+    asyncio.run(run(args.url, args.count, args.concurrency, args.api_key, args.max_retries))
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ const TASKS: &[(&str, &str)] = &[
     ("consolidate_similar", "Weekly"),
     ("cleanup_archived", "Monthly"),
     ("discover_connections", "Every hour"),
+    ("flush_recall", "Every 30 seconds"),
     ("checkpoint", "On demand"),
 ];
 

@@ -285,7 +285,7 @@ impl<'a> SSTableIterator<'a> {
     }
 }
 
-impl<'a> Iterator for SSTableIterator<'a> {
+impl Iterator for SSTableIterator<'_> {
     type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -471,7 +471,7 @@ mod tests {
 
         // First access loads into cache
         let _ = reader.get(b"key1").unwrap();
-        assert!(cache.len() > 0);
+        assert!(!cache.is_empty());
 
         // Second access should hit cache
         let _ = reader.get(b"key1").unwrap();

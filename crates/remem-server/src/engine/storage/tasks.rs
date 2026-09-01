@@ -3,7 +3,7 @@
 //! Contains the flush loop, compaction loop, checkpoint loop, and the
 //! `flush_memtable` helper used during both background and foreground flushes.
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -12,12 +12,13 @@ use tokio::task::JoinHandle;
 use super::compaction::CompactionManager;
 use super::engine::EngineConfig;
 use super::memtable::{ImmutableMemTable, MemTable};
+use super::partitioned_hnsw::PartitionedHnswIndexes;
+use super::partitioned_indexes::{PartitionedTagIndex, PartitionedTimeSeriesIndex};
 use super::sstable::{SSTableReader, SSTableWriter};
-use super::wal::WAL;
+use super::wal_commit::WalCommitCoordinator;
+use crate::engine::attr::index::AttrIndexes;
 use crate::engine::error::Result;
-use crate::engine::index::{
-    HnswIndex, SegmentedBTreeIndex, SegmentedCsrGraph, SegmentedInvertedIndex,
-};
+use crate::engine::index::SegmentedCsrGraph;
 
 /// Global counter for unique SSTable file names (prevents collisions when
 /// multiple flushes happen within the same millisecond).
@@ -65,31 +66,30 @@ pub(super) fn flush_memtable(
     Ok(())
 }
 
-/// Flush all immutable memtables and truncate the WAL, holding the WAL lock
-/// across the whole span.
+/// Flush all current and immutable memtables during an exclusive checkpoint.
 ///
-/// This is the safety-critical write barrier: no WAL record can be appended
-/// (every writer's first step is `wal.lock()`) while this runs, and nothing
-/// here can truncate the WAL without every write it covers already being
-/// durable in a flushed SSTable. Shared by `StorageEngine::checkpoint()`
-/// (the foreground/manual path) and the background checkpoint loop below —
-/// see REM-37 / `docs/PROJECT_REVIEW.md` §4.2 for why there must be exactly
-/// one implementation of this span.
-pub(super) fn wal_locked_flush_and_truncate(
-    wal: &Mutex<WAL>,
+/// Callers must hold exclusive write admission and establish a coordinator
+/// barrier before entering. They may ask the coordinator to truncate only
+/// after this function and every required index save succeed. Shared by the
+/// foreground and background checkpoint paths.
+pub(super) fn flush_memtables_for_checkpoint(
     memtable: &RwLock<MemTable>,
     immutable_memtables: &RwLock<Vec<Arc<ImmutableMemTable>>>,
     compaction: &CompactionManager,
     config: &EngineConfig,
 ) -> Result<()> {
-    let mut wal_guard = wal.lock();
-
     let newly_immutable = {
         let mut mt = memtable.write();
         if mt.is_empty() {
             None
         } else {
-            let old = std::mem::replace(&mut *mt, MemTable::with_capacity(config.memtable_size));
+            // Inherit the outgoing table's counter -- it is the engine's own
+            // handle, so the replacement keeps issuing versions in order.
+            let sequence = mt.sequence();
+            let old = std::mem::replace(
+                &mut *mt,
+                MemTable::with_sequence(config.memtable_size, sequence),
+            );
             Some(Arc::new(ImmutableMemTable::from_memtable(old)))
         }
     };
@@ -105,32 +105,37 @@ pub(super) fn wal_locked_flush_and_truncate(
             .retain(|m| !Arc::ptr_eq(m, &imm));
     }
 
-    wal_guard.truncate()?;
     Ok(())
 }
 
 /// Spawn the background flush, compaction, and checkpoint tasks.
 ///
-/// Returns `(flush_handle, compaction_handle)` so the engine can await them
-/// during graceful shutdown. The checkpoint task is not tracked — it stops
-/// on its own when the `shutdown` flag is set.
+/// These are storage-engine maintenance loops, not request paths. They process
+/// every already-encoded physical key so partition prefixes and per-partition
+/// HNSW roots are preserved without resolving an application read scope.
+///
+/// Returns every maintenance handle so the engine can await them during
+/// graceful shutdown and abort them if the engine is dropped abruptly.
 // Called exactly once, from `StorageEngine::new`. Every argument is a distinct
 // piece of engine state the tasks need to own a handle to; bundling them into a
-// struct would only move the same 11 fields one level down.
+// struct would only move the same 12 fields one level down.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_background_tasks(
     immutable_memtables: Arc<RwLock<Vec<Arc<ImmutableMemTable>>>>,
     memtable: Arc<RwLock<MemTable>>,
     compaction: Arc<CompactionManager>,
-    wal: Arc<Mutex<WAL>>,
-    hnsw_index: Option<Arc<HnswIndex>>,
+    wal: Arc<WalCommitCoordinator>,
+    write_admission: Arc<tokio::sync::RwLock<()>>,
+    checkpoint_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    hnsw_index: Option<Arc<PartitionedHnswIndexes>>,
     graph_index: Option<Arc<parking_lot::RwLock<SegmentedCsrGraph>>>,
-    time_series_index: Option<Arc<parking_lot::RwLock<SegmentedBTreeIndex>>>,
-    tag_index: Option<Arc<parking_lot::RwLock<SegmentedInvertedIndex>>>,
+    time_series_index: Option<Arc<parking_lot::RwLock<PartitionedTimeSeriesIndex>>>,
+    tag_index: Option<Arc<parking_lot::RwLock<PartitionedTagIndex>>>,
+    attr_indexes: Option<Arc<AttrIndexes>>,
     shutdown: Arc<AtomicBool>,
     config: EngineConfig,
     mut flush_rx: mpsc::Receiver<()>,
-) -> (JoinHandle<()>, JoinHandle<()>) {
+) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {
     // --- Flush task ---
     let immutable = Arc::clone(&immutable_memtables);
     let compaction_flush = Arc::clone(&compaction);
@@ -197,7 +202,7 @@ pub(super) fn start_background_tasks(
     let memtable_cp = Arc::clone(&memtable);
     let immutable_cp = Arc::clone(&immutable_memtables);
     let compaction_cp = Arc::clone(&compaction);
-    tokio::spawn(async move {
+    let checkpoint_handle = tokio::spawn(async move {
         // tokio::time::Instant, not std::time::Instant: this loop already
         // runs on tokio::time::sleep, and using tokio's clock here means
         // tokio::time::pause/advance (used by tests) actually affects this
@@ -211,32 +216,35 @@ pub(super) fn start_background_tasks(
                 break;
             }
 
-            let wal_size = {
-                let wal = wal.lock();
-                wal.size()
+            let wal_size = match wal.size().await {
+                Ok(size) => size,
+                Err(error) => {
+                    tracing::error!("Failed to read WAL size: {}", error);
+                    continue;
+                }
             };
 
             let should_checkpoint = wal_size > config.max_wal_size
                 || last_checkpoint.elapsed() > config.checkpoint_interval;
 
             if should_checkpoint {
+                let _admission = write_admission.write().await;
+                if let Err(error) = wal.barrier().await {
+                    tracing::error!("Failed to establish WAL checkpoint barrier: {}", error);
+                    continue;
+                }
                 tracing::info!(
                     "Background checkpoint triggering (WAL size: {}, Last: {:?})",
                     wal_size,
                     last_checkpoint.elapsed()
                 );
 
-                let data_dir = &config.data_dir;
                 let mut all_saves_ok = true;
 
                 if let Some(index) = &hnsw_index {
                     if index.is_dirty() {
-                        let hnsw_dir = data_dir.join("index");
-                        if let Err(e) = index.save_dirty_chunks(&hnsw_dir) {
-                            tracing::error!("Failed to save HNSW index chunks: {}", e);
-                            all_saves_ok = false;
-                        } else if let Err(e) = index.save_deleted_nodes(&hnsw_dir) {
-                            tracing::error!("Failed to save HNSW deleted-node set: {}", e);
+                        if let Err(e) = index.save_dirty() {
+                            tracing::error!("Failed to save partitioned HNSW indexes: {}", e);
                             all_saves_ok = false;
                         }
                     }
@@ -284,6 +292,16 @@ pub(super) fn start_background_tasks(
                     }
                 }
 
+                if let Some(indexes) = &attr_indexes {
+                    if let Err(e) = indexes.save_if_dirty() {
+                        tracing::error!("Failed to save attribute indexes: {}", e);
+                        all_saves_ok = false;
+                    }
+                    if let Err(e) = indexes.compact_if_needed() {
+                        tracing::error!("Attribute index compaction failed: {}", e);
+                    }
+                }
+
                 // Only reset the retry clock once the cycle actually
                 // completes end to end (index saves, KV flush, WAL
                 // truncate all succeed). Otherwise a persistent failure
@@ -292,14 +310,19 @@ pub(super) fn start_background_tasks(
                 // healthy checkpoint -- rather than promptly on the very
                 // next poll once the underlying problem clears up.
                 let checkpoint_succeeded = if all_saves_ok {
-                    match wal_locked_flush_and_truncate(
-                        &wal,
+                    match flush_memtables_for_checkpoint(
                         &memtable_cp,
                         &immutable_cp,
                         &compaction_cp,
                         &config,
                     ) {
-                        Ok(()) => true,
+                        Ok(()) => match wal.truncate().await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::error!("Checkpoint WAL truncate failed: {}", e);
+                                false
+                            }
+                        },
                         Err(e) => {
                             tracing::error!("Checkpoint flush/truncate failed: {}", e);
                             false
@@ -319,9 +342,10 @@ pub(super) fn start_background_tasks(
                     "Background checkpoint complete (succeeded={})",
                     checkpoint_succeeded
                 );
+                checkpoint_attempts.fetch_add(1, Ordering::Release);
             }
         }
     });
 
-    (flush_handle, compaction_handle)
+    (flush_handle, compaction_handle, checkpoint_handle)
 }

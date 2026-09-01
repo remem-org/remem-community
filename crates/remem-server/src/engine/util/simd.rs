@@ -56,7 +56,7 @@ impl DistanceMetric {
 /// # Example
 ///
 /// ```
-/// use remem_storage::util::simd::l2_distance_squared;
+/// use remem_server::engine::util::simd::l2_distance_squared;
 ///
 /// let a = vec![1.0, 2.0, 3.0];
 /// let b = vec![4.0, 5.0, 6.0];
@@ -90,7 +90,7 @@ pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> f32 {
 /// # Example
 ///
 /// ```
-/// use remem_storage::util::simd::dot_product;
+/// use remem_server::engine::util::simd::dot_product;
 ///
 /// let a = vec![1.0, 2.0, 3.0];
 /// let b = vec![4.0, 5.0, 6.0];
@@ -124,7 +124,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 /// # Example
 ///
 /// ```
-/// use remem_storage::util::simd::cosine_similarity;
+/// use remem_server::engine::util::simd::cosine_similarity;
 ///
 /// let a = vec![1.0, 0.0, 0.0];
 /// let b = vec![1.0, 0.0, 0.0];

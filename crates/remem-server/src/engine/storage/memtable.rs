@@ -60,8 +60,15 @@ pub struct MemTable {
     size: AtomicUsize,
     /// Maximum size before the MemTable should be flushed
     max_size: usize,
-    /// Next timestamp for entries
-    next_timestamp: AtomicU64,
+    /// The store's record-version counter.
+    ///
+    /// Shared rather than owned: a rotation builds the replacement memtable
+    /// from this same handle, so a version issued after the rotation still
+    /// sorts after one issued before it. Every site that resolves two copies
+    /// of a key -- compaction's merge, `insert_with_timestamp` below, WAL
+    /// replay -- decides by this number, so a counter that restarted per
+    /// memtable made a later write look older and let the stale copy win.
+    next_timestamp: Arc<AtomicU64>,
     /// Number of entries in the MemTable
     entry_count: AtomicUsize,
 }
@@ -72,15 +79,31 @@ impl MemTable {
         Self::with_capacity(DEFAULT_MEMTABLE_SIZE)
     }
 
-    /// Create a new MemTable with specified size limit
+    /// Create a new MemTable with specified size limit, on a counter of its
+    /// own. Suitable for a standalone table; the engine uses
+    /// [`MemTable::with_sequence`] so its tables share one order.
     pub fn with_capacity(max_size: usize) -> Self {
+        Self::with_sequence(max_size, Arc::new(AtomicU64::new(1)))
+    }
+
+    /// Create a MemTable that draws record versions from an existing counter.
+    ///
+    /// This is how a rotation preserves the order: the replacement inherits
+    /// the counter of the table it replaces instead of starting over.
+    pub fn with_sequence(max_size: usize, sequence: Arc<AtomicU64>) -> Self {
         Self {
             data: SkipMap::new(),
             size: AtomicUsize::new(0),
             max_size,
-            next_timestamp: AtomicU64::new(1),
+            next_timestamp: sequence,
             entry_count: AtomicUsize::new(0),
         }
+    }
+
+    /// A handle on the counter this table issues versions from, for building
+    /// its replacement.
+    pub fn sequence(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.next_timestamp)
     }
 
     /// Insert an entry with a specific timestamp (used during WAL replay)
@@ -407,5 +430,65 @@ mod tests {
 
         let entry = immutable.get(b"key1").unwrap();
         assert_eq!(entry.value.as_ref().unwrap().as_ref(), b"value1");
+    }
+
+    /// The admission rule is left exactly as it was — a version admits only if
+    /// it exceeds the one already held — because the fix for reverted writes
+    /// was to make the numbers order writes, not to special-case this site.
+    ///
+    /// Correct only while versions come from one counter, which is what
+    /// `a_rotation_keeps_issuing_from_the_same_counter` below covers.
+    #[test]
+    fn a_lower_version_does_not_displace_a_higher_one() {
+        let memtable = MemTable::new();
+        let key = Bytes::from_static(b"k");
+
+        memtable
+            .insert_with_timestamp(key.clone(), Bytes::from_static(b"higher"), 5000)
+            .unwrap();
+        memtable
+            .insert_with_timestamp(key.clone(), Bytes::from_static(b"lower"), 3)
+            .unwrap();
+
+        let held = memtable.get(&key).unwrap();
+        assert_eq!(
+            held.value.as_ref().unwrap().as_ref(),
+            b"higher",
+            "a smaller version must not displace a larger one"
+        );
+    }
+
+    #[test]
+    fn a_higher_version_displaces_a_lower_one() {
+        let memtable = MemTable::new();
+        let key = Bytes::from_static(b"k");
+
+        memtable
+            .insert_with_timestamp(key.clone(), Bytes::from_static(b"lower"), 3)
+            .unwrap();
+        memtable
+            .insert_with_timestamp(key.clone(), Bytes::from_static(b"higher"), 5000)
+            .unwrap();
+
+        let held = memtable.get(&key).unwrap();
+        assert_eq!(held.value.as_ref().unwrap().as_ref(), b"higher");
+    }
+
+    /// A rotation builds the replacement from the outgoing table's counter, so
+    /// the first version the new table issues is greater than the last the old
+    /// one issued. Without this, "higher wins" above silently means "older
+    /// wins" for every write that follows a rotation.
+    #[test]
+    fn a_rotation_keeps_issuing_from_the_same_counter() {
+        let first = MemTable::new();
+        let last_before = (0..8).map(|_| first.reserve_timestamp()).last().unwrap();
+
+        let second = MemTable::with_sequence(DEFAULT_MEMTABLE_SIZE, first.sequence());
+        let first_after = second.reserve_timestamp();
+
+        assert!(
+            first_after > last_before,
+            "a version issued after a rotation ({first_after}) must exceed one issued before it ({last_before})"
+        );
     }
 }

@@ -1,6 +1,8 @@
+pub mod extract;
 pub mod mcp;
 pub mod middleware;
 pub mod openapi;
+pub mod partition;
 pub mod routes;
 
 #[cfg(test)]
@@ -110,6 +112,16 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/tasks/:name/resume",
             post(routes::tasks::resume_task),
         )
+        // Partition maintenance/admin APIs. These are explicit cross-partition
+        // routes and require actor/purpose audit context in the query string.
+        .route(
+            "/api/v1/admin/partitions",
+            get(routes::partitions::list_partitions),
+        )
+        .route(
+            "/api/v1/admin/partitions/records",
+            get(routes::partitions::list_partition_records),
+        )
         // MCP — Streamable HTTP, mounted here (not under /api/v1) so it gets
         // the same auth/CORS/rate-limit layers as everything else below,
         // closing PROJECT_REVIEW.md §7.1 #1 (previously an unauthenticated
@@ -135,6 +147,10 @@ pub fn build_router(state: AppState) -> Router {
     );
 
     let api = api
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            partition::rest_partition_middleware,
+        ))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::auth_middleware,

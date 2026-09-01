@@ -291,3 +291,7 @@ test-results/
 .mcp.json
 .remember/
 crates/remem-server/.fastembed_cache
+
+# Local test-only model cache extracted from the runtime image (REM-78).
+.test-cache/
+.benchmark-data/

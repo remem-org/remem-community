@@ -1,3 +1,4 @@
+pub mod attr;
 pub mod error;
 pub mod index;
 pub mod query;

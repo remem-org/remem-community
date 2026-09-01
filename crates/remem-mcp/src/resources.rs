@@ -63,20 +63,22 @@ pub async fn read(params: &Value, client: &RememClient, request_id: &str) -> any
 
         "collections/recent" => {
             let data = client
-                .list_memories(limit, offset, None, None, request_id)
+                .list_memories(limit, offset, None, None, None, request_id)
                 .await?;
             let empty = vec![];
             let memories = data["memories"].as_array().unwrap_or(&empty);
             let count = memories.len();
             let result = json!({
                 "memories": memories.iter().map(summarise).collect::<Vec<_>>(),
-                "pagination": {"limit": limit, "offset": offset, "count": count, "total": data["total"]}
+                "pagination": {"limit": limit, "offset": offset, "count": count}
             });
             serde_json::to_string_pretty(&result)?
         }
 
         "collections/important" => {
-            let data = client.list_memories(200, 0, None, None, request_id).await?;
+            let data = client
+                .list_memories(200, 0, None, None, None, request_id)
+                .await?;
             let empty = vec![];
             let mut all: Vec<&Value> = data["memories"]
                 .as_array()

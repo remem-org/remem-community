@@ -117,7 +117,7 @@ impl SegmentHeader {
 /// Writes a segment file: header → data → footer (CRC32).
 ///
 /// Usage:
-/// ```ignore
+/// ```text
 /// let mut w = SegmentWriter::create(&path, header)?;
 /// w.write_all(&some_bytes)?;
 /// let crc32 = w.finish()?;
@@ -185,6 +185,24 @@ impl std::io::Write for SegmentWriter {
 // Reader
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Byte length of the fixed segment header.
+const HEADER_LEN: u64 = 36;
+/// Byte length of the `data_len` + `crc32` footer.
+const FOOTER_LEN: u64 = 12;
+
+/// Largest block `SegmentReader::verify` reads at a time.
+///
+/// The cap is the point: peak verification memory must not scale with segment
+/// size, or startup verification of a large deployment would trade the memory
+/// this change exists to bound.
+pub const VERIFY_BLOCK: usize = 64 * 1024;
+
+/// Buffer size `verify` uses for a data section of `data_len` bytes — capped at
+/// `VERIFY_BLOCK` however large the segment is.
+fn verify_buffer_len(data_len: u64) -> usize {
+    VERIFY_BLOCK.min(data_len.max(1) as usize)
+}
+
 /// Reads a segment file and verifies its CRC32 footer.
 #[derive(Debug)]
 pub struct SegmentReader {
@@ -225,6 +243,50 @@ impl SegmentReader {
         }
 
         Ok(Self { data })
+    }
+
+    /// Check a segment's stored CRC32 without materializing its contents.
+    ///
+    /// `open` buffers the whole data section to verify it, which is fine when
+    /// the caller wanted the bytes anyway. Startup integrity checking does not:
+    /// it needs to confirm every chunk of every partition is intact while
+    /// holding no more memory than one block, so that verifying a large
+    /// deployment costs the same peak memory as verifying a small one.
+    pub fn verify(path: &Path) -> Result<()> {
+        let file = std::fs::File::open(path).map_err(StorageError::Io)?;
+        let file_len = file.metadata().map_err(StorageError::Io)?.len();
+        let mut r = std::io::BufReader::new(file);
+
+        // Advance past the header; its fields come from the manifest.
+        let _header = SegmentHeader::read_from(&mut r)?;
+
+        let Some(data_len) = file_len.checked_sub(HEADER_LEN + FOOTER_LEN) else {
+            return Err(StorageError::invalid_format(path, "Segment file too short"));
+        };
+
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; verify_buffer_len(data_len)];
+        let mut remaining = data_len;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            r.read_exact(&mut buf[..want])?;
+            hasher.update(&buf[..want]);
+            remaining -= want as u64;
+        }
+        let computed = hasher.finalize();
+
+        let mut footer = [0u8; FOOTER_LEN as usize];
+        r.read_exact(&mut footer)?;
+        let stored_crc32 = u32::from_le_bytes(footer[8..12].try_into().unwrap());
+
+        if computed != stored_crc32 {
+            return Err(StorageError::invalid_format(
+                path,
+                format!("CRC32 mismatch: stored {stored_crc32:#010x}, computed {computed:#010x}"),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Return a cursor over the data section for deserialization.
@@ -272,6 +334,54 @@ mod tests {
 
         let r = SegmentReader::open(&path).unwrap();
         assert_eq!(r.data(), b"hello world");
+    }
+
+    #[test]
+    fn verify_accepts_an_intact_segment_and_rejects_a_flipped_byte() {
+        let dir = tempdir().unwrap();
+
+        let good = dir.path().join("good_0000.seg");
+        let mut w = SegmentWriter::create(&good, test_header()).unwrap();
+        w.write_bytes(b"payload that will be checked").unwrap();
+        w.finish().unwrap();
+        SegmentReader::verify(&good).expect("an intact segment must verify");
+
+        let bad = dir.path().join("bad_0000.seg");
+        let mut w = SegmentWriter::create(&bad, test_header()).unwrap();
+        w.write_bytes(b"payload that will be checked").unwrap();
+        w.finish().unwrap();
+        let mut bytes = std::fs::read(&bad).unwrap();
+        bytes[HEADER_LEN as usize] ^= 0xFF;
+        std::fs::write(&bad, &bytes).unwrap();
+
+        let err = SegmentReader::verify(&bad)
+            .expect_err("a flipped data byte must fail verification")
+            .to_string();
+        assert!(err.contains("CRC32"), "expected a CRC32 error, got: {err}");
+    }
+
+    #[test]
+    fn verify_peak_buffer_does_not_grow_with_segment_size() {
+        // The property startup verification depends on: however large the
+        // segment, verification holds at most one block.
+        assert_eq!(verify_buffer_len(u64::from(u32::MAX)), VERIFY_BLOCK);
+        assert_eq!(verify_buffer_len(VERIFY_BLOCK as u64 * 4_096), VERIFY_BLOCK);
+        // A small segment does not over-allocate.
+        assert_eq!(verify_buffer_len(64), 64);
+    }
+
+    #[test]
+    fn verify_reads_a_segment_larger_than_one_block() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large_0000.seg");
+
+        let payload = vec![0xA5u8; VERIFY_BLOCK * 3 + 17];
+        let mut w = SegmentWriter::create(&path, test_header()).unwrap();
+        w.write_bytes(&payload).unwrap();
+        w.finish().unwrap();
+
+        SegmentReader::verify(&path)
+            .expect("a multi-block segment must verify, including its partial tail block");
     }
 
     #[test]

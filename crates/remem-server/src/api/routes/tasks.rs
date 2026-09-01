@@ -109,9 +109,11 @@ pub async fn run_task(
     let lifecycle = std::sync::Arc::clone(&state.services.lifecycle);
     let registry = std::sync::Arc::clone(&state.services.task_registry);
     let engine = std::sync::Arc::clone(&state.services.engine);
+    let partition_set = crate::tasks::lifecycle::TaskPartitionSet::from_lifecycle(&lifecycle);
     let task_name = name.clone();
     tokio::spawn(async move {
-        crate::tasks::lifecycle::run_task(&task_name, lifecycle, registry, engine).await;
+        crate::tasks::lifecycle::run_task(&task_name, lifecycle, registry, engine, partition_set)
+            .await;
     });
 
     Ok((

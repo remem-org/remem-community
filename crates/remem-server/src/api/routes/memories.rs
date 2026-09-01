@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -7,10 +7,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::api::extract::ValidatedQuery;
 use crate::api::AppState;
 use crate::error::{AppError, Result};
+use crate::services::cursor::ListCursor;
 use crate::services::memory_manager::CreateOpts;
-use crate::services::types::{Memory, MemoryFilters, MemoryType, RelationshipType, SortBy};
+use crate::services::memory_manager::PageStart;
+use crate::services::types::{
+    Memory, MemoryFilters, MemoryType, RelationshipType, SortBy, SortOrder,
+};
 
 pub(crate) const MAX_CONTENT_BYTES: usize = 100_000;
 pub(crate) const MAX_TAGS: usize = 50;
@@ -58,6 +63,20 @@ fn deserialize_opt_sort_by<'de, D: Deserializer<'de>>(
     match s {
         None => Ok(None),
         Some(s) => SortBy::try_from(s.as_str())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+/// Deserialize an optional `SortOrder` from a string, returning a clear error
+/// on unknown values instead of propagating a generic 500.
+fn deserialize_opt_sort_order<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<SortOrder>, D::Error> {
+    let s: Option<String> = Option::deserialize(d)?;
+    match s {
+        None => Ok(None),
+        Some(s) => SortOrder::try_from(s.as_str())
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
@@ -158,6 +177,13 @@ pub struct ListQuery {
     /// Sort order: created_at (default) or accessed_at.
     #[serde(default, deserialize_with = "deserialize_opt_sort_by")]
     pub sort_by: Option<SortBy>,
+    /// Direction: `asc` (default) or `desc`. With a `cursor`, both directions
+    /// page; with an `offset`, only `asc` does -- see `validate_order_paging`.
+    #[serde(default, deserialize_with = "deserialize_opt_sort_order")]
+    pub order: Option<SortOrder>,
+    /// Continuation from a previous response's `next_cursor`. Resumes where
+    /// that page ended instead of counting past what came before it.
+    pub cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -172,10 +198,23 @@ pub struct DeleteQuery {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MemoryListResponse {
-    pub total: usize,
     pub limit: usize,
     pub offset: usize,
     pub memories: Vec<Memory>,
+    /// Pass back as `cursor` to continue. Absent once the listing is
+    /// exhausted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether further memories exist beyond this page.
+    pub has_more: bool,
+    /// Whether the listing stopped at its effort bound before it could fill
+    /// the page or establish that nothing remains.
+    ///
+    /// `false` with `has_more: false` means the listing is exhausted -- these
+    /// are all the matches. `true` means it gave up early and further matches
+    /// may exist; it cannot know. Same two fields, and the same meanings, the
+    /// search response uses.
+    pub truncated: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -185,6 +224,35 @@ pub struct DeleteResponse {
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+/// Which ways of saying "where does this page start" are allowed together.
+///
+/// `read-consistency` requires that paging never hands back a memory the
+/// caller already received. An offset cannot honour that descending: records
+/// are appended in creation order, so a descending offset boundary shifts by
+/// one for every memory written after the page was read, and the caller sees
+/// a duplicate. A cursor names a position rather than a count, and the
+/// ordering attribute never changes, so it holds in both directions -- which
+/// is why descending paging is offered through a cursor and refused through
+/// an offset.
+///
+/// Passing both is refused rather than resolved by precedence: silently
+/// preferring one would page from somewhere the caller did not ask for.
+fn validate_order_paging(order: SortOrder, offset: usize, cursor: Option<&str>) -> Result<()> {
+    if cursor.is_some() && offset > 0 {
+        return Err(AppError::Validation(
+            "cursor and offset are two ways to say where a page starts: pass one, not both".into(),
+        ));
+    }
+    if order == SortOrder::Descending && offset > 0 {
+        return Err(AppError::Validation(
+            "order=desc does not support a non-zero offset: page descending results with \
+             cursor instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) fn validate_create_memory(body: &CreateMemoryRequest) -> Result<()> {
     if body.content.trim().is_empty() {
@@ -257,17 +325,15 @@ pub(crate) async fn create_memory_core(
     // If the channel is full, discovery is skipped for this memory (not an error).
     let threshold = state.config.connections.auto_discovery_threshold;
     let top_k = state.config.connections.auto_discovery_top_k;
-    if let Err(e) =
-        state
-            .services
-            .discovery_tx
-            .try_send(crate::services::connection_manager::DiscoveryTask {
-                memory_id: memory.id,
-                embedding,
-                threshold,
-                top_k,
-            })
-    {
+    if let Err(e) = state.services.discovery_tx.try_send(
+        crate::services::connection_manager::DiscoveryTask::new(
+            &state.services.repo,
+            memory.id,
+            embedding,
+            threshold,
+            top_k,
+        )?,
+    ) {
         match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => {
                 state
@@ -321,7 +387,7 @@ pub async fn create_memory(
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Query(q): Query<GetQuery>,
+    ValidatedQuery(q): ValidatedQuery<GetQuery>,
 ) -> Result<Json<Memory>> {
     let mut memory = state.services.memory.get(id).await?;
     if q.include_connections.unwrap_or(false) {
@@ -392,7 +458,7 @@ pub async fn update_memory(
 pub async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Query(q): Query<DeleteQuery>,
+    ValidatedQuery(q): ValidatedQuery<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>> {
     state
         .services
@@ -419,6 +485,8 @@ pub async fn delete_memory(
         ("created_before" = Option<String>, Query, description = "RFC-3339 timestamp upper bound"),
         ("include_connections" = Option<bool>, Query, description = "Include connection lists"),
         ("sort_by" = Option<String>, Query, description = "Sort order: created_at (default) or accessed_at"),
+        ("order" = Option<String>, Query, description = "Direction: asc (default) or desc; with an offset, desc requires offset 0 -- page desc with a cursor"),
+        ("cursor" = Option<String>, Query, description = "Continuation from a previous response's next_cursor; cannot be combined with a non-zero offset"),
     ),
     responses(
         (status = 200, description = "Paginated memory list", body = MemoryListResponse),
@@ -427,23 +495,38 @@ pub async fn delete_memory(
 )]
 pub async fn list_memories(
     State(state): State<AppState>,
-    Query(q): Query<ListQuery>,
+    ValidatedQuery(q): ValidatedQuery<ListQuery>,
 ) -> Result<Json<MemoryListResponse>> {
     let limit = q.limit.unwrap_or(10).min(100);
     let offset = q.offset.unwrap_or(0);
     let sort_by = q.sort_by.unwrap_or_default();
+    let order = q.order.unwrap_or_default();
+    validate_order_paging(order, offset, q.cursor.as_deref())?;
+
+    let start = match q.cursor.as_deref() {
+        Some(token) => {
+            // Every rejection reads the same, whatever was wrong with it: a
+            // token for another tenant's scope must not be distinguishable
+            // from a malformed one, or the error itself answers questions
+            // about what exists elsewhere.
+            let cursor = ListCursor::decode(token)
+                .map_err(|_| AppError::Validation("cursor is not valid for this request".into()))?;
+            PageStart::After(cursor)
+        }
+        None => PageStart::Offset(offset),
+    };
 
     let filters = build_filters(&q);
     let include_connections = q.include_connections.unwrap_or(false);
 
-    let (mut memories, total) = state
+    let mut page = state
         .services
         .memory
-        .list(&filters, sort_by, limit, offset)
+        .list_page(&filters, sort_by, order, limit, start)
         .await?;
 
     if include_connections {
-        for mem in &mut memories {
+        for mem in &mut page.memories {
             mem.connections = state
                 .services
                 .memory
@@ -454,10 +537,12 @@ pub async fn list_memories(
     }
 
     Ok(Json(MemoryListResponse {
-        total,
         limit,
         offset,
-        memories,
+        memories: page.memories,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+        truncated: page.truncated,
     }))
 }
 
@@ -556,4 +641,58 @@ async fn process_graph_extraction(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod list_order_tests {
+    use super::*;
+
+    #[test]
+    fn ascending_pages_freely() {
+        assert!(validate_order_paging(SortOrder::Ascending, 0, None).is_ok());
+        assert!(validate_order_paging(SortOrder::Ascending, 500, None).is_ok());
+    }
+
+    #[test]
+    fn descending_is_allowed_on_the_first_page() {
+        assert!(validate_order_paging(SortOrder::Descending, 0, None).is_ok());
+    }
+
+    /// Records are appended in creation order, so a descending *offset*
+    /// boundary moves every time a memory is written. Paging past the first
+    /// page that way would hand back a record the caller already has, which
+    /// `read-consistency` forbids -- so the combination is refused rather
+    /// than silently served.
+    #[test]
+    fn descending_refuses_to_page_by_offset() {
+        let err = validate_order_paging(SortOrder::Descending, 1, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("desc"),
+            "the error names the order asked for: {msg}"
+        );
+        assert!(msg.contains("offset"), "and what conflicts with it: {msg}");
+        assert!(
+            msg.contains("cursor"),
+            "and points at the way that does work: {msg}"
+        );
+    }
+
+    /// A cursor names a position rather than a count, and the ordering
+    /// attribute never changes, so appending a memory cannot shift the
+    /// boundary. Descending therefore pages safely this way.
+    #[test]
+    fn descending_pages_with_a_cursor() {
+        assert!(validate_order_paging(SortOrder::Descending, 0, Some("token")).is_ok());
+    }
+
+    /// Two different answers to "where does this page start". Preferring one
+    /// silently would page from somewhere the caller did not ask for.
+    #[test]
+    fn a_cursor_and_an_offset_together_are_refused() {
+        let err = validate_order_paging(SortOrder::Ascending, 10, Some("token")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cursor"), "{msg}");
+        assert!(msg.contains("offset"), "{msg}");
+    }
 }

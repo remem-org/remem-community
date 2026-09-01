@@ -324,6 +324,17 @@ impl InvertedIndex {
         Ok(true)
     }
 
+    /// Whether this index can represent `token` at all.
+    ///
+    /// `add_tags` drops a tag that fails normalization, so a tag outside the
+    /// configured length bounds lives in the payload with no posting list of
+    /// its own. `search_and` returns nothing for such a token, which a caller
+    /// cannot tell apart from a genuine miss — so a caller narrowing a result
+    /// set through this index has to ask first.
+    pub fn can_represent(&self, token: &str) -> bool {
+        self.normalize_token(token).is_some()
+    }
+
     /// Search for documents containing a single token/tag
     pub fn search(&self, query: &str) -> Vec<Bytes> {
         let token = match self.normalize_token(query) {
@@ -437,12 +448,6 @@ impl InvertedIndex {
     pub fn get_tokens(&self, key: &[u8]) -> Vec<String> {
         let key_to_tokens = self.key_to_tokens.read();
         key_to_tokens.get(key).cloned().unwrap_or_default()
-    }
-
-    /// Check if a document key exists in the index
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        let key_to_tokens = self.key_to_tokens.read();
-        key_to_tokens.contains_key(key)
     }
 
     /// Get all unique tokens in the index
@@ -608,6 +613,14 @@ mod tests {
         assert!(index.is_empty());
         assert_eq!(index.len(), 0);
         assert!(index.search("test").is_empty());
+    }
+
+    #[test]
+    fn can_represent_rejects_a_token_over_the_length_bound() {
+        let index = InvertedIndex::new(InvertedIndexConfig::default());
+        let too_long = "a".repeat(101);
+        assert!(!index.can_represent(&too_long));
+        assert!(index.can_represent("rust"));
     }
 
     #[test]

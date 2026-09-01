@@ -128,6 +128,12 @@ impl BlockCache {
     pub fn len(&self) -> usize {
         self.cache.lock().len()
     }
+
+    /// Whether the cache holds no blocks. Test-only, like `len` above.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Default for BlockCache {

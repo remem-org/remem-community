@@ -15,7 +15,7 @@ instead of any kind of files you use all avalible tools for automatic memeory mo
 | `delete_memory` | Soft archive or hard delete |
 | `find_related` | Graph traversal to find related memories |
 | `promote_to_longterm` | Promote short-term → long-term |
-| `list_recent_memories` | List recently created/accessed memories |
+| `list_recent_memories` | List the most recently created memories, newest first |
 
 ALWAYS memorize worjk you are doing before quiting!
 
@@ -151,7 +151,8 @@ remem/
 ├── docker/                     # Per-service Dockerfiles
 ├── docs/
 │   ├── OPTIMISATIONS.md
-│   └── SEGMENTED_INDEXES.md
+│   ├── SEGMENTED_INDEXES.md
+│   └── STORAGE_FORMAT.md
 ├── scripts/
 │   ├── generate_memories.py         # Generate 100k test memories
 │   ├── release-edition.sh           # Publish snapshot to an edition repo
@@ -192,8 +193,12 @@ cargo build --release -p remem-mcp
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 # business/ is not compiled by the default build, so it needs its own pass —
-# CI runs both (docker/remem-server.Dockerfile, linter stage)
+# CI runs both (docker/remem-server.ci.Dockerfile, linter stage)
 cargo clippy --all-targets --features business -- -D warnings
+
+# Containerized CI checks (dev repo only; not shipped to edition repos)
+docker build --target linter -f docker/remem-server.ci.Dockerfile .
+docker build --target tester -f docker/remem-server.ci.Dockerfile .
 
 # One-time: keep the REM-85 bulk reformat out of `git blame`
 git config blame.ignoreRevsFile .git-blame-ignore-revs
@@ -268,7 +273,7 @@ MCP is the primary interface. All memory operations are MCP tools with LLM-optim
 Connections are first-class citizens. Auto-discovery on every store (similarity threshold 0.7, top-5). Typed relationships (related_to, caused_by, part_of, …). Graph traversal enables multi-hop discovery.
 
 ### Memory Lifecycle
-Short-term TTL → expiration. High access count → promotion to long-term. Long-term → importance decay. Similar memories → consolidation. Soft deletion (archiving) preferred.
+Short-term TTL → expiration. High access count → promotion to long-term. Long-term → importance decay. Similar memories → consolidation. Soft deletion (archiving) preferred. Archiving retires the memory from the similarity index, so it costs nothing on later searches; its record, timestamp entry and tags stay in place until `cleanup_archived` hard-deletes it past the retention age.
 
 ### Unified Storage
 All storage embedded in remem-server: HNSW (vector search), CSR Graph (relationships), LSM-tree KV (metadata). No external database.
@@ -334,4 +339,3 @@ docker-compose/Docker-image collapse to a single `remem-server` container
 `docs/superpowers/plans/2026-07-22-mcp-container-merge-cleanup.md`), plus this
 documentation sweep — matching the citation convention used for that
 roadmap's Phase 1 in [docs/PROJECT_REVIEW.md](docs/PROJECT_REVIEW.md) §2.4._
-

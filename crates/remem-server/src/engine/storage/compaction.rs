@@ -58,6 +58,12 @@ pub struct Level {
     pub total_size: u64,
 }
 
+impl Default for Level {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Level {
     /// Create a new empty level
     pub fn new() -> Self {
@@ -153,23 +159,37 @@ impl CompactionManager {
                 let path = entry.path();
 
                 if path.extension().map(|e| e == "sst").unwrap_or(false) {
-                    match SSTableReader::open_with_cache(
-                        &path,
-                        Some(Arc::clone(&self.cache)),
-                        level,
-                    ) {
-                        Ok(reader) => {
-                            levels[level].add_sstable(Arc::new(reader));
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to load SSTable {:?}: {}", path, e);
-                        }
-                    }
+                    let reader =
+                        SSTableReader::open_with_cache(&path, Some(Arc::clone(&self.cache)), level)
+                            .map_err(|e| {
+                                tracing::error!("Failed to load SSTable {:?}: {}", path, e);
+                                e
+                            })?;
+                    levels[level].add_sstable(Arc::new(reader));
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// The highest record version held in any SSTable.
+    ///
+    /// Read once, when opening a directory that carries no persisted
+    /// high-water mark — an upgrade, or a mark that went missing. It walks
+    /// record versions rather than payload content, and the result is
+    /// persisted so no later open repeats it.
+    pub fn max_record_version(&self) -> Result<u64> {
+        let levels = self.levels.read();
+        let mut highest = 0u64;
+        for level in levels.iter() {
+            for sst in &level.sstables {
+                for record in sst.iter() {
+                    highest = highest.max(record?.timestamp);
+                }
+            }
+        }
+        Ok(highest)
     }
 
     /// Add a new SSTable to level 0
@@ -401,8 +421,7 @@ impl CompactionManager {
         // Search L1+ (at most one file per level)
         for level in &levels[1..] {
             for sst in &level.sstables {
-                let meta = sst.meta();
-                if key >= meta.min_key.as_ref() && key <= meta.max_key.as_ref() {
+                if sst.meta().may_contain(key) {
                     if let Some(record) = sst.get(key)? {
                         return Ok(Some(record));
                     }
@@ -492,6 +511,7 @@ impl MergeIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::storage::sstable::format::HEADER_SIZE;
     use crate::engine::storage::sstable::SSTableWriter;
     use tempfile::tempdir;
 
@@ -553,6 +573,124 @@ mod tests {
             .unwrap()
             .expect("key1 should be findable after add_l0_sstable");
         assert_eq!(record.value, Some(Bytes::from("value1")));
+    }
+
+    #[test]
+    fn load_existing_refuses_corrupt_sstable() {
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+        let sst = create_sstable(dir.path(), 0, vec![("key1", "value1", 1)]);
+        let path = sst.path().to_path_buf();
+        drop(sst);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_SIZE + 1] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+
+        let manager =
+            CompactionManager::new(dir.path(), CompactionConfig::default(), Arc::clone(&cache))
+                .unwrap();
+
+        match manager.load_existing() {
+            Err(StorageError::ChecksumMismatch { file, .. }) => assert_eq!(file, path),
+            other => panic!("expected checksum mismatch, got {other:?}"),
+        }
+    }
+
+    /// The header stores only a 16-byte *prefix* of a file's min/max key, so a
+    /// lookup that compares a full key against those bounds as if they were
+    /// exact excludes every key that shares the prefix but runs longer.
+    ///
+    /// Harmless while keys differed early -- `memory:<uuid>` diverges by byte 8
+    /// -- and catastrophic once every key carries the same partition prefix:
+    /// `partition:default:default:memory:<uuid>` is identical for the first 16
+    /// bytes, so every payload lookup in L1+ was refused and every stored
+    /// memory read back as missing.
+    #[test]
+    fn get_finds_l1_keys_that_share_the_truncated_bound_prefix() {
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+
+        // All three share "partition:defaul" -- exactly 16 bytes.
+        let sst = create_sstable(
+            dir.path(),
+            1,
+            vec![
+                ("partition:default:default:memory:aaa", "va", 1),
+                ("partition:default:default:memory:bbb", "vb", 2),
+                ("partition:default:default:memory:ccc", "vc", 3),
+            ],
+        );
+        drop(sst);
+
+        let manager =
+            CompactionManager::new(dir.path(), CompactionConfig::default(), Arc::clone(&cache))
+                .unwrap();
+        manager.load_existing().unwrap();
+
+        let record = manager
+            .get(b"partition:default:default:memory:bbb")
+            .unwrap()
+            .expect("an L1 record must be findable when every key shares the stored bound prefix");
+        assert_eq!(record.value, Some(Bytes::from("vb")));
+    }
+
+    /// A key genuinely outside the file's range must still be answered without
+    /// reading it, so the prefix comparison must not degrade into "always look".
+    #[test]
+    fn get_still_skips_l1_files_whose_prefix_range_excludes_the_key() {
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+
+        let sst = create_sstable(dir.path(), 1, vec![("bbbb", "vb", 1), ("cccc", "vc", 2)]);
+        drop(sst);
+
+        let manager =
+            CompactionManager::new(dir.path(), CompactionConfig::default(), Arc::clone(&cache))
+                .unwrap();
+        manager.load_existing().unwrap();
+
+        assert!(manager.get(b"zzzz").unwrap().is_none());
+        assert!(manager.get(b"aaaa").unwrap().is_none());
+        assert_eq!(
+            manager.get(b"cccc").unwrap().unwrap().value,
+            Some(Bytes::from("vc"))
+        );
+    }
+
+    /// Merging resolves two copies of a key by keeping the higher version, and
+    /// that rule is left exactly as it was: the fix for reverted writes was to
+    /// make the numbers order writes, not to teach this site a special case.
+    ///
+    /// Worth pinning, because the rule is only correct while versions are
+    /// issued from one counter. They used to restart at 1 on every memtable
+    /// rotation, so a value written later carried a smaller number and this
+    /// merge discarded it -- `expire_short_term` re-archived the same ~19,189
+    /// memories on every run from May onward for exactly that reason. The
+    /// counter is now shared across rotations and seeded above the directory's
+    /// existing versions, so "higher" means "later" again.
+    #[test]
+    fn compaction_keeps_the_higher_version_of_a_duplicate_key() {
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+
+        let manager =
+            CompactionManager::new(dir.path(), CompactionConfig::default(), Arc::clone(&cache))
+                .unwrap();
+
+        // Deliberately added in the order that makes insertion order and
+        // version order disagree: the file added second holds the lower
+        // version, so a merge that trusted arrival order would pick it.
+        manager.add_l0_sstable(create_sstable(dir.path(), 0, vec![("k", "higher", 5000)]));
+        manager.add_l0_sstable(create_sstable(dir.path(), 0, vec![("k", "lower", 3)]));
+
+        manager.compact_level(0).unwrap();
+
+        assert_eq!(
+            manager.get(b"k").unwrap().unwrap().value,
+            Some(Bytes::from("higher")),
+            "merge must resolve a duplicate key by version, not by arrival order"
+        );
     }
 
     #[test]

@@ -21,11 +21,22 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(test)]
+static RANGE_VISITS: AtomicUsize = AtomicUsize::new(0);
+
 use crate::engine::error::{Result, StorageError};
 
 /// Configuration for the B+Tree index
 #[derive(Debug, Clone, Default)]
 pub struct BTreeConfig {}
+
+/// A position in an index's total order.
+///
+/// Entries are ordered by timestamp first and by key second. The key is what
+/// makes the order total: timestamps collide (several memories written in one
+/// millisecond), and a position that named only a timestamp could not say
+/// which of the colliding entries a page had already reached.
+pub type IndexPosition = (u64, Bytes);
 
 /// A value stored in the B+Tree (can have multiple keys per timestamp)
 #[derive(Debug, Clone)]
@@ -162,11 +173,172 @@ impl BTreeIndex {
 
         for (&ts, entry) in tree.range(start..=end) {
             for key in &entry.keys {
+                #[cfg(test)]
+                RANGE_VISITS.fetch_add(1, Ordering::Relaxed);
                 results.push((ts, key.clone()));
             }
         }
 
         results
+    }
+
+    /// Query a range, stopping after `limit` entries have been collected.
+    ///
+    /// Unlike callers that truncate [`Self::range`], this keeps the walk
+    /// bounded by the requested result count. The BTreeMap range iterator
+    /// remains ordered by timestamp, matching `range`'s contract.
+    pub fn range_limit(&self, start: u64, end: u64, limit: usize) -> Vec<(u64, Bytes)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let tree = self.tree.read();
+        let mut results = Vec::with_capacity(limit);
+        'timestamps: for (&ts, entry) in tree.range(start..=end) {
+            for key in &entry.keys {
+                #[cfg(test)]
+                RANGE_VISITS.fetch_add(1, Ordering::Relaxed);
+                results.push((ts, key.clone()));
+                if results.len() >= limit {
+                    break 'timestamps;
+                }
+            }
+        }
+        results
+    }
+
+    /// Visit a range in order, stopping when the visitor returns `false`.
+    /// The callback receives borrowed keys so callers can stop before cloning
+    /// or materializing the remainder of a large range.
+    pub(crate) fn visit_range<F>(&self, start: u64, end: u64, mut visitor: F)
+    where
+        F: FnMut(u64, &Bytes) -> bool,
+    {
+        let tree = self.tree.read();
+        'timestamps: for (&ts, entry) in tree.range(start..=end) {
+            for key in &entry.keys {
+                #[cfg(test)]
+                RANGE_VISITS.fetch_add(1, Ordering::Relaxed);
+                if !visitor(ts, key) {
+                    break 'timestamps;
+                }
+            }
+        }
+    }
+
+    /// Visit a range in the index's total order, optionally resuming after a
+    /// position, in either direction. The visitor stops the walk by returning
+    /// `false`.
+    ///
+    /// Keys sharing a timestamp are held in an unsorted `Vec` -- `remove` even
+    /// uses `swap_remove` -- so a walk that took them in stored order would put
+    /// a page boundary at a position that means nothing on the next call. They
+    /// are sorted here, per timestamp, which is what makes `(timestamp, key)` a
+    /// position a caller can resume from. The sort is over the keys of one
+    /// timestamp, not the range.
+    pub(crate) fn visit_range_ordered<F>(
+        &self,
+        start: u64,
+        end: u64,
+        after: Option<&IndexPosition>,
+        descending: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(u64, &Bytes) -> bool,
+    {
+        // Narrow the tree range by the resume position before walking: an
+        // ascending resume can never yield an earlier timestamp, and a
+        // descending one can never yield a later one.
+        let (start, end) = match after {
+            Some((ts, _)) if descending => (start, end.min(*ts)),
+            Some((ts, _)) => (start.max(*ts), end),
+            None => (start, end),
+        };
+        if start > end {
+            return;
+        }
+
+        // One timestamp's keys at a time. Collecting the range first would
+        // materialize everything the bound exists to avoid.
+        let mut keys: Vec<Bytes> = Vec::new();
+        let mut emit = |ts: u64, entry: &TimestampEntry| -> bool {
+            keys.clear();
+            keys.extend(entry.keys.iter().cloned());
+            keys.sort();
+            if descending {
+                keys.reverse();
+            }
+            for key in &keys {
+                if let Some((after_ts, after_key)) = after {
+                    let position = (ts, key);
+                    let boundary = (*after_ts, after_key);
+                    let past = if descending {
+                        position < boundary
+                    } else {
+                        position > boundary
+                    };
+                    if !past {
+                        continue;
+                    }
+                }
+                #[cfg(test)]
+                RANGE_VISITS.fetch_add(1, Ordering::Relaxed);
+                if !visitor(ts, key) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let tree = self.tree.read();
+        if descending {
+            for (&ts, entry) in tree.range(start..=end).rev() {
+                if !emit(ts, entry) {
+                    return;
+                }
+            }
+        } else {
+            for (&ts, entry) in tree.range(start..=end) {
+                if !emit(ts, entry) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// One page of the total order: at most `limit` entries from `start..=end`,
+    /// resuming after `after`, in the requested direction.
+    pub(crate) fn range_page(
+        &self,
+        start: u64,
+        end: u64,
+        after: Option<&IndexPosition>,
+        descending: bool,
+        limit: usize,
+    ) -> Vec<IndexPosition> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Reserve for the page, not for the caller's number: `limit` is a
+        // stopping condition and may legitimately be enormous.
+        let mut results = Vec::with_capacity(limit.min(1024));
+        self.visit_range_ordered(start, end, after, descending, |ts, key| {
+            results.push((ts, key.clone()));
+            results.len() < limit
+        });
+        results
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn reset_range_visit_count() {
+        RANGE_VISITS.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn range_visit_count() -> usize {
+        RANGE_VISITS.load(Ordering::Relaxed)
     }
 
     /// Get the minimum timestamp in the index
@@ -273,6 +445,111 @@ impl BTreeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk a whole range one page at a time, resuming from each page's last
+    /// position, and return everything seen.
+    fn walk_by_pages(
+        index: &BTreeIndex,
+        start: u64,
+        end: u64,
+        descending: bool,
+        page: usize,
+    ) -> Vec<IndexPosition> {
+        let mut seen = Vec::new();
+        let mut after: Option<IndexPosition> = None;
+        loop {
+            let batch = index.range_page(start, end, after.as_ref(), descending, page);
+            if batch.is_empty() {
+                return seen;
+            }
+            after = batch.last().cloned();
+            seen.extend(batch);
+        }
+    }
+
+    #[test]
+    fn an_ordered_walk_resumes_across_a_page_boundary_without_repeating_or_skipping() {
+        let index = BTreeIndex::new(BTreeConfig::default());
+        for i in 0..25u64 {
+            index.insert(i * 10, format!("key{i:02}")).unwrap();
+        }
+
+        let whole = index.range_page(0, u64::MAX, None, false, usize::MAX);
+        let paged = walk_by_pages(&index, 0, u64::MAX, false, 4);
+
+        assert_eq!(
+            paged, whole,
+            "paging must reconstruct the full walk exactly"
+        );
+        assert_eq!(paged.len(), 25);
+    }
+
+    #[test]
+    fn entries_sharing_a_timestamp_are_paged_without_loss() {
+        // The case a timestamp-only cursor cannot express: a page boundary
+        // landing among entries that share one timestamp.
+        let index = BTreeIndex::new(BTreeConfig::default());
+        for i in 0..9u64 {
+            index.insert(500, format!("same{i}")).unwrap();
+        }
+        index.insert(400, "before").unwrap();
+        index.insert(600, "after").unwrap();
+
+        let paged = walk_by_pages(&index, 0, u64::MAX, false, 2);
+        let mut keys: Vec<String> = paged
+            .iter()
+            .map(|(_, k)| String::from_utf8_lossy(k).into_owned())
+            .collect();
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+
+        assert_eq!(keys.len(), 11, "every entry is returned exactly once");
+        assert_eq!(unique.len(), 11, "no entry is returned twice");
+        keys.sort();
+        assert_eq!(keys.first().unwrap(), "after");
+        assert!(keys.contains(&"before".to_string()));
+    }
+
+    #[test]
+    fn a_descending_walk_yields_the_ascending_walk_reversed() {
+        let index = BTreeIndex::new(BTreeConfig::default());
+        // Deliberately includes tied timestamps: ties are where a direction
+        // reversal is easiest to get wrong.
+        for (ts, key) in [
+            (100, "a"),
+            (100, "b"),
+            (200, "c"),
+            (300, "d"),
+            (300, "e"),
+            (300, "f"),
+        ] {
+            index.insert(ts, key).unwrap();
+        }
+
+        let ascending = walk_by_pages(&index, 0, u64::MAX, false, 2);
+        let descending = walk_by_pages(&index, 0, u64::MAX, true, 2);
+        let mut reversed = ascending.clone();
+        reversed.reverse();
+
+        assert_eq!(descending, reversed);
+    }
+
+    #[test]
+    fn a_bounded_walk_visits_only_what_the_bound_asks_for() {
+        let index = BTreeIndex::new(BTreeConfig::default());
+        for i in 0..1000u64 {
+            index.insert(i, format!("key{i:04}")).unwrap();
+        }
+
+        BTreeIndex::reset_range_visit_count();
+        let page = index.range_page(0, u64::MAX, None, false, 10);
+        let visits = BTreeIndex::range_visit_count();
+
+        assert_eq!(page.len(), 10);
+        assert_eq!(
+            visits, 10,
+            "a bounded walk must not visit the rest of the range"
+        );
+    }
 
     #[test]
     fn test_empty_index() {

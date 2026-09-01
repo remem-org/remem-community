@@ -1,12 +1,14 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api::extract::ValidatedQuery;
 use crate::api::AppState;
 use crate::error::{AppError, Result};
+use crate::services::cursor::ConnectionCursor;
 use crate::services::types::{Connection, Memory, RelationshipType};
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -27,14 +29,24 @@ pub struct ConnectionResponse {
 pub struct ListConnectionsQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Continuation from a previous response's `next_cursor`.
+    pub cursor: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ListConnectionsResponse {
     pub connections: Vec<ConnectionResponse>,
-    pub total: usize,
     pub limit: usize,
-    pub offset: usize,
+    /// Pass back as `cursor` to continue. Absent once the listing is
+    /// exhausted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether further connections exist beyond this page.
+    pub has_more: bool,
+    /// Whether the walk stopped at its effort bound before it could fill the
+    /// page or establish that nothing remains. Same meaning as on the memory
+    /// listing and the search response.
+    pub truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +59,14 @@ pub struct RelatedQuery {
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct RelatedResponse {
     pub memory_id: Uuid,
+    /// The memory the traversal started from.
+    ///
+    /// Present so a caller rendering a graph has everything it needs from
+    /// one request. Fetching the centre separately would work, but fetching
+    /// a memory by id is a recall -- drawing a graph would then reinforce
+    /// the very memories it is only displaying. `None` when the memory does
+    /// not exist, which is also when `related` is empty.
+    pub memory: Option<Memory>,
     pub related: Vec<RelatedItem>,
 }
 
@@ -67,7 +87,7 @@ pub struct DeleteConnectionResponse {
     path = "/api/v1/connections",
     params(
         ("limit" = Option<usize>, Query, description = "Max results (default 50, max 500)"),
-        ("offset" = Option<usize>, Query, description = "Pagination offset"),
+        ("cursor" = Option<String>, Query, description = "Continuation from a previous response's next_cursor"),
     ),
     responses(
         (status = 200, description = "Paginated connection list", body = ListConnectionsResponse),
@@ -76,12 +96,31 @@ pub struct DeleteConnectionResponse {
 )]
 pub async fn list_connections(
     State(state): State<AppState>,
-    Query(q): Query<ListConnectionsQuery>,
+    ValidatedQuery(q): ValidatedQuery<ListConnectionsQuery>,
 ) -> Result<Json<ListConnectionsResponse>> {
     let limit = q.limit.unwrap_or(50).min(500);
-    let offset = q.offset.unwrap_or(0);
-    let (pairs, total) = state.services.connection.list_all(limit, offset).await?;
-    let connections: Vec<ConnectionResponse> = pairs
+    if q.offset.is_some_and(|o| o > 0) {
+        return Err(AppError::Validation(
+            "connections are paged with cursor, not offset: pass the next_cursor from the \
+             previous page"
+                .into(),
+        ));
+    }
+    let start = match q.cursor.as_deref() {
+        Some(token) => Some(
+            ConnectionCursor::decode(token)
+                .map_err(|_| AppError::Validation("cursor is not valid for this request".into()))?,
+        ),
+        None => None,
+    };
+
+    let page = state
+        .services
+        .connection
+        .list_page(limit, start, state.config.search.list_max_factor)
+        .await?;
+    let connections: Vec<ConnectionResponse> = page
+        .connections
         .into_iter()
         .map(|(src, conn)| ConnectionResponse {
             source_id: src,
@@ -90,9 +129,10 @@ pub async fn list_connections(
         .collect();
     Ok(Json(ListConnectionsResponse {
         connections,
-        total,
         limit,
-        offset,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+        truncated: page.truncated,
     }))
 }
 
@@ -153,7 +193,11 @@ pub async fn delete_connection(
     State(state): State<AppState>,
     Path((source_id, target_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<DeleteConnectionResponse>> {
-    state.services.connection.delete(source_id, target_id)?;
+    state
+        .services
+        .connection
+        .delete(source_id, target_id)
+        .await?;
     Ok(Json(DeleteConnectionResponse {
         success: true,
         message: "connection removed",
@@ -170,7 +214,7 @@ pub async fn delete_connection(
         ("limit" = Option<usize>, Query, description = "Max results (default 20, max 100)"),
     ),
     responses(
-        (status = 200, description = "Related memories with connection metadata", body = RelatedResponse),
+        (status = 200, description = "The centre memory plus related memories with connection metadata. Traversal records no recall — neither for the centre nor for the memories reached.", body = RelatedResponse),
         (status = 404, description = "Memory not found", body = ErrorResponse),
     ),
     tag = "memories"
@@ -178,7 +222,7 @@ pub async fn delete_connection(
 pub async fn find_related(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Query(q): Query<RelatedQuery>,
+    ValidatedQuery(q): ValidatedQuery<RelatedQuery>,
 ) -> Result<Json<RelatedResponse>> {
     let depth = q.depth.unwrap_or(1).min(5);
     let types: Vec<RelationshipType> = q
@@ -206,8 +250,20 @@ pub async fn find_related(
         .map(|(memory, connection)| RelatedItem { memory, connection })
         .collect();
 
+    // Read through the repository rather than `MemoryManager::get`: this is
+    // a traversal, and a traversal records no recall -- for the centre any
+    // more than for the memories it reaches.
+    let memory = state
+        .services
+        .repo
+        .load(id)
+        .await?
+        .filter(|stored| !stored.archived)
+        .map(|stored| stored.into_api(Vec::new()));
+
     Ok(Json(RelatedResponse {
         memory_id: id,
+        memory,
         related,
     }))
 }

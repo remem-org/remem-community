@@ -91,16 +91,28 @@ impl TaskSupervisor {
                             None => break, // channel closed — all senders dropped (server shutting down)
                             Some(t) => {
                                 match conn
-                                    .auto_discover(t.memory_id, &t.embedding, t.threshold, t.top_k)
+                                    .auto_discover_in_scope(
+                                        t.source_key.clone(),
+                                        &t.embedding,
+                                        t.threshold,
+                                        t.top_k,
+                                        &t.read_scope,
+                                    )
                                     .await
                                 {
                                     Ok(conns) => tracing::debug!(
                                         memory_id = %t.memory_id,
+                                        tenant = %t.read_scope.tenant(),
+                                        partitions = ?t.read_scope.partitions(),
+                                        write_partition = %t.write_target.partition(),
                                         count = conns.len(),
                                         "auto_discover completed"
                                     ),
                                     Err(e) => tracing::warn!(
                                         memory_id = %t.memory_id,
+                                        tenant = %t.read_scope.tenant(),
+                                        partitions = ?t.read_scope.partitions(),
+                                        write_partition = %t.write_target.partition(),
                                         error = %e,
                                         "auto_discover failed"
                                     ),

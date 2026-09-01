@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::api::partition::EffectivePartition;
 use crate::api::routes::memories::{
     create_memory_core, validate_create_memory, CreateMemoryRequest, UpdateMemoryRequest,
     MAX_CONTENT_BYTES, MAX_TAGS,
@@ -9,7 +10,9 @@ use crate::api::routes::memories::{
 use crate::api::AppState;
 use crate::services::memory_manager::UpdatePatch;
 use crate::services::search_engine::SearchQuery;
-use crate::services::types::{MemoryFilters, MemoryType, RelationshipType, SearchType, SortBy};
+use crate::services::types::{
+    MemoryFilters, MemoryType, RelationshipType, SearchType, SortBy, SortOrder,
+};
 
 /// Return the MCP `tools/list` result value. Schema is identical to
 /// `crates/remem-mcp/src/tools.rs::list()` except `update_memory` now
@@ -69,7 +72,7 @@ pub fn list() -> Value {
             },
             {
                 "name": "search_memories",
-                "description": "Search memories using semantic, keyword, or hybrid search. When related_to is provided, memories connected in the graph to that memory ID are boosted in results.",
+                "description": "Search memories using semantic, keyword, or hybrid search. When related_to is provided, memories connected in the graph to that memory ID are boosted in results. Each result carries a `score` from 0 to 1 measuring how well it matches the query — comparable across all search types, so it can be used to judge relevance and discard weak matches. `matched` lists which indexes surfaced the result (vector = semantic similarity, tag = tag match, content = text match, graph = connected to the related_to memory rather than matching the query itself). A `truncated` field of true means the search stopped at its internal limit before finding everything that matches, so more matching memories may exist beyond what is returned — do not treat such a result as a complete picture; narrow the query or add filters and search again. When it is false the result set is complete for the requested limit.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -77,6 +80,7 @@ pub fn list() -> Value {
                         "search_type": {"type": "string", "enum": ["semantic", "keyword", "hybrid"]},
                         "limit": {"type": "integer"},
                         "related_to": {"type": "string", "description": "UUID of a memory whose graph neighbours should be boosted in results"},
+                        "explain": {"type": "boolean", "description": "Return the full per-index breakdown behind each ranking (native scores, ranks and evidence) instead of the compact `matched` list. Defaults to false."},
                         "filters": {
                             "type": "object",
                             "properties": {
@@ -158,13 +162,13 @@ pub fn list() -> Value {
             },
             {
                 "name": "list_recent_memories",
-                "description": "List recently created or accessed memories.",
+                "description": "List the most recently created memories, newest first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "limit": {"type": "integer"},
                         "memory_type": {"type": "string", "enum": ["short_term", "long_term"]},
-                        "sort_by": {"type": "string", "enum": ["created_at", "accessed_at"]}
+                        "sort_by": {"type": "string", "enum": ["created_at"]}
                     }
                 }
             }
@@ -173,7 +177,14 @@ pub fn list() -> Value {
 }
 
 /// Dispatch a `tools/call` request against `AppServices` directly (no HTTP hop).
-pub async fn call(params: &Value, state: &AppState) -> anyhow::Result<Value> {
+pub async fn call(
+    params: &Value,
+    state: &AppState,
+    partition: &EffectivePartition,
+) -> anyhow::Result<Value> {
+    debug_assert_eq!(partition.read_scope(), state.services.repo.read_scope());
+    debug_assert_eq!(partition.write_target(), state.services.repo.write_target());
+
     let name = params["name"]
         .as_str()
         .ok_or_else(|| anyhow!("missing tool name"))?;
@@ -290,19 +301,74 @@ async fn search_memories(state: &AppState, args: &Value) -> anyhow::Result<Value
         related_to,
     };
 
-    let results = state.services.search.search(&query).await?;
+    let outcome = state.services.search.search(&query).await?;
+    let truncated = outcome.truncated;
+    let results = outcome.results;
     let count = results.len();
+    let explain = args
+        .get("explain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let results = shape_results_for_llm(serde_json::to_value(results)?, explain);
+
     Ok(json!({
         "success": true,
         "query": query_text,
         "results_count": count,
         "results": results,
-        "summary": if count > 0 {
-            format!("Found {count} memories for '{query_text}'")
-        } else {
-            format!("No memories found for '{query_text}'")
+        "truncated": truncated,
+        // The summary is what an agent actually reads, so it has to carry the
+        // same caveat as the field. Stating a bare count after a search that
+        // stopped early reads as exhaustive, and an agent that believes it
+        // will answer "everything I know about X" from a partial recall
+        // (REM-78).
+        "summary": match (count, truncated) {
+            (0, false) => format!("No memories found for '{query_text}'"),
+            (0, true) => format!(
+                "No memories found for '{query_text}' within the search limit; \
+                 matches may exist beyond it. Narrow the query or add filters."
+            ),
+            (_, false) => format!("Found {count} memories for '{query_text}'"),
+            (_, true) => format!(
+                "Found {count} memories for '{query_text}', but the search stopped \
+                 at its limit before finding everything — more matches may exist."
+            ),
         }
     }))
+}
+
+/// Trim search results for LLM consumption.
+///
+/// Every field here is context the model pays for on each search, so the
+/// default keeps `score` (which it can act on) and a compact `matched` list of
+/// contributing indexes, and drops the per-source evidence. `explain: true`
+/// returns the full breakdown. Kept identical to the copy in
+/// `crates/remem-mcp/src/tools.rs`.
+fn shape_results_for_llm(results: Value, explain: bool) -> Value {
+    if explain {
+        return results;
+    }
+    let Value::Array(items) = results else {
+        return results;
+    };
+    Value::Array(
+        items
+            .into_iter()
+            .map(|mut item| {
+                let matched: Vec<Value> = item
+                    .get("sources")
+                    .and_then(|s| s.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.get("source").cloned()).collect())
+                    .unwrap_or_default();
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("sources");
+                    obj.remove("fused_score");
+                    obj.insert("matched".to_string(), Value::Array(matched));
+                }
+                item
+            })
+            .collect(),
+    )
 }
 
 async fn get_memory(state: &AppState, args: &Value) -> anyhow::Result<Value> {
@@ -437,13 +503,13 @@ async fn list_recent_memories(state: &AppState, args: &Value) -> anyhow::Result<
         memory_type,
         ..Default::default()
     };
-    let (memories, total) = state
+    let memories = state
         .services
         .memory
-        .list(&filters, sort_by, limit, 0)
+        .list(&filters, sort_by, SortOrder::Descending, limit, 0)
         .await?;
     let count = memories.len();
-    Ok(json!({"success": true, "count": count, "total": total, "memories": memories}))
+    Ok(json!({"success": true, "count": count, "memories": memories}))
 }
 
 #[cfg(test)]
@@ -483,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn list_recent_memories_schema_advertises_sort_by() {
+    fn list_recent_memories_schema_offers_creation_order_only() {
         let list = list();
         let tools = list["tools"].as_array().unwrap();
         let lrm = tools
@@ -493,8 +559,12 @@ mod tests {
         let sort_by_enum = lrm["inputSchema"]["properties"]["sort_by"]["enum"]
             .as_array()
             .unwrap();
-        assert!(sort_by_enum.contains(&json!("created_at")));
-        assert!(sort_by_enum.contains(&json!("accessed_at")));
+        assert_eq!(
+            sort_by_enum,
+            &vec![json!("created_at")],
+            "listing orders by creation time only -- an ordering key has to be \
+             immutable, and recency of retrieval was changed by reading"
+        );
     }
 
     #[test]

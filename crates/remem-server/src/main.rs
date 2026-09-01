@@ -1,28 +1,20 @@
-mod api;
-#[cfg(feature = "business")]
-mod business;
-mod config;
-mod embedding;
-mod engine;
-mod error;
-mod services;
-mod tasks;
-
 use std::sync::Arc;
 
 use clap::Parser;
+use remem_server::{
+    api::{build_router, AppState},
+    config::{self, Args},
+    engine::{
+        self,
+        storage::engine::{
+            EngineConfig, GraphIndexConfig, TagIndexConfig, TimeSeriesConfig, VectorConfig,
+        },
+        StorageEngine,
+    },
+    services, tasks,
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-use engine::{
-    storage::engine::{
-        EngineConfig, GraphIndexConfig, TagIndexConfig, TimeSeriesConfig, VectorConfig,
-    },
-    StorageEngine,
-};
-
-use api::{build_router, AppState};
-use config::Args;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
         sync_writes: cfg.storage.sync_writes,
         checkpoint_interval: std::time::Duration::from_secs(cfg.storage.checkpoint_interval_secs),
         max_wal_size: cfg.storage.max_wal_size_mb * 1024 * 1024,
+        text_field: cfg.storage.text_field.clone(),
+        default_partition: cfg.storage.default_partition.clone(),
         vector: VectorConfig {
             enabled: true,
             dimension: cfg.vector.dimension,
@@ -80,6 +74,10 @@ async fn main() -> anyhow::Result<()> {
             hnsw_ef_construction: cfg.vector.hnsw_ef_construction,
             hnsw_ef_search: cfg.vector.hnsw_ef_search,
             metric: engine::util::DistanceMetric::L2,
+            hnsw_resident_budget_bytes: cfg
+                .vector
+                .hnsw_resident_budget_mb
+                .map(|mb| mb * 1024 * 1024),
         },
         graph: GraphIndexConfig {
             enabled: true,
@@ -91,6 +89,34 @@ async fn main() -> anyhow::Result<()> {
             lowercase: true,
             ..Default::default()
         },
+        attr_schema: Some(services::attrs::memory_schema()),
+        // Only exercised by a post-open backfill of records written before
+        // the attribute store existed (`StorageEngine::new` ->
+        // `backfill_attrs_if_marked`); see `EngineConfig::attr_project`'s
+        // doc comment for why the engine takes this as an opaque function
+        // rather than importing `StoredMemory` itself.
+        attr_project: Some(Arc::new(|bytes: &[u8]| {
+            serde_json::from_slice::<services::types::StoredMemory>(bytes)
+                .ok()
+                .map(|stored| services::attrs::project(&stored))
+        })),
+        // An archived memory belongs in no browsing order: it is invisible to
+        // callers, and leaving its entry in place makes every listing page
+        // pay for records the deployment has already retired. Steady-state
+        // archiving retires the entry as it happens; this tells the upgrade
+        // backfill the same rule for records archived before there was
+        // anything to record it in.
+        attr_index_exempt: Some(Arc::new(|row: &crate::engine::attr::row::AttrRow| {
+            let archived = matches!(
+                row.get(services::attrs::SLOT_ARCHIVED),
+                Some(crate::engine::attr::value::AttrValue::Bool(true))
+            );
+            if archived {
+                vec![services::attrs::SLOT_CREATED_AT]
+            } else {
+                Vec::new()
+            }
+        })),
         ..Default::default()
     };
 

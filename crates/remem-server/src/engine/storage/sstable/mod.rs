@@ -22,7 +22,7 @@
 //! ```
 
 mod block;
-mod format;
+pub(crate) mod format;
 mod reader;
 mod writer;
 

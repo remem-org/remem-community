@@ -51,6 +51,9 @@ subtle = "2"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
+# Already in the dependency tree at this version; taken directly for the
+# listing continuation token.
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 bytes = "1"
@@ -85,7 +88,16 @@ name = "download-model"
 path = "src/bin/download_model.rs"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 tokio-test = "0.4"
 tempfile = "3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "write_path"
+harness = false
+
+[[bench]]
+name = "vector_retrieval"
+harness = false

@@ -13,12 +13,17 @@ use crate::api::routes::{
         CreateMemoryRequest, DeleteResponse, ExtractedEntity, ExtractedRelationship,
         GraphExtraction, MemoryListResponse, UpdateMemoryRequest,
     },
+    partitions::{
+        MaintenanceAudit, PartitionAccounting, PartitionInventoryResponse, PartitionRecordRef,
+        PartitionRecordTraversalResponse,
+    },
     search::{SearchRequest, SearchResponse},
     tasks::{PauseTaskResponse, RunTaskResponse, TaskHistoryResponse, TaskListResponse},
 };
 use crate::error::ErrorResponse;
 use crate::services::types::{
-    Connection, Memory, MemoryType, Metadata, RelationshipType, SearchResult,
+    Connection, Memory, MemoryType, Metadata, RelationshipType, ResultSource, SearchResult,
+    SourceName,
 };
 use crate::tasks::registry::{RunLog, TaskStatus};
 
@@ -50,9 +55,12 @@ use crate::tasks::registry::{RunLog, TaskStatus};
         crate::api::routes::tasks::get_task_history,
         crate::api::routes::tasks::pause_task,
         crate::api::routes::tasks::resume_task,
+        crate::api::routes::partitions::list_partitions,
+        crate::api::routes::partitions::list_partition_records,
     ),
     components(schemas(
         Memory, Metadata, Connection, MemoryType, RelationshipType, SearchResult,
+        ResultSource, SourceName,
         CreateMemoryRequest, UpdateMemoryRequest, DeleteResponse,
         GraphExtraction, ExtractedEntity, ExtractedRelationship,
         MemoryListResponse,
@@ -61,6 +69,8 @@ use crate::tasks::registry::{RunLog, TaskStatus};
         RelatedResponse, RelatedItem, DeleteConnectionResponse,
         HealthResponse, ReadyResponse, StorageReadiness, StatsResponse, Stats, DeepHealthResponse, DeepHealthCheck,
         TaskListResponse, RunTaskResponse, TaskHistoryResponse, PauseTaskResponse,
+        MaintenanceAudit, PartitionAccounting, PartitionInventoryResponse,
+        PartitionRecordRef, PartitionRecordTraversalResponse,
         TaskStatus, RunLog,
         ErrorResponse,
     )),
@@ -68,6 +78,7 @@ use crate::tasks::registry::{RunLog, TaskStatus};
         (name = "memories", description = "Memory CRUD, search, and lifecycle"),
         (name = "connections", description = "Connection management and graph traversal"),
         (name = "tasks", description = "Background task monitoring and control"),
+        (name = "admin", description = "Maintenance and cross-partition administration"),
         (name = "system", description = "Health, stats, and system information"),
     ),
 )]

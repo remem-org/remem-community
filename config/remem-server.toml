@@ -19,6 +19,8 @@ data_dir = "/var/lib/remem"
 sync_writes = true
 checkpoint_interval_secs = 300     # flush indexes to disk every 5 minutes
 max_wal_size_mb = 256              # trigger checkpoint when WAL exceeds this
+text_field = "content"             # record field that keyword search scans
+default_partition = "default"      # legacy single-tenant partition until auth scopes are configured
 
 # =============================================================================
 # Vector Index (HNSW)
@@ -30,6 +32,22 @@ dimension = 384                    # all-MiniLM-L6-v2 output dimension
 hnsw_m = 16                        # connections per node (16–64 recommended)
 hnsw_ef_construction = 200         # build quality (100–400 recommended)
 hnsw_ef_search = 50                # search quality (40–200 recommended)
+
+# Ceiling on the partition vector indexes held in memory at once.
+#
+# Unset (the default) means a partition's index, once loaded, is never released
+# to reclaim memory. That is the right setting while a deployment has one
+# partition, which is every deployment until namespaces exist.
+#
+# Set it when partition count is high enough that holding every index is a
+# problem. It is a target, not a limit: a partition a request needs is always
+# served, and the budget is restored afterwards by releasing the least recently
+# used partitions. If the set of partitions in active use does not fit, the
+# server keeps working but pays repeated reloads — watch
+# `remem_vector_index_loads_total` and `remem_vector_index_evictions_total`
+# climbing together, which is what that looks like from outside.
+#
+# hnsw_resident_budget_mb = 512
 
 # =============================================================================
 # Embedding Service (fastembed-rs, ONNX Runtime)
@@ -47,6 +65,22 @@ cache_size = 10000                 # number of embeddings to keep in LRU cache
 auto_discovery_threshold = 0.7     # minimum similarity to create a SimilarTo edge
 auto_discovery_top_k = 5           # maximum connections created per new memory
 
+[search]
+# How far a filtered search widens before giving up, as a multiple of the
+# number of results requested.
+#
+# A filter rejects candidates, and the only way to make up the shortfall is to
+# ask the index for more. Unbounded, a filter matching a negligible slice of
+# the corpus turns one search into a walk of everything the caller may see —
+# under concurrent load that is one tenant's query degrading everyone else's,
+# not merely a slow response. Bounded, such a search returns what it found and
+# marks the result `truncated` so the caller can tell "this is everything" from
+# "this is as far as we looked".
+#
+# Raise it to trade latency for completeness on very selective filters; lower
+# it to cap the cost of the worst query a caller can ask for.
+widen_max_factor = 32
+
 # =============================================================================
 # Background Task Intervals & Worker Configuration
 # =============================================================================
@@ -58,6 +92,12 @@ active_forgetting_secs = 86400
 consolidate_similar_secs = 604800   # weekly
 cleanup_archived_secs = 2592000     # monthly (30 days)
 discover_connections_secs = 3600    # hourly
+# How long a recall may stay unpersisted. Recall metadata (access_count,
+# accessed_at, last_recalled_at and the health boost a retrieval grants) is
+# telemetry, not authored content: it is batched instead of written on every
+# retrieval, so an unclean shutdown can lose up to this many seconds of it.
+# Memory content, tags, importance and connections are always durable.
+flush_recall_secs = 30
 discovery_workers = 2
 discovery_queue_size = 10000
 # When true, active_forgetting hard-deletes memories whose health reaches

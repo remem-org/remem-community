@@ -101,7 +101,10 @@ pub(crate) async fn compute_stats(state: &AppState) -> Result<Stats> {
     // limit returns every entry regardless of count, avoiding the truncation bug
     // that time_latest(btree_count + 64) introduced when btree_count lagged the
     // actual number of entries (e.g. older short-term memories were silently dropped).
-    let entries = state.services.engine.time_range_query(0, u64::MAX, None)?;
+    let entries = state
+        .services
+        .engine
+        .maintenance_time_range_query(0, u64::MAX, None)?;
 
     let mut total = 0usize;
     let mut long_term = 0usize;
@@ -136,7 +139,7 @@ pub(crate) async fn compute_stats(state: &AppState) -> Result<Stats> {
     // resurrects KV entries whose BTree timestamps were durably removed.
     let mut total_connections = 0usize;
     for key_bytes in &active_entry_keys {
-        let neighbors = state.services.engine.get_neighbors(key_bytes)?;
+        let neighbors = state.services.engine.maintenance_get_neighbors(key_bytes)?;
         for (target, _, _, _) in neighbors {
             let Ok(tgt) = state.services.repo.load_by_key(target.as_ref()).await else {
                 continue;
@@ -210,7 +213,12 @@ pub async fn deep_health(State(state): State<AppState>) -> (StatusCode, Json<Dee
         }
     } else {
         let zero_vec = vec![0.0f32; 384];
-        match state.services.engine.vector_search(&zero_vec, 1).await {
+        match state
+            .services
+            .engine
+            .vector_search_partitioned(state.services.repo.read_scope(), &zero_vec, 1, None)
+            .await
+        {
             Ok(_) => DeepHealthCheck {
                 ok: true,
                 detail: None,

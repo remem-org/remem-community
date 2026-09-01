@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::api::routes::health::compute_stats;
 use crate::api::AppState;
-use crate::services::types::{Memory, MemoryFilters, SortBy};
+use crate::services::types::{Memory, MemoryFilters, SortBy, SortOrder};
 
 pub fn list() -> Value {
     json!({
@@ -43,24 +43,36 @@ pub async fn read(params: &Value, state: &AppState) -> anyhow::Result<Value> {
         }
 
         "collections/recent" => {
-            let (memories, total) = state
+            let memories = state
                 .services
                 .memory
-                .list(&MemoryFilters::default(), SortBy::CreatedAt, limit, offset)
+                .list(
+                    &MemoryFilters::default(),
+                    SortBy::CreatedAt,
+                    SortOrder::Ascending,
+                    limit,
+                    offset,
+                )
                 .await?;
             let count = memories.len();
             let result = json!({
                 "memories": memories.iter().map(summarise).collect::<Vec<_>>(),
-                "pagination": {"limit": limit, "offset": offset, "count": count, "total": total}
+                "pagination": {"limit": limit, "offset": offset, "count": count}
             });
             serde_json::to_string_pretty(&result)?
         }
 
         "collections/important" => {
-            let (mut memories, _) = state
+            let mut memories = state
                 .services
                 .memory
-                .list(&MemoryFilters::default(), SortBy::CreatedAt, 200, 0)
+                .list(
+                    &MemoryFilters::default(),
+                    SortBy::CreatedAt,
+                    SortOrder::Ascending,
+                    200,
+                    0,
+                )
                 .await?;
             memories.sort_by(|a, b| {
                 b.metadata

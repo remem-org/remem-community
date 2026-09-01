@@ -289,14 +289,30 @@ it. `200` with `{"success": true, "message": "memory deleted"}`, `404` if not fo
 | Query param | Notes |
 |---|---|
 | `limit` | default 10, max 100 |
-| `offset` | default 0 |
+| `cursor` | continue where the previous page ended — pass the `next_cursor` you were given |
+| `offset` | default 0. The older way to page; cannot be combined with `cursor` |
 | `memory_type` | `short_term` \| `long_term` |
 | `tags` | comma-separated, e.g. `tags=rust,async` |
 | `min_importance`, `max_importance` | 0.0–1.0 |
 | `created_after`, `created_before` | RFC-3339, e.g. `2024-01-01T00:00:00Z` |
+| `order` | `asc` (default) or `desc`. `desc` pages with `cursor`; `desc` with a non-zero `offset` is rejected |
 | `include_connections` | default `false` |
 
-→ `200` with `{"total": n, "limit": n, "offset": n, "memories": [Memory, ...]}`.
+→ `200` with `{"limit": n, "offset": n, "memories": [Memory, ...], "next_cursor": "…", "has_more": bool, "truncated": bool}`.
+
+**There is no total.** Counting every match means walking every match, so the
+cost of one page would grow with everything you have ever stored. Read the two
+flags instead:
+
+| `has_more` | `truncated` | What it means |
+|---|---|---|
+| `false` | `false` | That was everything. |
+| `true` | `false` | More to come — pass `next_cursor`. |
+| `true` | `true` | The server stopped at its effort bound. More may exist; it cannot say. Narrow the filter, or continue from `next_cursor`. |
+
+Page with `cursor` rather than `offset` where you can: a cursor names a position,
+so page ten costs the same as page one, and memories written mid-sequence cannot
+shift the boundary and hand you something twice.
 
 ### Search
 
@@ -328,7 +344,7 @@ managed directly:
 
 | Method & Path | Description |
 |---|---|
-| `GET /api/v1/connections?limit=50&offset=0` | List all connections (max limit 500) → `{"connections": [{"source_id", "connection": Connection}], "total", "limit", "offset"}` |
+| `GET /api/v1/connections?limit=50&cursor=` | One page of connections (max limit 500) → `{"connections": [{"source_id", "connection": Connection}], "limit", "next_cursor", "has_more", "truncated"}`. Cursor-paged, with the same three-state meaning as the memory listing above; no `total` and no `offset` |
 | `POST /api/v1/connections` | Create one: body `{"source_id", "target_id", "relationship_type"?, "strength"?}` (`relationship_type` defaults to `related_to`; one of `related_to`, `caused_by`, `part_of`, `references`, `contradicts`, `supports`, `similar_to`, `derived_from`) → `200` with `{"source_id", "connection"}` |
 | `DELETE /api/v1/connections/{source_id}/{target_id}` | Remove a connection → `200` or `404` |
 | `GET /api/v1/memories/{id}/related?depth=1&relationship_types=&limit=20` | Graph traversal from a memory. `depth` max 5, `limit` max 100, `relationship_types` comma-separated filter → `200` with `{"memory_id", "related": [{"memory": Memory, "connection": Connection}]}` |
@@ -484,8 +500,20 @@ cargo build --release -p remem-mcp
 
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features business -- -D warnings
 cargo test --workspace
 ```
+
+The dev repo has two Rust Dockerfiles with separate responsibilities:
+
+- `docker/remem-server.Dockerfile` builds the production runtime image and is
+  the only server Dockerfile used for Docker Hub publishing and edition
+  snapshots.
+- `docker/remem-server.ci.Dockerfile` is dev-repo-only CI infrastructure. Use
+  `docker build --target linter -f docker/remem-server.ci.Dockerfile .` for
+  `cargo fmt --check` plus both clippy passes, and
+  `docker build --target tester -f docker/remem-server.ci.Dockerfile .` for the
+  containerized Rust test pass.
 
 Building `remem-server` from source downloads ONNX Runtime and the embedding model
 on first build/run; expect the first `cargo build` and first container start to be

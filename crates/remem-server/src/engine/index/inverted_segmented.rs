@@ -5,8 +5,9 @@
 //! to a lightweight `{index}_{seqno:04}.del` file on checkpoint.
 
 use bytes::Bytes;
-use std::collections::HashSet;
-use std::io::Read;
+use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,6 +17,7 @@ use crate::engine::index::segment_io::{
     SegmentHeader, SegmentReader, SegmentWriter, INDEX_TYPE_INVERTED,
 };
 use crate::engine::index::{InvertedIndex, InvertedIndexConfig, TAGS_CHUNK_SIZE};
+use crate::engine::storage::durable_rename::durable_rename;
 
 // ── Sealed segment ─────────────────────────────────────────────────────────────
 
@@ -24,8 +26,12 @@ struct SealedTagSegment {
     seq_no: u32,
     /// The loaded inverted index (already populated).
     index: InvertedIndex,
-    /// Deletion bitset — `deleted[i]` is true if global doc `doc_start + i` is deleted.
-    deleted: Vec<bool>,
+    /// Local doc ID -> external key. This is the source of truth for deletion bit positions.
+    keys_by_doc_id: Vec<Bytes>,
+    /// External key -> local doc ID.
+    doc_id_by_key: HashMap<Bytes, usize>,
+    /// Deletion bitset — `deleted[i]` is true if local doc `i` is deleted.
+    deleted: RwLock<Vec<bool>>,
     /// Whether the deletion bitset has changed since last save.
     deletions_dirty: AtomicBool,
     /// Absolute path to the `.del` file for this segment.
@@ -34,11 +40,11 @@ struct SealedTagSegment {
 
 impl SealedTagSegment {
     fn doc_count(&self) -> u32 {
-        self.index.len() as u32
+        self.keys_by_doc_id.len() as u32
     }
 
     fn deletion_count(&self) -> usize {
-        self.deleted.iter().filter(|&&d| d).count()
+        self.deleted.read().iter().filter(|&&d| d).count()
     }
 
     /// Derive the segment filename from seq_no.
@@ -48,27 +54,51 @@ impl SealedTagSegment {
 
     /// Iterate all keys in this segment that are not soft-deleted.
     fn live_keys(&self) -> Vec<Bytes> {
-        // Get all keys from the index; the deletion bitset is per-doc-ID
-        // but we don't have per-key doc IDs, so return all keys (conservative).
-        // Compaction will rebuild from scratch without deleted keys,
-        // using the `remove()` set tracked in the growing index.
-        self.index
-            .all_tokens()
+        let deleted = self.deleted.read();
+        self.keys_by_doc_id
             .iter()
-            .flat_map(|token| self.index.search(token))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
+            .enumerate()
+            .filter(|(doc_id, _)| !deleted[*doc_id])
+            .map(|(_, key)| key.clone())
             .collect()
     }
 
-    /// Load the deletion bitset from disk (`.del` file). Missing = all alive.
-    fn load_deletions(del_path: &Path, doc_count: usize) -> Vec<bool> {
-        if !del_path.exists() {
-            return vec![false; doc_count];
-        }
-        let Ok(bytes) = std::fs::read(del_path) else {
-            return vec![false; doc_count];
+    fn is_key_deleted(&self, key: &[u8]) -> bool {
+        let Some(&doc_id) = self.doc_id_by_key.get(key) else {
+            return false;
         };
+        self.deleted.read().get(doc_id).copied().unwrap_or(false)
+    }
+
+    fn mark_deleted(&self, key: &[u8]) -> bool {
+        let Some(&doc_id) = self.doc_id_by_key.get(key) else {
+            return false;
+        };
+        let mut deleted = self.deleted.write();
+        if deleted.get(doc_id).copied().unwrap_or(false) {
+            return false;
+        }
+        deleted[doc_id] = true;
+        self.deletions_dirty.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Load the deletion bitset from disk (`.del` file). Missing = all alive.
+    fn load_deletions(del_path: &Path, doc_count: usize) -> Result<Vec<bool>> {
+        if !del_path.exists() {
+            return Ok(vec![false; doc_count]);
+        }
+        let bytes = std::fs::read(del_path).map_err(StorageError::Io)?;
+        let expected_len = doc_count.div_ceil(8);
+        if bytes.len() != expected_len {
+            return Err(StorageError::invalid_format(
+                del_path,
+                format!(
+                    "Deletion bitset has {} bytes for {doc_count} docs; expected {expected_len}",
+                    bytes.len()
+                ),
+            ));
+        }
         // Bit-packed: byte[i] bit j => doc i*8+j deleted
         let mut deleted = vec![false; doc_count];
         for (i, &byte) in bytes.iter().enumerate() {
@@ -80,7 +110,7 @@ impl SealedTagSegment {
                 deleted[idx] = (byte >> bit) & 1 == 1;
             }
         }
-        deleted
+        Ok(deleted)
     }
 
     /// Save deletion bitset to disk if dirty.
@@ -88,17 +118,19 @@ impl SealedTagSegment {
         if !self.deletions_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let doc_count = self.deleted.len();
+        let deleted = self.deleted.read();
+        let doc_count = deleted.len();
         let byte_count = doc_count.div_ceil(8);
         let mut bytes = vec![0u8; byte_count];
-        for (i, &del) in self.deleted.iter().enumerate() {
+        for (i, &del) in deleted.iter().enumerate() {
             if del {
                 bytes[i / 8] |= 1 << (i % 8);
             }
         }
+        drop(deleted);
         let tmp = self.del_path.with_extension("del.tmp");
         std::fs::write(&tmp, &bytes).map_err(StorageError::Io)?;
-        std::fs::rename(&tmp, &self.del_path).map_err(StorageError::Io)?;
+        durable_rename(&tmp, &self.del_path)?;
         self.deletions_dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -139,17 +171,19 @@ impl SegmentedInvertedIndex {
         }
     }
 
-    /// Load from manifest + segment files in `dir`. Returns fresh index on any error.
-    pub fn load_from_dir(config: InvertedIndexConfig, dir: PathBuf) -> Self {
+    /// Load from manifest + segment files in `dir`.
+    ///
+    /// A parse failure is refused by default rather than silently rebuilt
+    /// from empty — see [`crate::engine::index::on_index_parse_failure`].
+    pub fn load_from_dir(config: InvertedIndexConfig, dir: PathBuf) -> Result<Self> {
+        // See `SegmentedBTreeIndex::load_from_dir` -- repair an interrupted
+        // rekey swap before reading anything.
+        crate::engine::index::rekey::recover_interrupted_publish(&dir, &Self::rekey_artifacts())?;
         match Self::try_load_from_dir(config.clone(), &dir) {
-            Ok(idx) => idx,
+            Ok(idx) => Ok(idx),
             Err(e) => {
-                tracing::warn!(
-                    "Failed to load segmented tag index from {:?}: {}; starting fresh",
-                    dir,
-                    e
-                );
-                Self::new(config, dir)
+                crate::engine::index::on_index_parse_failure(&dir, &e)?;
+                Ok(Self::new(config, dir))
             }
         }
     }
@@ -202,20 +236,36 @@ impl SegmentedInvertedIndex {
 
     fn load_sealed_segment(path: &Path, meta: &ChunkMeta, dir: &Path) -> Result<SealedTagSegment> {
         let reader = SegmentReader::open(path)?;
-        let mut cursor = reader.data_cursor();
-        let index = deserialize_inverted_index(&mut cursor, &InvertedIndexConfig::default())?;
-        let doc_count = index.len();
+        let (index, keys_by_doc_id) = deserialize_tag_segment_v2(reader.data())?;
+        let doc_count = keys_by_doc_id.len();
+        if doc_count != meta.entry_count as usize {
+            return Err(StorageError::invalid_format(
+                path,
+                format!(
+                    "Tag segment key directory has {doc_count} docs; manifest records {}",
+                    meta.entry_count
+                ),
+            ));
+        }
+        let doc_id_by_key = build_doc_id_by_key(&keys_by_doc_id)?;
 
         let del_path = del_file_path(dir, Self::INDEX_NAME, meta.seq_no);
-        let deleted = SealedTagSegment::load_deletions(&del_path, doc_count);
+        let deleted = SealedTagSegment::load_deletions(&del_path, doc_count)?;
 
         Ok(SealedTagSegment {
             seq_no: meta.seq_no,
             index,
-            deleted,
+            keys_by_doc_id,
+            doc_id_by_key,
+            deleted: RwLock::new(deleted),
             deletions_dirty: AtomicBool::new(false),
             del_path,
         })
+    }
+
+    /// Whether the index can represent `token`. See `InvertedIndex::can_represent`.
+    pub fn can_represent(&self, token: &str) -> bool {
+        self.growing.can_represent(token)
     }
 
     /// Seal the growing segment to disk and add it to the manifest.
@@ -238,7 +288,7 @@ impl SegmentedInvertedIndex {
 
         // Serialize the growing index
         let mut data_buf = Vec::new();
-        serialize_inverted_index(&self.growing, &mut data_buf)?;
+        let keys_by_doc_id = serialize_tag_segment_v2(&self.growing, &mut data_buf)?;
 
         let entry_count = self.growing.len() as u32;
         let header = SegmentHeader::new(
@@ -279,11 +329,14 @@ impl SegmentedInvertedIndex {
 
         let del_path = del_file_path(&self.dir, Self::INDEX_NAME, seq_no);
         let doc_count = old_growing.len();
+        let doc_id_by_key = build_doc_id_by_key(&keys_by_doc_id)?;
 
         self.sealed.push(SealedTagSegment {
             seq_no,
             index: old_growing,
-            deleted: vec![false; doc_count],
+            keys_by_doc_id,
+            doc_id_by_key,
+            deleted: RwLock::new(vec![false; doc_count]),
             deletions_dirty: AtomicBool::new(false),
             del_path,
         });
@@ -347,18 +400,9 @@ impl SegmentedInvertedIndex {
     /// Replace all tags for a document key.
     pub fn set_tags(&self, key: impl Into<Bytes>, tags: &[String]) -> Result<()> {
         let key = key.into();
-        // Remove from any sealed segment where the key exists
-        for seg in &self.sealed {
-            let tokens = seg.index.get_tokens(&key);
-            if !tokens.is_empty() {
-                // We can't remove from the sealed index, but mark as deleted
-                // The key will be re-added to the growing segment below
-                // For simplicity, we just soft-delete the old entry
-                // (In practice, the WAL will have the correct set_tags entry)
-            }
-        }
+        let removed_from_sealed = self.mark_deleted_in_sealed(&key);
         let result = self.growing.set_tags(key, tags);
-        if result.is_ok() {
+        if result.is_ok() || removed_from_sealed {
             self.dirty.store(true, Ordering::Relaxed);
         }
         result
@@ -368,16 +412,7 @@ impl SegmentedInvertedIndex {
     pub fn remove(&self, key: &[u8]) -> Result<bool> {
         let mut removed = false;
 
-        // Soft-delete from sealed segments
-        for seg in &self.sealed {
-            if seg.index.contains_key(key) {
-                // We can't easily get the local doc ID without a reverse map,
-                // so we just track that the external key was deleted via the
-                // growing segment's absence of this key.
-                // For correct query results, search must check growing.contains_key.
-                removed = true;
-            }
-        }
+        removed |= self.mark_deleted_in_sealed(key);
 
         // Hard-remove from growing
         let in_growing = self.growing.remove(key)?;
@@ -399,7 +434,7 @@ impl SegmentedInvertedIndex {
         let mut result_set: HashSet<Bytes> = HashSet::new();
         for seg in &self.sealed {
             for key in seg.index.search_and(queries) {
-                if !self.is_key_deleted_in_sealed(seg, &key) {
+                if !seg.is_key_deleted(&key) {
                     result_set.insert(key);
                 }
             }
@@ -415,7 +450,7 @@ impl SegmentedInvertedIndex {
         let mut scores: std::collections::HashMap<Bytes, f32> = std::collections::HashMap::new();
         for seg in &self.sealed {
             for (key, score) in seg.index.search_or_scored(queries) {
-                if !self.is_key_deleted_in_sealed(seg, &key) {
+                if !seg.is_key_deleted(&key) {
                     *scores.entry(key).or_insert(0.0) += score;
                 }
             }
@@ -438,9 +473,116 @@ impl SegmentedInvertedIndex {
         sealed_count + self.growing.len()
     }
 
+    /// Whether the index holds no live documents.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn rewrite_keys_in_dir<F>(
+        config: InvertedIndexConfig,
+        dir: &Path,
+        mut rewrite_key: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&Bytes) -> Result<Bytes>,
+    {
+        let existing = Self::load_from_dir(config.clone(), dir.to_path_buf())?;
+        let mut docs: HashMap<Bytes, HashSet<String>> = HashMap::new();
+
+        for seg in &existing.sealed {
+            for key in seg.live_keys() {
+                docs.entry(key.clone())
+                    .or_default()
+                    .extend(seg.index.get_tokens(&key));
+            }
+        }
+        for key in key_directory(&existing.growing) {
+            docs.entry(key.clone())
+                .or_default()
+                .extend(existing.growing.get_tokens(&key));
+        }
+
+        let tmp_dir = dir.join(".tags-rekey.tmp");
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir)?;
+        }
+        std::fs::create_dir_all(&tmp_dir)?;
+
+        let mut changed = false;
+        let mut rewritten_docs: HashMap<Bytes, HashSet<String>> = HashMap::new();
+        for (key, tokens) in docs {
+            let rewritten = rewrite_key(&key)?;
+            changed |= rewritten != key;
+            rewritten_docs.entry(rewritten).or_default().extend(tokens);
+        }
+
+        if !changed {
+            std::fs::remove_dir_all(&tmp_dir)?;
+            return Ok(false);
+        }
+
+        let mut rebuilt = Self::new(config, tmp_dir.clone());
+        for (key, tokens) in rewritten_docs {
+            let mut tags: Vec<String> = tokens.into_iter().collect();
+            tags.sort();
+            if !tags.is_empty() {
+                rebuilt.add_tags(key, &tags)?;
+            }
+        }
+        rebuilt.seal_growing()?;
+        crate::engine::index::rekey::publish_rebuilt_index(
+            dir,
+            &tmp_dir,
+            &Self::rekey_artifacts(),
+        )?;
+        Ok(true)
+    }
+
+    fn rekey_artifacts() -> crate::engine::index::rekey::IndexArtifacts {
+        crate::engine::index::rekey::IndexArtifacts::new(Self::INDEX_NAME)
+    }
+
+    /// Convert a pre-segmented `tags.idx` in `dir` into segment files.
+    ///
+    /// See `SegmentedBTreeIndex::convert_legacy_file_in_dir` for why the
+    /// partition migration needs this before it can rekey.
+    pub(crate) fn convert_legacy_file_in_dir(
+        config: InvertedIndexConfig,
+        dir: &Path,
+    ) -> Result<bool> {
+        let legacy_path = dir.join(format!("{}.idx", Self::INDEX_NAME));
+        let manifest_path = dir.join(format!("{}.manifest", Self::INDEX_NAME));
+        if !legacy_path.exists() || manifest_path.exists() {
+            return Ok(false);
+        }
+
+        let Ok(legacy) = InvertedIndex::load(&legacy_path) else {
+            return Ok(false);
+        };
+        let mut keys: HashSet<Bytes> = HashSet::new();
+        for token in legacy.all_tokens() {
+            keys.extend(legacy.search(&token));
+        }
+
+        let mut rebuilt = Self::new(config, dir.to_path_buf());
+        for key in keys {
+            let tags = legacy.get_tokens(&key);
+            if !tags.is_empty() {
+                rebuilt.add_tags(key, &tags)?;
+            }
+        }
+        rebuilt.seal_growing()?;
+        std::fs::remove_file(&legacy_path)?;
+        tracing::info!(
+            "Converted legacy {:?} to segmented format before partition rekey",
+            legacy_path
+        );
+        Ok(true)
+    }
+
     /// Whether compaction should be triggered.
     pub fn needs_compaction(&self) -> bool {
-        let total_docs: usize = self.sealed.iter().map(|s| s.index.len()).sum();
+        let total_docs: usize = self.sealed.iter().map(|s| s.doc_count() as usize).sum();
         let deleted: usize = self.sealed.iter().map(|s| s.deletion_count()).sum();
         let ratio = if total_docs == 0 {
             0.0
@@ -498,7 +640,7 @@ impl SegmentedInvertedIndex {
             .sum();
 
         let mut data_buf = Vec::new();
-        serialize_inverted_index(&merged, &mut data_buf)?;
+        let keys_by_doc_id = serialize_tag_segment_v2(&merged, &mut data_buf)?;
 
         let entry_count = merged.len() as u32;
         let header = SegmentHeader::new(
@@ -548,13 +690,15 @@ impl SegmentedInvertedIndex {
         self.sealed.remove(a_idx);
 
         // Add new merged segment
-        let new_seg_path = self.dir.join(&filename);
-        let del_path = new_seg_path.with_extension("seg.del");
+        let del_path = del_file_path(&self.dir, Self::INDEX_NAME, seq_no);
         let doc_count = merged.len();
+        let doc_id_by_key = build_doc_id_by_key(&keys_by_doc_id)?;
         self.sealed.push(SealedTagSegment {
             seq_no,
             index: merged,
-            deleted: vec![false; doc_count],
+            keys_by_doc_id,
+            doc_id_by_key,
+            deleted: RwLock::new(vec![false; doc_count]),
             del_path,
             deletions_dirty: AtomicBool::new(false),
         });
@@ -569,22 +713,245 @@ impl SegmentedInvertedIndex {
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    /// Check if `key` is soft-deleted within the sealed segment.
-    /// Since we don't have a doc-ID reverse map in the sealed index, we
-    /// check if the key appears in the growing segment's removal list by
-    /// checking whether the growing index has seen a `remove()` for this key.
-    /// A simpler approximation: the key is "deleted" in a sealed seg if
-    /// `growing.contains_key(key)` is false AND the growing received a remove.
-    /// For now, we use a conservative approach: never filter based on
-    /// bitset since we don't have per-doc IDs tracked here.
-    fn is_key_deleted_in_sealed(&self, _seg: &SealedTagSegment, _key: &Bytes) -> bool {
-        // Conservative: don't filter. Compaction handles physical removal.
-        // TODO: track per-key deletion status more precisely.
-        false
+    fn mark_deleted_in_sealed(&self, key: &[u8]) -> bool {
+        let mut removed = false;
+        for seg in &self.sealed {
+            removed |= seg.mark_deleted(key);
+        }
+        if removed {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        removed
     }
 }
 
 // ── Serialization helpers ──────────────────────────────────────────────────────
+
+const TAG_SEGMENT_V2_MAGIC: &[u8; 8] = b"TAGSIDX2";
+const TAG_SEGMENT_V2_VERSION: u32 = 2;
+
+/// Rewrite every legacy tag segment under `dir` into the v2 payload format.
+///
+/// `dir` is the shared storage index directory containing `tags.manifest`.
+pub fn migrate_segments_to_v2(dir: &Path) -> Result<()> {
+    let Some(mut manifest) = SegmentManifest::load(dir, SegmentedInvertedIndex::INDEX_NAME)? else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    for chunk in &mut manifest.chunks {
+        let path = dir.join(&chunk.filename);
+        let reader = SegmentReader::open(&path)?;
+        if is_tag_segment_v2(reader.data()) {
+            continue;
+        }
+
+        let (index, keys_by_doc_id) =
+            deserialize_legacy_inverted_index_with_keys(&mut reader.data_cursor())?;
+        if keys_by_doc_id.len() != chunk.entry_count as usize {
+            return Err(StorageError::invalid_format(
+                &path,
+                format!(
+                    "Legacy tag segment has {} keys; manifest records {}",
+                    keys_by_doc_id.len(),
+                    chunk.entry_count
+                ),
+            ));
+        }
+
+        let del_path = del_file_path(dir, SegmentedInvertedIndex::INDEX_NAME, chunk.seq_no);
+        let deleted = SealedTagSegment::load_deletions(&del_path, keys_by_doc_id.len())?;
+
+        let crc32 = write_v2_segment_file(
+            &path,
+            chunk.seq_no,
+            chunk.first_id,
+            chunk.last_id,
+            &index,
+            Some(&keys_by_doc_id),
+        )?;
+
+        if del_path.exists() {
+            write_deletions(&del_path, &deleted)?;
+        }
+        chunk.crc32 = crc32;
+        chunk.file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        chunk.entry_count = keys_by_doc_id.len() as u32;
+        chunk.has_deletions = deleted.iter().any(|&d| d);
+        changed = true;
+    }
+
+    if changed {
+        manifest.commit(dir)?;
+    }
+
+    Ok(())
+}
+
+fn is_tag_segment_v2(data: &[u8]) -> bool {
+    data.len() >= TAG_SEGMENT_V2_MAGIC.len()
+        && &data[..TAG_SEGMENT_V2_MAGIC.len()] == TAG_SEGMENT_V2_MAGIC
+}
+
+fn serialize_tag_segment_v2(index: &InvertedIndex, buf: &mut Vec<u8>) -> Result<Vec<Bytes>> {
+    let keys_by_doc_id = key_directory(index);
+    serialize_tag_segment_v2_with_keys(index, &keys_by_doc_id, buf)?;
+    Ok(keys_by_doc_id)
+}
+
+fn serialize_tag_segment_v2_with_keys(
+    index: &InvertedIndex,
+    keys_by_doc_id: &[Bytes],
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    use std::io::Write as IoWrite;
+
+    let mut legacy = Vec::new();
+    serialize_inverted_index(index, &mut legacy)?;
+
+    let mut w = std::io::BufWriter::new(buf);
+    w.write_all(TAG_SEGMENT_V2_MAGIC)
+        .map_err(StorageError::Io)?;
+    w.write_all(&TAG_SEGMENT_V2_VERSION.to_le_bytes())
+        .map_err(StorageError::Io)?;
+    w.write_all(&(legacy.len() as u32).to_le_bytes())
+        .map_err(StorageError::Io)?;
+    w.write_all(&legacy).map_err(StorageError::Io)?;
+    w.write_all(&(keys_by_doc_id.len() as u32).to_le_bytes())
+        .map_err(StorageError::Io)?;
+    for key in keys_by_doc_id {
+        w.write_all(&(key.len() as u32).to_le_bytes())
+            .map_err(StorageError::Io)?;
+        w.write_all(key).map_err(StorageError::Io)?;
+    }
+    w.flush().map_err(StorageError::Io)?;
+    Ok(())
+}
+
+fn deserialize_tag_segment_v2(data: &[u8]) -> Result<(InvertedIndex, Vec<Bytes>)> {
+    if !is_tag_segment_v2(data) {
+        return Err(StorageError::Serialization(
+            "Legacy tag segment payload found after index.tags v2 migration".into(),
+        ));
+    }
+
+    let mut cursor = Cursor::new(data);
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+
+    let mut buf4 = [0u8; 4];
+    cursor.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+    if version != TAG_SEGMENT_V2_VERSION {
+        return Err(StorageError::Serialization(format!(
+            "Unsupported tag segment payload version: {version}"
+        )));
+    }
+
+    cursor.read_exact(&mut buf4)?;
+    let legacy_len = u32::from_le_bytes(buf4) as usize;
+    let mut legacy = vec![0u8; legacy_len];
+    cursor.read_exact(&mut legacy)?;
+    let index =
+        deserialize_inverted_index(&mut Cursor::new(&legacy), &InvertedIndexConfig::default())?;
+
+    cursor.read_exact(&mut buf4)?;
+    let key_count = u32::from_le_bytes(buf4) as usize;
+    let mut keys_by_doc_id = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        cursor.read_exact(&mut buf4)?;
+        let key_len = u32::from_le_bytes(buf4) as usize;
+        let mut key = vec![0u8; key_len];
+        cursor.read_exact(&mut key)?;
+        keys_by_doc_id.push(Bytes::from(key));
+    }
+
+    if cursor.position() != data.len() as u64 {
+        return Err(StorageError::Serialization(
+            "Trailing bytes in tag segment payload".into(),
+        ));
+    }
+    if keys_by_doc_id.len() != index.len() {
+        return Err(StorageError::Serialization(format!(
+            "Tag segment key directory has {} keys; inverted index has {} docs",
+            keys_by_doc_id.len(),
+            index.len()
+        )));
+    }
+    Ok((index, keys_by_doc_id))
+}
+
+fn key_directory(index: &InvertedIndex) -> Vec<Bytes> {
+    let mut key_set: HashSet<Bytes> = HashSet::new();
+    for token in index.all_tokens() {
+        for key in index.search(&token) {
+            key_set.insert(key);
+        }
+    }
+    let mut keys: Vec<Bytes> = key_set.into_iter().collect();
+    keys.sort();
+    keys
+}
+
+fn build_doc_id_by_key(keys_by_doc_id: &[Bytes]) -> Result<HashMap<Bytes, usize>> {
+    let mut doc_id_by_key = HashMap::with_capacity(keys_by_doc_id.len());
+    for (doc_id, key) in keys_by_doc_id.iter().cloned().enumerate() {
+        if doc_id_by_key.insert(key.clone(), doc_id).is_some() {
+            return Err(StorageError::Serialization(format!(
+                "Duplicate key in tag segment directory: {:?}",
+                key
+            )));
+        }
+    }
+    Ok(doc_id_by_key)
+}
+
+fn write_v2_segment_file(
+    path: &Path,
+    seq_no: u32,
+    first_id: u64,
+    last_id: u64,
+    index: &InvertedIndex,
+    keys_by_doc_id: Option<&[Bytes]>,
+) -> Result<u32> {
+    let keys;
+    let keys_by_doc_id = match keys_by_doc_id {
+        Some(keys_by_doc_id) => keys_by_doc_id,
+        None => {
+            keys = key_directory(index);
+            &keys
+        }
+    };
+
+    let mut data_buf = Vec::new();
+    serialize_tag_segment_v2_with_keys(index, keys_by_doc_id, &mut data_buf)?;
+    let header = SegmentHeader::new(
+        *b"TAGS_SEG",
+        INDEX_TYPE_INVERTED,
+        seq_no,
+        keys_by_doc_id.len() as u32,
+        first_id,
+        last_id,
+    );
+    let mut writer = SegmentWriter::create(path, header)?;
+    writer.write_bytes(&data_buf)?;
+    writer.finish()
+}
+
+fn write_deletions(del_path: &Path, deleted: &[bool]) -> Result<()> {
+    let doc_count = deleted.len();
+    let byte_count = doc_count.div_ceil(8);
+    let mut bytes = vec![0u8; byte_count];
+    for (i, &del) in deleted.iter().enumerate() {
+        if del {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    let tmp = del_path.with_extension("del.tmp");
+    std::fs::write(&tmp, &bytes).map_err(StorageError::Io)?;
+    durable_rename(&tmp, del_path)?;
+    Ok(())
+}
 
 /// Serialize an `InvertedIndex` to a byte buffer using the legacy wire format.
 fn serialize_inverted_index(index: &InvertedIndex, buf: &mut Vec<u8>) -> Result<()> {
@@ -679,6 +1046,12 @@ fn deserialize_inverted_index(
     cursor: &mut impl Read,
     _config: &InvertedIndexConfig,
 ) -> Result<InvertedIndex> {
+    deserialize_legacy_inverted_index_with_keys(cursor).map(|(index, _)| index)
+}
+
+fn deserialize_legacy_inverted_index_with_keys(
+    cursor: &mut impl Read,
+) -> Result<(InvertedIndex, Vec<Bytes>)> {
     let mut magic = [0u8; 4];
     cursor.read_exact(&mut magic)?;
     if &magic != b"INVI" {
@@ -730,39 +1103,33 @@ fn deserialize_inverted_index(
 
     let index = InvertedIndex::new(cfg);
 
-    // We rebuild the index by re-adding all postings
-    let mut all_postings: Vec<(String, Vec<(Bytes, f32)>)> = Vec::with_capacity(token_count);
-
     for _ in 0..token_count {
         cursor.read_exact(&mut buf4)?;
         let token_len = u32::from_le_bytes(buf4) as usize;
         let mut token_bytes = vec![0u8; token_len];
         cursor.read_exact(&mut token_bytes)?;
-        let token = String::from_utf8(token_bytes)
+        let _token = String::from_utf8(token_bytes)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         cursor.read_exact(&mut buf4)?;
         let posting_count = u32::from_le_bytes(buf4) as usize;
 
-        let mut postings = Vec::with_capacity(posting_count);
         for _ in 0..posting_count {
             cursor.read_exact(&mut buf4)?;
             let key_len = u32::from_le_bytes(buf4) as usize;
             let mut key_bytes = vec![0u8; key_len];
             cursor.read_exact(&mut key_bytes)?;
-            let key = Bytes::from(key_bytes);
+            let _key = Bytes::from(key_bytes);
 
             cursor.read_exact(&mut buf4)?;
-            let score = f32::from_le_bytes(buf4);
-
-            postings.push((key, score));
+            let _score = f32::from_le_bytes(buf4);
         }
-        all_postings.push((token, postings));
     }
 
     // Read ktt
     cursor.read_exact(&mut buf4)?;
     let doc_count = u32::from_le_bytes(buf4) as usize;
+    let mut keys_by_doc_id = Vec::with_capacity(doc_count);
 
     for _ in 0..doc_count {
         cursor.read_exact(&mut buf4)?;
@@ -787,17 +1154,17 @@ fn deserialize_inverted_index(
 
         // Re-add the key with its tokens
         if !tokens.is_empty() {
-            let _ = index.add_tags(key, &tokens);
+            let _ = index.add_tags(key.clone(), &tokens);
+            keys_by_doc_id.push(key);
         }
     }
 
-    Ok(index)
+    Ok((index, keys_by_doc_id))
 }
 
 fn del_file_path(dir: &Path, index_name: &str, seq_no: u32) -> PathBuf {
     dir.join(format!("{index_name}_{seq_no:04}.del"))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,7 +1214,8 @@ mod tests {
         let reloaded = SegmentedInvertedIndex::load_from_dir(
             InvertedIndexConfig::default(),
             dir.path().to_path_buf(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(reloaded.sealed.len(), 1);
         assert_eq!(reloaded.search_and(&["common"]).len(), 5);
@@ -867,5 +1235,171 @@ mod tests {
 
         idx.remove(b"doc1").unwrap();
         assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn delete_after_seal_filters_exact_tag_search() {
+        let dir = tempdir().unwrap();
+        let mut idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
+
+        idx.add_tags(b"doc1".to_vec(), &["rust".to_string()])
+            .unwrap();
+        idx.add_tags(b"doc2".to_vec(), &["rust".to_string()])
+            .unwrap();
+        idx.seal_growing().unwrap();
+
+        assert!(idx.remove(b"doc1").unwrap());
+        let results = idx.search_and(&["rust"]);
+
+        assert_eq!(results, vec![Bytes::from_static(b"doc2")]);
+    }
+
+    #[test]
+    fn retag_after_seal_removes_old_tags_and_adds_new_tags() {
+        let dir = tempdir().unwrap();
+        let mut idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
+
+        idx.set_tags(b"doc1".to_vec(), &["old".to_string()])
+            .unwrap();
+        idx.seal_growing().unwrap();
+
+        idx.set_tags(b"doc1".to_vec(), &["new".to_string()])
+            .unwrap();
+
+        assert!(idx.search_and(&["old"]).is_empty());
+        assert_eq!(idx.search_and(&["new"]), vec![Bytes::from_static(b"doc1")]);
+    }
+
+    #[test]
+    fn scored_search_skips_deleted_sealed_postings() {
+        let dir = tempdir().unwrap();
+        let mut idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
+
+        idx.add_tags(
+            b"doc1".to_vec(),
+            &["rust".to_string(), "storage".to_string()],
+        )
+        .unwrap();
+        idx.add_tags(b"doc2".to_vec(), &["rust".to_string()])
+            .unwrap();
+        idx.seal_growing().unwrap();
+
+        idx.remove(b"doc1").unwrap();
+        let results = idx.search_or_scored(&["rust", "storage"]);
+
+        assert_eq!(results, vec![(Bytes::from_static(b"doc2"), 1.0)]);
+    }
+
+    #[test]
+    fn len_and_compaction_reflect_sealed_deletions() {
+        let dir = tempdir().unwrap();
+        let mut idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
+
+        for i in 0..5 {
+            idx.add_tags(format!("doc{i}"), &["rust".to_string()])
+                .unwrap();
+        }
+        idx.seal_growing().unwrap();
+
+        idx.remove(b"doc0").unwrap();
+        idx.remove(b"doc1").unwrap();
+
+        assert_eq!(idx.len(), 3);
+        assert!(idx.needs_compaction());
+    }
+
+    #[test]
+    fn compact_and_reload_do_not_resurrect_deleted_or_retagged_postings() {
+        let dir = tempdir().unwrap();
+        let mut idx =
+            SegmentedInvertedIndex::new(InvertedIndexConfig::default(), dir.path().to_path_buf());
+
+        idx.set_tags(b"deleted".to_vec(), &["stale".to_string()])
+            .unwrap();
+        idx.set_tags(b"retagged".to_vec(), &["old".to_string()])
+            .unwrap();
+        idx.seal_growing().unwrap();
+
+        idx.remove(b"deleted").unwrap();
+        idx.set_tags(b"retagged".to_vec(), &["new".to_string()])
+            .unwrap();
+        idx.set_tags(b"live".to_vec(), &["fresh".to_string()])
+            .unwrap();
+        idx.seal_growing().unwrap();
+        assert!(idx.compact().unwrap());
+
+        let reloaded = SegmentedInvertedIndex::load_from_dir(
+            InvertedIndexConfig::default(),
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+
+        assert!(reloaded.search_and(&["stale"]).is_empty());
+        assert!(reloaded.search_and(&["old"]).is_empty());
+        assert_eq!(
+            reloaded.search_and(&["new"]),
+            vec![Bytes::from_static(b"retagged")]
+        );
+        assert_eq!(
+            reloaded.search_and(&["fresh"]),
+            vec![Bytes::from_static(b"live")]
+        );
+    }
+
+    #[test]
+    fn legacy_v1_segments_migrate_to_v2_without_losing_live_tags() {
+        let dir = tempdir().unwrap();
+        let index = InvertedIndex::new(InvertedIndexConfig::default());
+        index
+            .set_tags(b"doc1".to_vec(), &["rust".to_string()])
+            .unwrap();
+        index
+            .set_tags(b"doc2".to_vec(), &["storage".to_string()])
+            .unwrap();
+
+        let mut legacy_data = Vec::new();
+        serialize_inverted_index(&index, &mut legacy_data).unwrap();
+        let header = SegmentHeader::new(*b"TAGS_SEG", INDEX_TYPE_INVERTED, 0, 2, 0, 1);
+        let seg_path = dir.path().join("tags_0000.seg");
+        let mut writer = SegmentWriter::create(&seg_path, header).unwrap();
+        writer.write_bytes(&legacy_data).unwrap();
+        let crc32 = writer.finish().unwrap();
+
+        let mut manifest = SegmentManifest::new(SegmentedInvertedIndex::INDEX_NAME);
+        manifest.chunks.push(ChunkMeta {
+            seq_no: 0,
+            filename: "tags_0000.seg".into(),
+            entry_count: 2,
+            file_size: seg_path.metadata().unwrap().len(),
+            first_id: 0,
+            last_id: 1,
+            crc32,
+            sealed: true,
+            has_deletions: false,
+        });
+        manifest.commit(dir.path()).unwrap();
+
+        migrate_segments_to_v2(dir.path()).unwrap();
+
+        let reloaded = SegmentedInvertedIndex::load_from_dir(
+            InvertedIndexConfig::default(),
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.search_and(&["rust"]),
+            vec![Bytes::from_static(b"doc1")]
+        );
+        assert_eq!(
+            reloaded.search_and(&["storage"]),
+            vec![Bytes::from_static(b"doc2")]
+        );
+        assert!(is_tag_segment_v2(
+            SegmentReader::open(&seg_path).unwrap().data()
+        ));
     }
 }
