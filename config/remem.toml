@@ -1,0 +1,154 @@
+# Remem configuration.
+#
+# Every value below is the default, written out. Spec §51 asks for
+# configuration that is explicit and inspectable, so this file is the whole
+# surface rather than a minimal example: nothing Remem does is decided by a
+# setting that is not here.
+#
+# Precedence, lowest to highest: these defaults, this file, environment
+# variables, command-line flags.
+#
+#   REMEM_SERVER_HTTP_ADDR=0.0.0.0:4545     environment
+#   --server.http_addr=0.0.0.0:4545         flag
+#   --config /etc/remem/remem.toml          use this file and no other
+#
+# Invalid values fail at startup, naming the key.
+
+[node]
+# This node's stable identity. Empty derives it from the hostname.
+id = ""
+
+[storage]
+path = "./data"
+# "pebble" is durable; "memory" keeps nothing across a restart.
+engine = "pebble"
+cache_size_bytes = 268435456 # 256 MiB
+# fsync every commit. Turning this off trades the last writes for throughput.
+sync_writes = true
+
+[server]
+# "development" or "production". In production an api_key is required.
+env = "development"
+http_addr = "127.0.0.1:4545"
+api_key = ""
+read_timeout = "30s"
+write_timeout = "30s"
+shutdown_timeout = "30s"
+max_request_bytes = 8388608 # 8 MiB
+# Requests a second each tenant may send, sustained, and how many at once. Zero
+# rps turns limiting off. Counted per tenant after authentication, where Rust
+# counted per client address.
+rate_limit_rps = 100
+rate_limit_burst = 50
+
+[tenant]
+# Every piece of user-owned data belongs to a tenant (Invariant 1); this is the
+# one a request that names none belongs to.
+default = "default"
+auto_provision = true
+
+[embedding]
+# Fixed: vectors from another model are not comparable with the stored ones,
+# which is why every vector records the model that produced it.
+model = "all-MiniLM-L6-v2"
+model_path = ""
+batch_size = 32
+max_sequence_tokens = 256
+
+[vector]
+# 384 is all-MiniLM-L6-v2's output width. Changing one without the other is
+# refused at startup.
+dimension = 384
+# "flat" is exact; "hnsw" is approximate and arrives in Phase 7.
+index = "flat"
+metric = "cosine"
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_search = 64
+
+[text]
+# The inverted index behind keyword and hybrid search. There is one setting:
+# how text is split into terms is fixed in code, because changing it would make
+# memories written before the change findable by a term and memories written
+# after not, with nothing in the results to say so.
+enabled = true
+
+[search]
+default_limit = 10
+max_limit = 200
+# Reciprocal-rank fusion's k. Fixed at 60.
+rrf_k = 60
+# How far a filtered search may widen its candidate set. Fixed at 32.
+widen_max_factor = 32
+# How far a filtered listing may widen, as a multiple of the page. Larger than
+# the search bound on purpose: a listing candidate is one attribute-row read,
+# where a widened search re-runs a similarity walk. Rust's number, 128.
+list_max_factor = 128
+similarity_threshold = 0.0
+
+[lifecycle]
+# Turns the per-tenant maintenance job and durable recall recording on. With it
+# off nothing decays, nothing expires, and fetching a memory records nothing.
+enabled = true
+# One maintenance job per tenant, on this interval. It is not how fast a
+# backlog drains: a run that spends its budget enqueues its own continuation,
+# so a corpus that is entirely due — every corpus written before Phase 10 —
+# catches up at worker speed rather than at this interval.
+sweep_interval = "1h"
+# How many memories one run acts on before leaving the rest for its
+# continuation. A bound on a single run, never on the work.
+run_budget = 10000
+# How close together two fetches of one memory have to be for the second to be
+# free. It is what makes access_count count recall sessions rather than round
+# trips, and it is decided against the durable event stream, so it survives a
+# restart.
+recall_window = "30s"
+# How long an audit row is kept. It is enforced per memory by the sweep that
+# was visiting it anyway, so it costs no walk of its own.
+event_retention = "2160h" # 90 days
+
+# Decay rates, promotion thresholds and the health that archives are no longer
+# settings here. They are fields on a named retention policy, per tenant:
+#   curl -X PATCH -H "Authorization: Bearer $KEY" \
+#     -d '{"policies":{"long_term":{"importance_decay":0.999}}}' \
+#     http://127.0.0.1:4545/api/v1/tenants/default/policies
+# A global dial that silently lost to a policy would be a setting an operator
+# believes is in force and is not, so the three old names are refused at
+# start-up rather than ignored.
+
+[jobs]
+# How many background handlers run at once in this process.
+workers = 4
+# How long a worker's claim on a job lasts before another may reclaim it. It is
+# renewed at a third of this while a handler is running, so two renewals may be
+# missed before a lease lapses.
+lease_duration = "1m"
+# How many times a failed job is tried again, so a job runs at most six times.
+max_retries = 5
+poll_interval = "1s"
+# How long a finished job row is kept for audit before the reaper removes it.
+# It is what keeps "what happened to my rebuild" answerable, and what keeps the
+# queue's scans bounded.
+retention = "24h"
+# How long a shutdown waits for running handlers to checkpoint and return
+# before their jobs are released back to the queue.
+drain_timeout = "15s"
+# queue_capacity is gone. It bounded an in-memory channel; a durable queue's
+# capacity is the disk, and the bounded channel that silently dropped its
+# overflow is the defect this framework replaces. A file still naming it is
+# refused by name.
+
+[log]
+# debug, info, warn, error.
+level = "info"
+# "json" for production, "text" for a terminal.
+format = "json"
+add_source = false
+
+[metrics]
+enabled = true
+# Empty serves the metrics on the main HTTP listener. A host:port serves them on
+# a listener of their own and removes them from the main one, still behind a
+# credential not bound to one tenant, and nothing else is served there.
+addr = ""
+path = "/metrics"

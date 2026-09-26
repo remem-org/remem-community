@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+// Package lifecycle.v1 is a tenant's retention policy overrides: the value
+// stored at the untenanted system key /policies/<tenant>.
+//
+// # Why it is not inside the tenant directory row
+//
+// Plan §Phase 10 Task 1 says "per-tenant overrides stored in tenant metadata",
+// and this is that — one row per tenant, in the same untenanted system space as
+// the directory row beside it, read the same way. What it is not is a *field on*
+// the directory row, and the reason is the dependency direction.
+//
+// internal/keys imports internal/tenant, so internal/tenant cannot import
+// internal/lifecycle. Putting the overrides on tenant.Meta would therefore mean
+// either a second copy of the Policy struct in internal/tenant — two
+// declarations of one durable shape, which eventually disagree — or moving
+// retention semantics into the package whose job is isolation identity. A row
+// of its own costs one system prefix and keeps the policy's meaning in the
+// package that acts on it.
+//
+// # An override states a whole policy, not a patch
+//
+// "No TTL" and "TTL unstated" are different facts, and a partial durable record
+// cannot hold them apart. So the patching happens at the API edge, where JSON
+// null and JSON absent are distinguishable, and what reaches disk is complete.
+package lifecycle.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/lifecycle/policykv/pb;pb";
+
+// Overrides is one tenant's policy table.
+//
+// The tenant is the key and is deliberately not in the value, the rule every
+// other row here follows.
+message Overrides {
+  // policies are the tenant's retention policies, keyed by name. A name that is
+  // also a built-in replaces it for this tenant; a name that is not adds one.
+  map<string, RetentionPolicy> policies = 1;
+
+  uint64 updated_at_unix_ms = 2;
+}
+
+// RetentionPolicy is one named set of retention rules (plan §II.6).
+//
+// Every field that can mean "never" is optional, because for each of them
+// "never" and "zero" are different things: a cleanup_after of zero would delete
+// a memory the instant it was archived, where its absence means the record is
+// kept until somebody asks for it to go.
+message RetentionPolicy {
+  // ttl_secs is the default expiry for memories of this policy. Absent means
+  // they never expire on the clock — which is Rust's behaviour for short_term
+  // and is not what plan §II.6's table says.
+  optional uint64 ttl_secs = 1;
+
+  // promote_at_recalls and promote_to move an expired memory into another
+  // policy instead of archiving it. Absent never promotes.
+  optional uint32 promote_at_recalls = 2;
+  string promote_to = 3;
+
+  // importance_decay is the per-day multiplier; 1.0 is no decay. It is a
+  // double rather than a float because it is exponentiated over hundreds of
+  // days and the comparison with Rust is to 1e-6.
+  double importance_decay = 4;
+
+  // health_decay is points of health lost per whole elapsed day; 0 is none.
+  double health_decay = 5;
+
+  // archive_at_health is the health at or below which the memory is retired.
+  // Absent means health never archives it.
+  optional float archive_at_health = 6;
+
+  // cleanup_after_secs is how long an archived record is retained before it is
+  // removed. Absent means never.
+  optional uint64 cleanup_after_secs = 7;
+}

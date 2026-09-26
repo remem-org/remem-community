@@ -1,0 +1,64 @@
+syntax = "proto3";
+package snapshot.v1;
+
+message Header {
+  uint64 created_at_unix_ms   = 1;
+  string source_impl          = 2;  // "rust" | "go"
+  string source_version       = 3;
+  uint32 record_format_version= 4;
+  repeated string tenants     = 5;
+  uint64 record_count         = 6;
+  uint64 vector_count         = 7;
+  uint64 edge_count           = 8;
+  uint64 event_count          = 9;
+}
+
+message Tenant { string id = 1; string display_name = 2; uint64 created_at_unix_ms = 3; }
+
+message Record {
+  string tenant             = 1;
+  bytes  id                 = 2;   // 16-byte UUID
+  string content            = 3;
+  string policy             = 4;   // "short_term" | "long_term" | "pinned"
+  bool   archived           = 5;
+  uint64 created_at_unix_ms = 6;
+  uint64 updated_at_unix_ms = 7;
+  uint64 accessed_at_unix_ms= 8;
+  uint32 access_count       = 9;
+  optional string source    = 10;
+  repeated string tags      = 11;
+  float  importance         = 12;
+  float  emotional_valence  = 13;
+  float  arousal            = 14;
+  float  health             = 15;
+  optional uint64 last_recalled_at_unix_ms  = 16;
+  optional uint64 flashbulb_until_unix_ms   = 17;
+  optional uint64 ttl_seconds               = 18;
+  optional uint64 last_decay_at_unix_ms     = 19;
+  optional uint64 last_health_check_at_unix_ms = 20;
+}
+
+message Vector {
+  string tenant = 1;
+  bytes  id     = 2;
+  string model_id = 3;             // "all-MiniLM-L6-v2"
+  uint32 dim      = 4;
+  repeated float values = 5 [packed = true];
+}
+
+message Edge {
+  string tenant = 1;
+  bytes  from   = 2;
+  bytes  to     = 3;
+  string relationship_type = 4;
+  float  strength = 5;
+  uint64 created_at_unix_ms = 6;
+}
+
+message Event {
+  string tenant  = 1;
+  bytes  subject = 2;
+  uint64 at_unix_ms = 3;
+  string kind    = 4;              // "recalled" | "archived" | "promoted" | "decayed"
+  string detail  = 5;
+}

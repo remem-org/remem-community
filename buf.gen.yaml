@@ -1,0 +1,9 @@
+version: v2
+plugins:
+  # module= strips the Go module prefix from each file's go_package, so
+  # "github.com/remem-org/remem-go/internal/codec/pb" is written to
+  # internal/codec/pb/ rather than to a directory named after the import path.
+  - local: protoc-gen-go
+    out: .
+    opt:
+      - module=github.com/remem-org/remem-go

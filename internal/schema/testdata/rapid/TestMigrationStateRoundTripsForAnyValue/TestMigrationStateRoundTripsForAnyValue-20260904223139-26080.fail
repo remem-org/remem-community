@@ -1,0 +1,49 @@
+# 2026/09/04 22:31:39.052081 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw id: "a"
+# 2026/09/04 22:31:39.052111 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw source:key_encoding: false
+# 2026/09/04 22:31:39.052112 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw source:record_envelope: false
+# 2026/09/04 22:31:39.052113 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw source:snapshot_format: false
+# 2026/09/04 22:31:39.052114 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw source:attr_schema: false
+# 2026/09/04 22:31:39.052115 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw source:cluster_compat: false
+# 2026/09/04 22:31:39.052116 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw target:key_encoding: false
+# 2026/09/04 22:31:39.052116 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw target:record_envelope: false
+# 2026/09/04 22:31:39.052117 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw target:snapshot_format: false
+# 2026/09/04 22:31:39.052118 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw target:attr_schema: false
+# 2026/09/04 22:31:39.052118 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw target:cluster_compat: false
+# 2026/09/04 22:31:39.052119 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw state: 0x1
+# 2026/09/04 22:31:39.052125 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw cursor: []byte{0x0}
+# 2026/09/04 22:31:39.052126 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw processed: 0x0
+# 2026/09/04 22:31:39.052127 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw started: 0x0
+# 2026/09/04 22:31:39.052128 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw progress: 0x0
+# 2026/09/04 22:31:39.052129 [TestMigrationStateRoundTripsForAnyValue] [rapid] draw error: ""
+# 2026/09/04 22:31:39.052132 [TestMigrationStateRoundTripsForAnyValue] round trip changed the state:
+#  got {ID:a Source:map[] Target:map[] State:pending Cursor:[] Processed:0 StartedAt:0001-01-01 00:00:00 +0000 UTC LastProgressAt:0001-01-01 00:00:00 +0000 UTC Error:}
+# want {ID:a Source:map[] Target:map[] State:pending Cursor:[0] Processed:0 StartedAt:0001-01-01 00:00:00 +0000 UTC LastProgressAt:0001-01-01 00:00:00 +0000 UTC Error:}
+# 
+v0.4.8#2391150989161213378
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x5555555555555
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

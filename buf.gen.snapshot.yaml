@@ -1,0 +1,20 @@
+# proto/snapshot/v1/snapshot.proto is byte-shared with the frozen Rust
+# repository and checksummed in both (test/proto_checksum_test.go). It therefore
+# carries no `option go_package`, and adding one would break the checksum on
+# both sides for a line prost ignores.
+#
+# Managed mode supplies the option at generation time instead, which is why this
+# is a second template rather than a stanza in buf.gen.yaml: every other schema
+# in proto/ declares its own go_package, and turning managed mode on for all of
+# them would override the declarations that are already right.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package
+      value: github.com/remem-org/remem-go/internal/snapshot/pb
+plugins:
+  - local: protoc-gen-go
+    out: .
+    opt:
+      - module=github.com/remem-org/remem-go

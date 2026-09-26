@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+// Go-native companion sections for the portable snapshot.
+//
+// proto/snapshot/v1/snapshot.proto is the migration contract: byte-shared with
+// the frozen Rust implementation, checksummed in both repositories, and
+// therefore fixed. It predates Go's graph (Phase 6) and lifecycle (Phase 10),
+// so there are five things Go stores that it cannot express — connection
+// metadata, an edge's update time, a record's archive time, the per-tenant
+// schema version, and the lifecycle audit stream in the shape Go actually keeps
+// it.
+//
+// Dropping them would make Remem's only backup format lossy, and Invariant 12
+// calls that format the escape route from Pebble. So Go writes the shared
+// sections exactly as Rust would, and writes these alongside them: strip the
+// companion sections from a Go snapshot and what remains is precisely a
+// snapshot.v1 file.
+//
+// Every message here is keyed the same way as the shared message it annotates,
+// and a companion block always immediately follows the block it annotates.
+package snapshotext.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/snapshot/pbext";
+
+// RecordExt carries what snapshot.v1.Record has no field for.
+//
+// next_attention_at is deliberately absent: it is derived from the policy and
+// the record, and an import recomputes it through the lifecycle scheduler
+// rather than trusting a number written by a possibly-differently-configured
+// deployment.
+message RecordExt {
+  string tenant                 = 1;
+  bytes  id                     = 2;   // 16-byte UUID, matching Record.id
+  uint64 archived_at_unix_ms    = 3;   // 0 when the record is not archived
+  uint32 schema_version         = 4;   // the tenant user-schema version (spec §19.3)
+}
+
+// EdgeExt carries what snapshot.v1.Edge has no field for. It is keyed by the
+// whole edge identity, because two records may be connected several ways.
+message EdgeExt {
+  string tenant                 = 1;
+  bytes  from                   = 2;
+  bytes  to                     = 3;
+  string relationship_type      = 4;
+  uint64 updated_at_unix_ms     = 5;
+  map<string, string> meta      = 6;   // caller-supplied; Remem never interprets it
+}
+
+// TenantExt carries what snapshot.v1.Tenant has no field for.
+message TenantExt {
+  string id                     = 1;
+  uint32 schema_version         = 2;
+}
+
+// Event is one row of the lifecycle audit stream (plan §II.10 row 14).
+//
+// snapshot.v1.Event exists and is never written by either implementation: it
+// flattens an event into a kind and a free-text detail, where Go's is a
+// structured record of what moved and why. The audit stream answers "why did my
+// memory disappear", including for a memory that has been hard-deleted, so a
+// backup that omitted it would lose the one row that outlives its subject.
+message Event {
+  string tenant                 = 1;
+  bytes  subject                = 2;
+  uint64 at_unix_ms             = 3;
+  uint32 seq                    = 4;   // breaks ties within a millisecond
+  string kind                   = 5;
+  string actor                  = 6;
+  string reason                 = 7;
+  map<string, string> before    = 8;   // fields that moved. Never content.
+  map<string, string> after     = 9;
+}

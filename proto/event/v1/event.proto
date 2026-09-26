@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+// Package event.v1 is the durable lifecycle audit record: the value stored in
+// the event key space.
+//
+// The event stream is canonical (plan §II.4). Nothing rebuilds it — an event is
+// the record of something that happened, and a lost one is a lost fact about
+// the past. It is exported (snapshot section 6) and never reconstructed.
+//
+// It is not a fifth independently versioned durable format. Protobuf's
+// field-number evolution carries it forward, which is the footing the job row,
+// the tenant directory and the session registry are already on.
+//
+// # Content never appears here
+//
+// The rule that keeps memory content out of logs extends to this stream, and a
+// test enforces it. An audit trail is read by operators, shipped to a log
+// aggregator and kept long after the memory it describes has been deleted;
+// content inside it would outlive every deletion the product offers.
+//
+// Field number ranges, so later phases do not collide:
+//   1-19   identity, kind and provenance
+//   20-39  the field deltas
+//   40+    later
+package event.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/events/pb;pb";
+
+// Event is one thing that happened to one record.
+//
+// The tenant, the namespace, the subject, the timestamp and the sequence
+// number are all in the key, and a second copy inside the value is a second
+// thing that can disagree with the first — the rule Record follows for tenant
+// and namespace, and Job for its id and partition.
+message Event {
+  // kind is the durable name of the transition: "recalled", "promoted",
+  // "expired", "archived", "restored", "hard_deleted". A retired kind stays
+  // retired, and a name is never reused for a different meaning.
+  //
+  // A string rather than an enum because this value is read by operators and
+  // by tools outside this binary, and an enum's unknown-variant behaviour —
+  // decoding a kind a newer writer introduced as zero — would render a
+  // transition nobody can name as one everybody misreads.
+  string kind = 1;
+
+  // actor is what caused it: "ttl", "active_forgetting", "cleanup", "api".
+  // It is the answer to "what did this to my memory", which is the first
+  // question anybody asks of an audit trail.
+  string actor = 2;
+
+  // reason is the human sentence: "health reached 0", "ttl elapsed, 5 recalls".
+  // It is written for a person reading one row, not parsed by anything.
+  string reason = 3;
+
+  // before and after are the fields that moved, rendered as short strings.
+  // They are maps for the reason Edge.meta is, and they are marshalled
+  // deterministically for the same reason: a row's bytes must be a function of
+  // the event and nothing else, or two nodes handed the same transition write
+  // different rows (Invariants 8 and 9). See internal/events/codec.go.
+  //
+  // Memory content is never a value here. See the package comment.
+  map<string, string> before = 20;
+  map<string, string> after = 21;
+}

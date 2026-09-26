@@ -1,0 +1,13 @@
+# buf builds the protobuf schemas without protoc, which this host does not have
+# and which would otherwise be a versioned binary every contributor has to
+# install at the right version. `make proto` runs it via `go run`, the same way
+# the Makefile already pins staticcheck.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Spin up the community edition (Remem only).
+# Usage:
+#   ./run-community              # start
+#   ./run-community down         # stop
+#   ./run-community logs -f      # logs
+#   ./run-community <any docker compose subcommand>
+set -euo pipefail
+
+cd "$(dirname "$0")"
+if [ $# -eq 0 ]; then
+    exec docker compose -f docker-compose.community.yml up -d
+else
+    exec docker compose -f docker-compose.community.yml "$@"
+fi

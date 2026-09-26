@@ -1,0 +1,16 @@
+# 2026/09/05 00:23:04.297239 [TestOrderEncodingPreservesOrder] [rapid] draw type: 0x5
+# 2026/09/05 00:23:04.297243 [TestOrderEncodingPreservesOrder] [rapid] draw a: 0
+# 2026/09/05 00:23:04.297244 [TestOrderEncodingPreservesOrder] [rapid] draw b: -0
+# 2026/09/05 00:23:04.297245 [TestOrderEncodingPreservesOrder] 0 and -0 compare 0 by value and 1 by bytes: an index over this slot would return records in an order that is not the order of their values
+# 
+v0.4.8#16031606589143149512
+0x6b74f03291620
+0x4
+0x0
+0x1
+0x0
+0x0
+0x0
+0x1
+0x0
+0x1

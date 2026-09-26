@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Spin up the business edition (Remem, observability, and backoffice).
+# Usage:
+#   ./run-business              # start
+#   ./run-business down         # stop
+#   ./run-business logs -f      # logs
+#   ./run-business <any docker compose subcommand>
+set -euo pipefail
+
+cd "$(dirname "$0")"
+if [ $# -eq 0 ]; then
+    exec docker compose -f docker-compose.business.yml up -d
+else
+    exec docker compose -f docker-compose.business.yml "$@"
+fi

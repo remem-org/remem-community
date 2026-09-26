@@ -1,0 +1,207 @@
+syntax = "proto3";
+
+// Package record.v1 is the canonical record body: the bytes inside every value
+// in the record key space, wrapped by the envelope internal/codec writes.
+//
+// Protobuf is the body encoding for one reason (plan §II.3): field-number
+// evolution is the only option that lets this binary decode a record written by
+// a version that did not exist when it was compiled, and preserve the fields it
+// does not understand when it writes that record back. A rolling upgrade
+// depends on that; speed did not enter into it (spec §41).
+//
+// Rules, which are compatibility guarantees and not style:
+//   - a field number is never reused for a different meaning;
+//   - fields are only added or reserved, never repurposed;
+//   - `optional` wherever absence is meaningful, so "unset" and "zero" stay
+//     distinguishable;
+//   - schema_version travels inside the body so a record says which schema
+//     wrote it, independent of the storage format version (plan §II.5b).
+//
+// Field number ranges, so later phases do not collide:
+//   1-19   identity and content        (this phase)
+//   20-49  lifecycle and retention     (Phase 4, plan §II.6)
+//   50-79  attributes and user fields
+//   80-99  reserved for experiments that must never reach a release
+package record.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/codec/pb;pb";
+
+// Record is a canonical record body.
+//
+// The tenant and namespace are deliberately absent: they are in the key, and a
+// second copy inside the value is a second thing that can disagree with the
+// first. The id is present despite also being in the key, because an export
+// carries bodies without their keys and because it lets a read check that the
+// row it decoded is the row it asked for.
+message Record {
+  // id is the 16-byte UUID. v7 for records this binary creates, v4 for those
+  // imported from Rust Remem.
+  bytes id = 1;
+
+  // schema_version is the tenant's user-schema version at the time of writing.
+  // It is not the storage format version and must never be confused with it —
+  // a Phase 4 test asserts that moving one leaves the other unmoved.
+  uint32 schema_version = 2;
+
+  // type distinguishes the kinds of record sharing the record space. It
+  // mirrors keys.RecordType, which is the byte the key sorts on.
+  RecordType type = 3;
+
+  // content is the memory text.
+  string content = 4;
+
+  uint64 created_at_unix_ms = 5;
+  uint64 updated_at_unix_ms = 6;
+
+  // tags are ordinary terms in the text index rather than a special case
+  // (plan §II.10 row 2).
+  repeated string tags = 7;
+
+  // source is where the memory came from. Absent means unrecorded, which is
+  // different from recorded as empty.
+  optional string source = 8;
+
+  // archived retires a memory from retrieval without deleting it. The record,
+  // its indexes and its export entry all survive until cleanup: a heuristic
+  // must never destroy user data (plan §II.10 row 8), and "why did my memory
+  // disappear" has to have an answer other than "it did not".
+  bool archived = 20;
+
+  // archived_at_unix_ms is when it was retired. Absent while live.
+  optional uint64 archived_at_unix_ms = 21;
+
+  // The retention and lifecycle fields (plan §II.6). They are written from
+  // Phase 5, because the attribute slot table indexes them and a slot that is
+  // declared and never populated is an ordering that silently returns nothing.
+  // The behaviour that *moves* them — decay, promotion, active forgetting —
+  // arrives with internal/lifecycle in Phase 10; until then they hold their
+  // initial values and only archiving changes one.
+  //
+  // Field numbers match no other message on purpose. They are the record
+  // body's, and snapshot.v1.Record's numbering is its own; two formats that
+  // shared numbers would look interchangeable and drift apart at the first
+  // change to either.
+
+  // policy is the named retention policy: "short_term", "long_term" or
+  // "pinned" (plan §II.6). It replaces Rust's MemoryType enum, so that adding
+  // a retention behaviour is data rather than a new variant every match arm
+  // has to learn about. Empty means the default policy in force.
+  string policy = 22;
+
+  // importance is the record's weight in ranking and in decay, 0..1.
+  float importance = 23;
+
+  // health is the decay budget, 0..100, matching Rust's scale so an imported
+  // corpus needs no rescaling. Zero always archives (plan §II.10 row 8).
+  float health = 24;
+
+  // emotional_valence (-1..1) and arousal (0..1) are the affective dimensions
+  // Rust records. Nothing reads them before Phase 10; they are written now so
+  // an import has somewhere to put them.
+  float emotional_valence = 25;
+  float arousal = 26;
+
+  // accessed_at_unix_ms and access_count are read telemetry. A read updates
+  // them in Phase 10, through the durable event stream (plan §II.10 row 4).
+  uint64 accessed_at_unix_ms = 27;
+  uint32 access_count = 28;
+
+  // last_recalled_at_unix_ms is the last *genuine* recall, which is not every
+  // access: it is absent until one happens, and absent is different from the
+  // epoch.
+  optional uint64 last_recalled_at_unix_ms = 29;
+
+  // next_attention_at_unix_ms is when a lifecycle sweep next needs to look at
+  // this record — one value shared by every sweep rather than one index per
+  // sweep. Zero means "due now", which is the safe reading of a record nothing
+  // has scheduled yet: treating it as "never" would drop the record out of
+  // maintenance silently and permanently.
+  //
+  // It is derived: internal/lifecycle recomputes it from the fields below on
+  // every write, and it is stored here as well as in attribute slot 9 so that
+  // the body and the row a listing walks cannot disagree about the same
+  // memory. Nothing reads it back to decide anything.
+  uint64 next_attention_at_unix_ms = 30;
+
+  // ttl_secs is how long this memory lives before it expires. Absent means it
+  // never does, which is Rust's behaviour and not plan §II.6's: a short-term
+  // memory without a TTL is retired by health, not by the clock
+  // (services/types.rs:1139-1143).
+  //
+  // Seconds rather than milliseconds, matching Rust, so an import is a copy
+  // rather than a conversion that can round.
+  optional uint64 ttl_secs = 31;
+
+  // protected_until_unix_ms defers decay and forgetting wholesale while it is
+  // in the future. It is what Rust calls flashbulb_until: a memory stored with
+  // arousal >= 0.8 is protected for thirty days (services/memory_manager.rs:115).
+  //
+  // Plan §II.6 expresses this as a temporary `pinned` policy that reverts.
+  // Doing that needs two more durable fields — what to revert to, and when —
+  // to say what this one timestamp says, and it would make a record's policy a
+  // value that changes by itself, which nothing else in the system does.
+  optional uint64 protected_until_unix_ms = 32;
+
+  // last_decay_at_unix_ms is when importance decay last ran. Absent means
+  // never, and the decay clock then starts at created_at
+  // (services/lifecycle_manager.rs:275-278).
+  optional uint64 last_decay_at_unix_ms = 33;
+
+  // last_health_check_at_unix_ms is when active forgetting last ran. It is a
+  // separate field from last_decay_at because Rust advances the two on
+  // different passes, and the differential harness compares both.
+  optional uint64 last_health_check_at_unix_ms = 34;
+}
+
+// Vector is a canonical embedding: the value stored in the vector key space.
+//
+// model_id and dim travel with every vector because nothing in Rust Remem
+// recorded which model produced one (plan §II.10 row 10), and a model change
+// therefore corrupted the space silently — the vectors stayed the right shape
+// and stopped meaning the same thing. A vector whose model_id is not the
+// running model's is refused, not scored.
+message Vector {
+  // model_id names the model that produced the values, e.g. all-MiniLM-L6-v2.
+  string model_id = 1;
+
+  // dim is the vector width. It is stored as well as implied by values so a
+  // truncated value is detectable rather than merely shorter.
+  uint32 dim = 2;
+
+  // values are the components, L2-normalised at the embedder.
+  repeated float values = 3;
+}
+
+enum RecordType {
+  RECORD_TYPE_UNSPECIFIED = 0;
+  RECORD_TYPE_MEMORY = 1;
+}
+
+// Edge is a relationship between two records: the value stored in the out-edge
+// key space, and copied verbatim into the derived in-edge index.
+//
+// It carries only what the key does not. The tenant, the namespace, both
+// endpoints and the relationship type are all in the key, and a second copy in
+// the value is a second thing that can disagree with the first — the same rule
+// Record follows for tenant and namespace.
+//
+// The copy in the in-edge index is what makes "what points at this memory, with
+// what strength" one iterator rather than one read per neighbour. The price is
+// that this message must marshal deterministically, because a rebuild of that
+// index is required to reproduce it byte for byte, and `meta` is a map: Go's
+// protobuf runtime randomises map field order unless it is told not to. See
+// codec.MarshalEdge.
+message Edge {
+  // strength is the weight the relationship carries, 0..1. For an
+  // auto-discovered edge it is the similarity that discovered it; for a
+  // user-created one it is stated confidence. Traversal ranks by the product of
+  // these along a path, which is what plan §II.10 row 7 (REM-83) asks for.
+  float strength = 1;
+
+  uint64 created_at_unix_ms = 2;
+  uint64 updated_at_unix_ms = 3;
+
+  // meta is caller-supplied annotation. It is opaque to Remem: nothing indexes
+  // it, nothing ranks by it, and it survives a round trip unchanged.
+  map<string, string> meta = 4;
+}

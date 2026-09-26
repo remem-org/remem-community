@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+// Package schema.v1 is the durable state of Remem's own evolution: the
+// registered attribute slot table, and the record of every migration that has
+// run against a directory.
+//
+// Both are untenanted system rows, and both are bare protobuf rather than
+// codec-enveloped values — the envelope in internal/codec frames the record key
+// space, and a system row is not a record. The convention matches
+// proto/tenant/v1: field-number evolution is what lets an older binary read a
+// row a newer one wrote, and preserve the fields it never heard of when it
+// writes that row back.
+//
+// The same rules apply here as to every other durable schema in this
+// repository: a field number is never reused for a different meaning, fields
+// are only added or reserved, and `optional` is used wherever absence is
+// meaningful.
+package schema.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/schema/pb;pb";
+
+// SlotSchema is the registered attribute slot table: the value stored at the
+// untenanted system key /slots.
+//
+// It is canonical data in the strict sense — losing it does not lose a memory,
+// but it loses the ability to decode every attribute row on disk, because an
+// attribute row is a packed blob whose fields are addressed by slot number and
+// skipped by declared width. The table is what turns those bytes back into
+// named values.
+message SlotSchema {
+  // version is the schema's own revision, bumped whenever a slot is added or
+  // retired. It is not a storage format version and not a tenant's user-schema
+  // version; it exists so an operator can see that the table moved.
+  uint32 version = 1;
+
+  // slots are the declarations, in no guaranteed order. Readers index by slot
+  // number; the writer sorts for a stable byte representation.
+  repeated Slot slots = 2;
+}
+
+// Slot is one attribute's declaration.
+//
+// A slot number is never reused and a slot is never dropped — it is retired,
+// which keeps its declared type on disk so that rows written before the
+// retirement can still be decoded. The type is what gives a reader the width to
+// skip past a value it no longer has a name for.
+message Slot {
+  // slot is the number. It is a uint16 in Go; proto3 has no narrower integer
+  // than uint32, and the Go side refuses anything that will not fit.
+  uint32 slot = 1;
+
+  // name is what the field is called. It is part of the compatibility surface:
+  // renaming a slot is refused, because the name is how callers address it and
+  // a silent rename would repoint every query at a different column.
+  string name = 2;
+
+  SlotType type = 3;
+
+  // indexed is whether this slot carries an ordered index usable as an access
+  // path. A retired slot has no index whatever this says.
+  bool indexed = 4;
+
+  // retired means the slot is never written to new rows. Its declaration
+  // survives so older rows stay decodable.
+  bool retired = 5;
+}
+
+// SlotType is an attribute's storage type.
+//
+// The fixed-width types are Rust Remem's, with their numbers chosen so an
+// imported corpus needs no remapping. STRING is the one addition, and it is
+// variable-width: a row carrying one length-prefixes it, so skipping past an
+// unknown slot still works.
+enum SlotType {
+  SLOT_TYPE_UNSPECIFIED = 0;
+  SLOT_TYPE_BOOL = 1;
+  SLOT_TYPE_U8 = 2;
+  SLOT_TYPE_U32 = 3;
+  SLOT_TYPE_U64 = 4;
+  SLOT_TYPE_F32 = 5;
+  SLOT_TYPE_STRING = 6;
+}
+
+// MigrationState is the durable record of one migration: the value stored at
+// the untenanted system key /migration/<id>.
+//
+// The fields are spec §20.3's, and no more. It exists so that a migration
+// interrupted by a process restart, a node restart or a cluster failover can be
+// resumed exactly rather than restarted approximately — which for a step that
+// walks a corpus is the difference between minutes and hours, and for a step
+// that is not idempotent is the difference between correct and not.
+message MigrationState {
+  // migration_id is the step's stable id. It is also in the key; the copy here
+  // is what lets a state row be exported and still say what it is about.
+  string migration_id = 1;
+
+  // source_format and target_format are the subsystem versions the step moves
+  // between, captured when it started. They are recorded rather than looked up
+  // so that a resumed run can tell it is resuming the same work: a binary
+  // upgraded mid-migration would otherwise silently continue a step under new
+  // assumptions.
+  map<string, uint32> source_format = 2;
+  map<string, uint32> target_format = 3;
+
+  State state = 4;
+
+  // cursor is where the last checkpoint left off, opaque to everything but the
+  // step that wrote it. It is committed in the same transaction as the work it
+  // describes, so it never points past unfinished work.
+  bytes cursor = 5;
+
+  uint64 processed_count = 6;
+
+  uint64 started_at_unix_ms = 7;
+  uint64 last_progress_at_unix_ms = 8;
+
+  // error is the failure that stopped the last attempt, kept so an operator
+  // finds out why without the log that carried it. Empty unless state is
+  // FAILED.
+  string error = 9;
+
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // PENDING: planned, not yet started.
+    STATE_PENDING = 1;
+    // RUNNING: started and not finished. A row left in this state is what a
+    // crash looks like, and it is what the runner resumes from.
+    STATE_RUNNING = 2;
+    // DONE: terminal and successful.
+    STATE_DONE = 3;
+    // FAILED: the last attempt returned an error. Retried on the next open.
+    STATE_FAILED = 4;
+  }
+}

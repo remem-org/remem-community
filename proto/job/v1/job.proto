@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+// Package job.v1 is the durable job row: the value stored in the job key space.
+//
+// Job state is canonical (plan §II.4). Nothing reconstructs it, and a lost row
+// is lost work — which is the specific Rust defect this framework replaces, a
+// bounded channel that dropped discovery work under load and counted the drops.
+// There is no rebuild path for this space and there must not be one.
+//
+// It is not a fifth independently versioned durable format. Protobuf's
+// field-number evolution carries it forward, which is the same footing the
+// tenant directory and the session registry are on.
+package job.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/jobs/pb;pb";
+
+// Job is one unit of background work.
+//
+// The tenant and the job id are deliberately absent: both are in the key, and a
+// second copy inside the value is a second thing that can disagree with the
+// first. The key also carries the *partition* — pending, running or done — so
+// the state below is the finer logical state within it, and the two are kept in
+// step by writing both halves of every transition in one transaction.
+message Job {
+  // type names the registered handler. It is a durable name: it is written
+  // into every row of that type, and a retired one stays retired.
+  string type = 1;
+
+  // payload is opaque to the framework and meaningful only to the handler.
+  // It is a reference to work, not the work, and is bounded accordingly.
+  bytes payload = 2;
+
+  // state is the logical state: pending, running, retry, completed, failed or
+  // cancelled.
+  uint32 state = 3;
+
+  // attempts counts runs, not retries. max_attempts is the bound it is
+  // compared against; a job that reaches it is failed with last_error kept.
+  uint32 attempts = 4;
+  uint32 max_attempts = 5;
+
+  // run_at_unix_ms is when the job becomes claimable. It is the due time
+  // encoded in a pending key, and it moves forward on every retry.
+  uint64 run_at_unix_ms = 6;
+
+  // lease is present exactly while the job is running.
+  optional Lease lease = 7;
+
+  // checkpoint is the handler's own progress cursor, opaque here. It survives
+  // reclamation and restart, which is what makes a long job restartable
+  // without redoing the half it finished.
+  bytes checkpoint = 8;
+
+  // last_error is the message from the most recent failure, kept so that a
+  // failed job says why without an operator reading the logs.
+  string last_error = 9;
+
+  // priority orders the jobs within one claim batch and nothing wider: the key
+  // is ordered by due time and priority is not in it.
+  int32 priority = 10;
+
+  uint64 created_at_unix_ms = 11;
+  uint64 updated_at_unix_ms = 12;
+
+  // namespace is the subdivision within the tenant the job acts on. It is in
+  // the key as well, and is stored here because a job's *subject* namespace is
+  // what a handler needs and the key's is where the row happens to live —
+  // today they are always the same value and the day they are not, the handler
+  // must read the one it was given.
+  string namespace = 13;
+}
+
+// Lease is one worker's claim on a running job.
+//
+// Owner and token exist from the first commit even though there is one node.
+// That is spec §24's "abstractions compatible with future distributed
+// execution": cross-node claiming becomes a change to how a lease is granted,
+// never a change to a handler, and retrofitting fencing later would mean
+// auditing every handler there is.
+message Lease {
+  // owner is the node id that holds the lease.
+  string owner = 1;
+
+  // expires_at_unix_ms is when the claim lapses and the job may be reclaimed.
+  // It is also the due time encoded in a running key, so reclaiming lapsed
+  // leases is the same bounded forward scan that claiming due work is.
+  uint64 expires_at_unix_ms = 2;
+
+  // token fences a reclaimed job against its previous owner. Reclamation draws
+  // a new one, so a worker that wakes up holding the old one is refused rather
+  // than allowed to complete work somebody else has since redone.
+  bytes token = 3;
+}
+
+// Pause is an operator's suppression of one recurring type's scheduling in one
+// tenant.
+//
+// The type it suppresses is in the key as well as here for the reason the job
+// row's namespace is: the key is where the row lives, and this is what the
+// record says about itself. A pause is not a boolean, because a suppression
+// with no expiry outlives the memory of setting it — and what these jobs do is
+// repair.
+message Pause {
+  // type names the registered recurring type whose scheduled enqueueing is
+  // suppressed. Manual runs are unaffected.
+  string type = 1;
+
+  // expires_at_unix_ms is when the suppression lifts. It is required and
+  // bounded: the scheduler compares it against its own clock, so a crash or a
+  // missed cleanup cannot leave a pause in force indefinitely.
+  uint64 expires_at_unix_ms = 2;
+
+  // set_by is the operator credential that asked for the pause, so that the
+  // status surface can say who suppressed the work rather than only that
+  // somebody did.
+  string set_by = 3;
+
+  uint64 set_at_unix_ms = 4;
+}
+
+// Run is one execution attempt, retained for jobs.retention.
+//
+// It describes one attempt and not a deduplicated total across retries:
+// delivery is at-least-once, so the same record can be visited more than once
+// and a sum across attempts is not a count of distinct records.
+message Run {
+  // job_id is the job this attempt belongs to. Several runs share one.
+  bytes job_id = 1;
+
+  // type names the registered handler, copied here because history is read by
+  // type and the job row it came from may already have been reaped.
+  string type = 2;
+
+  // attempt is the run number the queue charged, counting from one.
+  uint32 attempt = 3;
+
+  uint64 started_at_unix_ms = 4;
+  uint64 finished_at_unix_ms = 5;
+
+  // outcome is the logical state the attempt ended in: completed, retry,
+  // failed or cancelled.
+  uint32 outcome = 6;
+
+  // error is the failure message, empty on success.
+  string error = 7;
+
+  // records_processed and records_changed are what the handler reported for
+  // this attempt, and are absent when it reported nothing. Absent is not zero:
+  // "this attempt changed nothing" and "nobody counted" are different answers,
+  // and neither may be inferred from a checkpoint, an elapsed time or the size
+  // of an index afterwards.
+  optional uint64 records_processed = 8;
+  optional uint64 records_changed = 9;
+
+  // owner is the node that ran the attempt.
+  string owner = 10;
+
+  // namespace is the subdivision the attempt acted on.
+  string namespace = 11;
+}

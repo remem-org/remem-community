@@ -1,41 +1,35 @@
+# Remem Community Edition: the server.
+#
+# Start it with:
+#   mkdir -p ./remem-data && sudo chown 10001:10001 ./remem-data
+#   REMEM_SERVER_API_KEY='replace-with-a-long-random-secret' docker compose up --build -d
+#
+# The corpus lives on the host, in the directory REMEM_DATA_DIR names --
+# ./remem-data by default, resolved from the Compose project directory. It is a
+# bind mount rather than a Docker-managed named volume, so every durable Remem
+# data structure is where an operator can see and back it up, and
+# `docker compose down -v` no longer reaches it. The directory must be writable
+# by the container's user, uid 10001. See .env.example and docs/DEPLOYMENT.md,
+# which also has the migration off the old `remem-data` named volume.
+#
+# The repository root's docker-compose.yml is a copy of this file, so that
+# `docker compose up` works in a checkout; an edition release writes its own.
 services:
-  # ============================================================
-  # RUST BACKEND - remem-server
-  # ============================================================
-  remem-server:
+  remem:
     build:
       context: .
-      dockerfile: docker/remem-server.Dockerfile
+      dockerfile: docker/Dockerfile
       args:
-        EDITION_FEATURES: ""  # community: no business Rust features
-    container_name: remem-server
-    ports:
-      - "4545:4545"
-    volumes:
-      - ./data/remem:/var/lib/remem:Z
-      - ./config/remem-server.toml:/etc/remem/config.toml:ro,Z
+        GO_BUILD_TAGS: ""
+    image: remem-go:community
     environment:
-      - RUST_LOG=info
-      - REMEM_ENV=${REMEM_ENV:-development}
-      - REMEM_API_KEY=${REMEM_API_KEY:-}
-      - REMEM_API_KEY_SECONDARY=${REMEM_API_KEY_SECONDARY:-}
-      - REMEM_ALLOW_AUTH_DISABLED=${REMEM_ALLOW_AUTH_DISABLED:-false}
-      - REMEM_CORS_ORIGINS=${REMEM_CORS_ORIGINS:-http://localhost:3000}
-      - OMP_NUM_THREADS=4
-      - ORT_NUM_INTRA_THREADS=4
-      - REMEM_RATE_LIMIT_RPS=${REMEM_RATE_LIMIT_RPS:-100}
-      - REMEM_RATE_LIMIT_BURST=${REMEM_RATE_LIMIT_BURST:-50}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4545/api/v1/ready"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5m     # extra time for migrations/index backfills + ONNX model load
+      REMEM_SERVER_API_KEY: ${REMEM_SERVER_API_KEY:?set REMEM_SERVER_API_KEY to a long random secret}
+      REMEM_SERVER_ENV: production
+    ports:
+      - "${REMEM_HTTP_PORT:-4545}:4545"
+    # :z relabels the host directory for SELinux, which otherwise refuses the
+    # container access ("permission denied" on an enforcing host, found by
+    # Phase 13's end-to-end run). Hosts without SELinux ignore it.
+    volumes:
+      - ${REMEM_DATA_DIR:-./remem-data}:/var/lib/remem:z
     restart: unless-stopped
-    networks:
-      - remem-network
-
-networks:
-  remem-network:
-    driver: bridge
-    name: remem-network

@@ -124,14 +124,14 @@ MEMORY_TYPES = ["short_term", "long_term"]
 
 def default_api_key() -> str:
     """Read the API key from the environment or the repository's .env file."""
-    if api_key := os.environ.get("REMEM_API_KEY", "").strip():
+    if api_key := os.environ.get("REMEM_SERVER_API_KEY", "").strip():
         return api_key
 
     env_path = Path(__file__).resolve().parent.parent / ".env"
     try:
         for line in env_path.read_text().splitlines():
             key, separator, value = line.partition("=")
-            if separator and key.strip() == "REMEM_API_KEY":
+            if separator and key.strip() == "REMEM_SERVER_API_KEY":
                 return value.strip().strip("'\"")
     except FileNotFoundError:
         pass
@@ -157,7 +157,7 @@ def random_memory() -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "content": random_content(),
-        "memory_type": memory_type,
+        "policy": memory_type,
         "tags": tags,
         "importance": importance,
         "source": source,
@@ -165,7 +165,7 @@ def random_memory() -> dict[str, Any]:
 
     if memory_type == "short_term":
         # TTL between 1 hour and 7 days
-        payload["ttl"] = random.randint(3600, 604800)
+        payload["ttl_seconds"] = random.randint(3600, 604800)
 
     return payload
 
@@ -239,7 +239,7 @@ async def run(url: str, count: int, concurrency: int, api_key: str, max_retries:
     counter: list[int] = [0]
     errors: Counter[str] = Counter()
     error_samples: dict[str, str] = {}
-    headers = {"X-API-Key": api_key} if api_key else {}
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     print(f"Generating {count:,} memories -> {url}")
     print(f"Concurrency: {concurrency}")
@@ -266,7 +266,7 @@ async def run(url: str, count: int, concurrency: int, api_key: str, max_retries:
                 f"remem-server rejected the API preflight: HTTP {exc.response.status_code} — {detail}",
                 file=sys.stderr,
             )
-            print("Set REMEM_API_KEY in .env, export it, or pass --api-key.", file=sys.stderr)
+            print("Set REMEM_SERVER_API_KEY in .env, export it, or pass --api-key.", file=sys.stderr)
             raise SystemExit(2) from exc
 
         tasks = [
@@ -307,8 +307,8 @@ def main() -> None:
     parser.add_argument(
         "--count",
         type=int,
-        default=100_000,
-        help="Number of memories to generate (default: 100000)",
+        default=10_000,
+        help="Number of memories to generate (default: 10000)",
     )
     parser.add_argument(
         "--concurrency",
@@ -319,7 +319,7 @@ def main() -> None:
     parser.add_argument(
         "--api-key",
         default=default_api_key(),
-        help="API key (default: REMEM_API_KEY environment variable or repository .env)",
+        help="API key (default: REMEM_SERVER_API_KEY environment variable or repository .env)",
     )
     parser.add_argument(
         "--max-retries",

@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+// Package session.v1 is the MCP session row: the value stored in the session
+// key space.
+//
+// A session is canonical but expendable (plan §II.2): losing one costs a client
+// a re-initialise, not data. It is stored rather than held in memory anyway,
+// because the alternative strands every connected agent on a rolling restart —
+// and a row per session is a rounding error against the memories beside it.
+package session.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/session/pb;pb";
+
+// Session is one MCP session.
+//
+// The tenant is deliberately absent: it is in the key, and a second copy inside
+// the value is a second thing that can disagree with the first.
+message Session {
+  // principal names the credential that opened the session, for audit. It is
+  // never the secret.
+  string principal = 1;
+
+  // client_name and client_version are what the client called itself at
+  // initialize. They are the only way to answer "which agent is doing this"
+  // when one starts misbehaving.
+  optional string client_name = 2;
+  optional string client_version = 3;
+
+  // protocol_version is the version negotiated at initialize, so a session
+  // opened by an older client keeps being answered the way it expects.
+  string protocol_version = 4;
+
+  uint64 created_at_unix_ms = 5;
+  uint64 last_seen_at_unix_ms = 6;
+}

@@ -1,0 +1,33 @@
+# The build context: what `docker build` sends, and what the builder stage's
+# `COPY . .` copies. The image fetches its own ONNX Runtime, tokenizer and model
+# (docker/Dockerfile), so it needs the source and nothing local.
+#
+# Without this file the context was the whole checkout: an .env holding real
+# credentials went into the builder stage's layers, and two gigabytes of
+# benchmark data went over the wire on every build.
+.git
+.env
+.env.*
+.benchmark-data
+.tools
+.models
+.remember
+.claude
+.agents
+.superpowers
+data
+*.out
+*.test
+
+# The backoffice's dependencies, build output and caches. Without these the
+# build context carries every npm package and every .pyc, and each image builds
+# its own dependencies anyway. The Python patterns are unanchored for the same
+# reason as in .gitignore: a __pycache__ appears beside every package the
+# interpreter touches.
+backoffice/frontend/node_modules/
+backoffice/frontend/dist/
+backoffice/frontend/coverage/
+backoffice/backend/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/

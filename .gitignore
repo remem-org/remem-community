@@ -1,297 +1,95 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
-
-# C extensions
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
 *.so
+*.dylib
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# Test binary, built with `go test -c`
+*.test
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
+# Code coverage profiles and other test artifacts.
+#
+# `coverage.*` is deliberately absent. macOS matches gitignore patterns
+# case-insensitively, so it swallowed test/differential/COVERAGE.md — a document
+# CLAUDE.md tells a reader to consult before trusting the harness, which was
+# therefore never in the repository at all. The generated artefacts are named
+# explicitly instead.
+*.out
+coverage.html
+coverage.txt
 coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+*.coverprofile
+profile.cov
 
-# Translations
-*.mo
-*.pot
+# Dependency directories (remove the comment below to include it)
+# vendor/
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# Go workspace file
+go.work
+go.work.sum
 
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
-
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
-
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
-
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
-
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
+# env file
 .env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
-
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer,
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-# =============================================================================
-# Rust
-# =============================================================================
-
-# Cargo build artifacts
-target/
-
-# Workspace lock file for the storage sub-crate when used standalone
-# (workspace uses root Cargo.lock)
-storage/Cargo.lock
-
-# =============================================================================
-# Remem Project Specific
-# =============================================================================
-
-# Environment files
-.env.local
-.env.*.local
-
-# Docker Hub push credentials for scripts/publish-docker-community.sh —
-# deliberately kept out of the shared .env (that one gets loaded by docker
-# compose for the running app stack; a registry push token has no business
-# being reachable from there).
+# Docker Hub publication credentials for scripts/publish-docker-community.sh.
+# Keep these outside the Compose .env so a registry token is never supplied to
+# an application container.
 .env.docker-publish
 
-# IDEs
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
+# Editor/IDE
+# .idea/
+# .vscode/
 
-# Database files
-*.db
-*.sqlite
+# Build and coverage output
+/cover.out
+/bin/
 
-# Docker volumes (if mounted locally)
-data/
-volumes/
-postgres_data/
-neo4j_data/
-qdrant_data/
-redis_data/
+# Pinned code-generation binaries, installed by `make proto`.
+.tools/
 
-# Stray root-level memory-tool directory (REM-41) — old memory-tool
-# convention, superseded by the per-project memory dir under ~/.claude/
-/memory/
+# Model artefacts fetched by scripts/fetch-model.sh. Ninety megabytes of
+# weights are not a thing a source repository holds.
+.models/
 
-# Temporary files
-tmp/
-temp/
-*.tmp
+# The Rust reference corpora, regenerated by `make fixtures`. 22 MB of derived
+# bytes that the same seed reproduces byte for byte against the frozen tree —
+# the pinned digests in scripts/generate-fixtures.sh are what is worth keeping,
+# not the corpora. The tests that read them skip when they are absent.
+/fixtures/rust/
 
-# Model cache files (sentence-transformers, etc.)
-.cache/
-huggingface/
+# rapid writes a reproduction file under testdata/rapid/ when a property test
+# fails. It is a local debugging artefact keyed to one machine's run: the seed
+# it holds only reproduces the failure against the same code, so committing it
+# would pin a mystery nobody else can re-run. Property tests seed their own
+# generators from drawn values instead, so a failure reproduces from the draws
+# printed in the output.
+testdata/rapid/
 
-# Backup files
-*.bak
-*.backup
+# Benchmark runs write real databases here, never under /tmp. Kept for
+# inspection and never committed (bench/, scripts/benchmark.sh).
+/.benchmark-data/
+/.superpowers/
 
-# OS generated files
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
+# The backoffice's Python virtual environment.
+backoffice/backend/.venv/
 
-# Git worktrees
-.worktrees/
-.claude/
+# The backoffice frontend's dependencies and build output.
+backoffice/frontend/node_modules/
+backoffice/frontend/dist/
+backoffice/frontend/coverage/
+# Python bytecode and test caches, anywhere in the tree. Unanchored on purpose:
+# these appear beside every package the interpreter touches, under
+# backoffice/backend/ and under .benchmark-data/ alike, so a path-anchored
+# pattern would miss the next place one turns up.
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
-# Playwright E2E
-tests/e2e/node_modules/
-tests/e2e/test-results/
-tests/e2e/playwright-report/
-tests/e2e/.playwright/
-tests/e2e/dist/
-test-results/
-.superpowers/
-.mcp.json
-.remember/
-crates/remem-server/.fastembed_cache
-
-# Local test-only model cache extracted from the runtime image (REM-78).
-.test-cache/
-.benchmark-data/
+# The default Remem data directory for a Compose deployment in a checkout
+# (REMEM_DATA_DIR, docker-compose.yml). It is a live Pebble database, not
+# source.
+/remem-data/

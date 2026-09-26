@@ -1,0 +1,12 @@
+# 2026/09/06 10:16:47.554928 [TestDocRowRoundTripsAndIsOrderIndependent] [rapid] draw terms: []string{"", ""}
+# 2026/09/06 10:16:47.554961 [TestDocRowRoundTripsAndIsOrderIndependent] [rapid] draw doc_len: 0x0
+# 2026/09/06 10:16:47.554964 [TestDocRowRoundTripsAndIsOrderIndependent] terms: got ["" ""], want [""]
+# 
+v0.4.8#6406334010105807883
+0x5555555555555
+0x0
+0x5555555555555
+0x0
+0x0
+0x0
+0x0
