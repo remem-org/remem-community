@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/events"
 	"github.com/remem-org/remem-go/internal/id"
@@ -58,6 +59,9 @@ func (s *Service) Update(ctx context.Context, req UpdateReq) (*Memory, error) {
 	if req.ID.IsZero() {
 		return nil, errs.E(errs.Invalid, op, fmt.Errorf("an update needs a memory to change"))
 	}
+	if err := s.validateSupplied(req, op); err != nil {
+		return nil, err
+	}
 	if req.isEmpty() {
 		return nil, errs.E(errs.Invalid, op, fmt.Errorf(
 			"an update must change something; every field was left unset"))
@@ -94,9 +98,20 @@ func (s *Service) Update(ctx context.Context, req UpdateReq) (*Memory, error) {
 
 	var newVector *vector.Vector
 	if req.Content != nil && *req.Content != probe.Content {
-		vs, eerr := s.embedder.Embed(ctx, []string{*req.Content})
-		if eerr != nil {
-			return nil, eerr
+		var vs [][]float32
+		if embedding.CallerSupplied(s.embedder) {
+			// Already checked by validateSupplied; this copies it.
+			v, eerr := s.suppliedVector("embedding", req.Embedding, op, "")
+			if eerr != nil {
+				return nil, eerr
+			}
+			vs = [][]float32{v}
+		} else {
+			var eerr error
+			vs, eerr = s.embedder.Embed(ctx, []string{*req.Content})
+			if eerr != nil {
+				return nil, eerr
+			}
 		}
 		if len(vs) != 1 {
 			return nil, errs.E(errs.Storage, op, fmt.Errorf(
@@ -280,4 +295,26 @@ func (r UpdateReq) validate(op string) error {
 		c.TTL = *r.TTL
 	}
 	return validateCreate(0, c, op)
+}
+
+// validateSupplied settles an update's vector against where this server's
+// vectors come from, before anything is read: the refusals depend on the
+// request and the server alone.
+func (s *Service) validateSupplied(req UpdateReq, op string) error {
+	if !embedding.CallerSupplied(s.embedder) {
+		if req.Embedding != nil {
+			return errs.E(errs.Invalid, op, fmt.Errorf(
+				"embedding was supplied, but this server computes its own embeddings from content; send the content alone"))
+		}
+		return nil
+	}
+	if req.Content == nil {
+		if req.Embedding != nil {
+			return errs.E(errs.Invalid, op, fmt.Errorf(
+				"embedding was supplied without content; a vector describes the content it travels with, so send both"))
+		}
+		return nil
+	}
+	_, err := s.suppliedVector("embedding", req.Embedding, op, "")
+	return err
 }

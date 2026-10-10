@@ -42,6 +42,12 @@ type SearchRequest struct {
 	// Explain returns the per-index evidence behind each hit.
 	Explain         bool `json:"explain,omitempty"`
 	IncludeArchived bool `json:"include_archived,omitempty"`
+
+	// QueryVector is the caller's vector for a semantic or hybrid search, on a
+	// server configured with embedding.provider = "external". There it is
+	// required, and a semantic search needs no query text beside it; a server
+	// that computes its own embeddings refuses it by name.
+	QueryVector []float32 `json:"query_vector,omitempty"`
 }
 
 // SearchResponse is a ranked answer.
@@ -127,6 +133,7 @@ func (d Deps) searchMemories(w http.ResponseWriter, r *http.Request) {
 		Cursor:          body.Cursor,
 		Explain:         body.Explain,
 		IncludeArchived: body.IncludeArchived,
+		QueryVector:     body.QueryVector,
 	})
 	if err != nil {
 		WriteError(w, r, err)

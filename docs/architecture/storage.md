@@ -106,6 +106,20 @@ publishes none of the batch. Record read-modify-write paths use this to prevent
 a stale archive or lazy upgrade from overwriting a concurrent update or
 resurrecting a hard-deleted record.
 
+That serialization is **striped by tenant**, not store-wide. Pebble is safe for
+concurrent writers by itself; the adapter's write lock exists only so that the
+condition checks and the apply cannot be separated by another writer. A key's
+stripe is a hash of the tenant in its scope prefix (`keys.TenantOf`), the
+untenanted system space takes one stripe of its own, and every writer — `Set`,
+`Delete`, and a batch commit — holds the stripe of each key it touches, a batch
+adding its condition keys to the set and locking the set in ascending order.
+The guarantee a condition gets is therefore: *a conditional commit is atomic
+against every other write touching the same tenant, or the system space.* That
+is the whole of what a condition can need, because a condition names a key and
+only a writer of that key can falsify it — and it leaves two tenants' writers
+out of each other's way. Stripe collisions between tenants cost throughput,
+never correctness.
+
 `storage.Snapshot` is the read boundary. It pins a state. The memory service
 keeps that object in a bounded paging-session registry, so every page reads the
 same state and mutable ordering values cannot move across the cursor. Snapshot

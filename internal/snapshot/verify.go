@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/graph"
 	"github.com/remem-org/remem-go/internal/id"
@@ -115,7 +116,9 @@ func (r *VerifyReport) add(f Finding) {
 // is one this binary's model wrote. A Rust snapshot's vectors are in a different
 // space (§II.10 row 16) and the store's are recomputed, so comparing them would
 // be a measurement of the pooling difference. The norm is still worth checking:
-// it is one, and a vector whose norm has drifted is one that will rank wrongly.
+// it is one for this binary's model, and a vector whose norm has drifted is one
+// that will rank wrongly. A vector a caller supplied is stored as given, so it
+// is held to the norm it had in the file instead.
 //
 // Derived rows are not compared at all. They are not in the file, and they are
 // rebuilt rather than restored.
@@ -375,12 +378,23 @@ func (v *verifier) compareRecord(t tenant.ID, rec *record.Record, sameModel bool
 			Kind: FindingExtra, What: "vector", Tenant: t, Ref: rec.ID.String(),
 			Detail: "the store holds an embedding the snapshot does not",
 		})
-	case stored != nil:
+	case stored != nil && stored.ModelID == embedding.Model:
 		if n := norm(stored.Values); math.Abs(n-1) > 1e-3 {
 			v.report.add(Finding{
 				Kind: FindingDiffers, What: "vector", Tenant: t, Ref: rec.ID.String(),
 				Detail: fmt.Sprintf("the stored embedding has norm %.6f, not one; it will rank "+
 					"against a corpus it is not on the same scale as", n),
+			})
+		}
+	case stored != nil && hadVector && sameModel:
+		// A caller's vector, stored as given. Unit length is this binary's
+		// model's promise and not the caller's, so the norm to hold it to is
+		// the one it had in the file.
+		if n, want := norm(stored.Values), v.vectors[key]; math.Abs(n-want) > 1e-3*math.Max(1, want) {
+			v.report.add(Finding{
+				Kind: FindingDiffers, What: "vector", Tenant: t, Ref: rec.ID.String(),
+				Detail: fmt.Sprintf("the stored embedding has norm %.6f and the snapshot's has %.6f; "+
+					"it is not the vector the file carried", n, want),
 			})
 		}
 	}

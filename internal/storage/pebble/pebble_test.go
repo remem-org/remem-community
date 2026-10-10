@@ -43,6 +43,38 @@ func TestPebbleErrorsAreNeverExposed(t *testing.T) {
 	}
 }
 
+// The two tuning options are a Pebble concept each, so what has to be shown is
+// that setting them still produces a store that reads back what it wrote: a
+// bloom filter that answered wrongly would turn a present key into a miss, and
+// a memtable size Pebble refused would turn the open into an error.
+func TestABloomFilterAndALargerMemtableStillRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	kv, err := pebble.Open(t.TempDir(), pebble.Options{
+		MemTableSizeBytes: 64 << 20,
+		BloomBitsPerKey:   10,
+	})
+	if err != nil {
+		t.Fatalf("open with a filter and a larger memtable: %v", err)
+	}
+	t.Cleanup(func() { _ = kv.Close() })
+
+	if err := kv.Set(ctx, []byte("present"), []byte("value")); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, err := kv.Get(ctx, []byte("present"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(got) != "value" {
+		t.Fatalf("get = %q, want %q", got, "value")
+	}
+	// A filter may say "maybe"; it may never say "no" about a key that is
+	// there, and it must not turn an absent key into anything but NotFound.
+	if _, err := kv.Get(ctx, []byte("absent")); !errs.Is(err, errs.NotFound) {
+		t.Fatalf("absent key: want NotFound, got %v", err)
+	}
+}
+
 func open(t *testing.T) storage.KV {
 	t.Helper()
 	kv, err := pebble.Open(t.TempDir(), pebble.Options{})

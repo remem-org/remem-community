@@ -15,6 +15,18 @@ import (
 // punctuation beyond - and _, short enough to prefix every key it scopes.
 var tenantIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 
+// MaxIndexQueueSize is the largest vector.index_queue_size a server will start
+// with.
+//
+// A bound needs two ends. The lower one is already here because zero would put
+// the insert back on the request path silently; this is the upper one, and it
+// exists because the queue allocates its channel at that depth per worker and
+// each slot holds an embedding. A million slots is about 1.5 GB of queued
+// vectors at 384 dimensions and a megabyte of channel per worker before a
+// single operation arrives — far past any burst a server absorbs, and a digit
+// slipped into a configuration file rather than a number anybody chose.
+const MaxIndexQueueSize = 1 << 20
+
 // Validate checks the whole configuration and reports every problem at once.
 //
 // Spec §51 asks for validation at startup and a fast failure on invalid
@@ -24,6 +36,14 @@ var tenantIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 // mistakes reports three, not one per restart.
 func (c Config) Validate() error {
 	var p problems
+
+	// Runtime. -1 is refused by name rather than as a negative number, because
+	// it is the Go runtime's own spelling of "do not collect" — a value an
+	// operator may mean, where -2 is only ever a typo.
+	p.require(c.Runtime.GCPercent >= 0 || c.Runtime.GCPercent == -1, "runtime.gc_percent",
+		"is a percentage of live data, so it cannot be negative; -1 alone is allowed, and turns the collector off")
+	p.require(c.Runtime.MemoryLimitBytes >= 0, "runtime.memory_limit_bytes",
+		"cannot be negative; zero is no limit")
 
 	// Storage.
 	p.require(c.Storage.Path != "", "storage.path", "must name a data directory")
@@ -36,6 +56,10 @@ func (c Config) Validate() error {
 		p.add("storage.engine", `"memory" keeps nothing across a restart; a production server needs "pebble"`)
 	}
 	p.require(c.Storage.CacheSizeBytes >= 0, "storage.cache_size_bytes", "cannot be negative")
+	p.require(c.Storage.MemTableSizeBytes >= 0, "storage.memtable_size_bytes",
+		"cannot be negative; zero takes the engine's own default")
+	p.require(c.Storage.BloomBitsPerKey >= 0, "storage.bloom_bits_per_key",
+		"cannot be negative; zero writes no filter")
 
 	// Server.
 	p.oneOf(c.Server.Env, []string{"development", "production"}, "server.env")
@@ -82,12 +106,32 @@ func (c Config) Validate() error {
 	p.require(c.Embedding.MaxSequenceTokens > 0, "embedding.max_sequence_tokens", "must be greater than zero")
 	p.require(c.Embedding.CacheSize >= 0, "embedding.cache_size", "cannot be negative")
 	p.require(c.Embedding.Workers > 0, "embedding.workers", "must be greater than zero")
+	p.require(c.Embedding.IntraOpThreads >= 0, "embedding.intra_op_threads",
+		"cannot be negative; zero derives it from the CPUs this process may use")
 	p.positive(c.Embedding.FillWindow, "embedding.fill_window")
 
 	p.require(c.Vector.Dimension > 0, "vector.dimension", "must be greater than zero")
-	if c.Embedding.Model == EmbeddingModel && c.Vector.Dimension != EmbeddingDimension {
-		p.add("vector.dimension", fmt.Sprintf("is %d, but embedding.model %q produces %d-dimensional vectors",
-			c.Vector.Dimension, EmbeddingModel, EmbeddingDimension))
+	p.oneOf(c.Embedding.Provider, []string{ProviderONNX, ProviderExternal}, "embedding.provider")
+	switch c.Embedding.Provider {
+	case ProviderExternal:
+		// The caller declares the model, so the width is theirs to declare too.
+		p.require(c.Embedding.ExternalModelID != "", "embedding.external_model_id",
+			"must name the model the caller's vectors come from when embedding.provider is external; it is stamped on every stored vector")
+		if c.Embedding.ExternalModelID == EmbeddingModel {
+			p.add("embedding.external_model_id", fmt.Sprintf(
+				"cannot be %q: vectors this server did not compute would claim to be comparable with ones it did", EmbeddingModel))
+		}
+		if c.Vector.Dimension > MaxExternalDimension {
+			p.add("vector.dimension", fmt.Sprintf("is %d; the widest supported is %d", c.Vector.Dimension, MaxExternalDimension))
+		}
+	default:
+		if c.Embedding.ExternalModelID != "" {
+			p.add("embedding.external_model_id", "is set, but embedding.provider is onnx and computes its own vectors; set embedding.provider = \"external\" or remove it")
+		}
+		if c.Embedding.Model == EmbeddingModel && c.Vector.Dimension != EmbeddingDimension {
+			p.add("vector.dimension", fmt.Sprintf("is %d, but embedding.model %q produces %d-dimensional vectors",
+				c.Vector.Dimension, EmbeddingModel, EmbeddingDimension))
+		}
 	}
 	p.oneOf(c.Vector.Index, []string{"flat", "hnsw"}, "vector.index")
 	p.oneOf(c.Vector.Metric, []string{"cosine", "dot", "l2"}, "vector.metric")
@@ -97,6 +141,24 @@ func (c Config) Validate() error {
 		p.require(c.Vector.HNSWEfSearch > 0, "vector.hnsw_ef_search", "must be greater than zero when vector.index is hnsw")
 		p.require(c.Vector.ResidentBudgetMB > 0, "vector.resident_budget_mb",
 			"must be greater than zero when vector.index is hnsw: an index allowed no memory can hold no tenant")
+	}
+	// Negative is refused whatever vector.async_indexing says: zero and a size
+	// past the bound are only wrong for a queue that exists, but a negative
+	// size is never a value anyone means, and the queue is off by default.
+	p.require(c.Vector.IndexQueueSize >= 0, "vector.index_queue_size",
+		"cannot be negative")
+	if c.Vector.AsyncIndexing {
+		// Only when the queue exists. Zero is not "the default" here: a queue
+		// of nothing would make every create wait for the insert it believed
+		// it had moved off the request path, which is worse than setting
+		// vector.async_indexing = false and meaning it.
+		p.require(c.Vector.IndexQueueSize > 0, "vector.index_queue_size",
+			"must be greater than zero when vector.async_indexing is on: a queue of nothing "+
+				"puts the index insert back on the request path without saying so")
+		p.require(c.Vector.IndexQueueSize <= MaxIndexQueueSize, "vector.index_queue_size",
+			fmt.Sprintf("cannot be above %d: each slot holds a queued embedding, so one worker's "+
+				"channel is allocated up front and a bound this size is already about 1.5 GB of "+
+				"them at 384 dimensions", MaxIndexQueueSize))
 	}
 
 	// Text.
@@ -110,6 +172,8 @@ func (c Config) Validate() error {
 	p.require(c.Search.WidenMaxFactor >= 1, "search.widen_max_factor", "must be at least one: a search that cannot widen its candidate set cannot answer a filtered query")
 	p.require(c.Search.ListMaxFactor >= 1, "search.list_max_factor", "must be at least one: a listing that cannot widen cannot fill a page under a filter")
 	p.ratio(c.Search.SimilarityThreshold, "search.similarity_threshold")
+	p.require(c.Search.RowCacheEntries >= 0, "search.row_cache_entries",
+		"is a number of cached attribute rows, so it cannot be negative; zero turns the cache off")
 
 	// Lifecycle.
 	p.positive(c.Lifecycle.SweepInterval, "lifecycle.sweep_interval")

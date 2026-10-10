@@ -1,76 +1,83 @@
 package memory
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
-	"fmt"
 	"math"
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/attr"
-	"github.com/remem-org/remem-go/internal/graph"
-	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/query"
 )
 
-// legacyFingerprint is searchFingerprint as it was written before Phase 13
-// made it cheaper: one binary.Write per vector component, which reflects on
-// every call. At 384 dimensions that was 384 reflective writes a search. It is
-// kept here as the reference the cheaper encoding must match byte for byte.
-func legacyFingerprint(q *query.Query, includeArchived bool) [32]byte {
-	h := sha256.New()
-	fmt.Fprintf(h, "v1 tenant=%q namespace=%q text=%q keyword=%t explain=%t archived=%t order=%d desc=%t\n",
-		q.Tenant, q.Namespace, q.Text, q.Keyword, q.Explain, includeArchived, q.OrderBy, q.Desc)
-	for _, tag := range q.Tags {
-		fmt.Fprintf(h, "tag=%q\n", tag)
+func fingerprintVector(n int) []float32 {
+	v := make([]float32, n)
+	for i := range v {
+		v[i] = float32(math.Sin(float64(i))) * 0.1
 	}
-	for _, p := range q.Preds {
-		fmt.Fprintf(h, "pred=%q\n", p.String())
-	}
-	fmt.Fprintf(h, "related=%v depth=%d direction=%q strength=%08x\n",
-		q.RelatedTo, q.RelatedDepth, q.RelatedDirection, math.Float32bits(q.RelatedMinStrength))
-	for _, typ := range q.RelatedTypes {
-		fmt.Fprintf(h, "type=%q\n", typ)
-	}
-	fmt.Fprintf(h, "vector=%d\n", len(q.Vector))
-	for _, v := range q.Vector {
-		_ = binary.Write(h, binary.LittleEndian, v)
-	}
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
+	return v
 }
 
-// The fingerprint binds a paging cursor to the exact query that made it, so a
-// faster encoding must not change a single byte of what is hashed: a cursor
-// minted before a change and presented after it would otherwise be refused as
-// belonging to another query.
-func TestSearchFingerprintIsUnchangedByItsEncoding(t *testing.T) {
-	anchor := id.New()
-	vec384 := make([]float32, 384)
-	for i := range vec384 {
-		vec384[i] = float32(math.Sin(float64(i))) * 0.1
+// A fingerprint is only ever compared with one computed in this process, inside
+// the lifetime of a paging session, which lives in memory and never survives a
+// restart. Within that process it has to be perfectly stable: a seed drawn per
+// call or per Service would refuse every continuation of every search.
+func TestSearchFingerprintIsStableWithinTheProcess(t *testing.T) {
+	_, one := newSearchPagingService(t, nil, Config{})
+	_, two := newSearchPagingService(t, nil, Config{})
+	q := &query.Query{Tenant: "acme", Text: "raft leader election", Vector: fingerprintVector(384), Limit: 10}
+	first := one.searchFingerprint(q, false)
+	if one.searchFingerprint(q, false) != first {
+		t.Fatal("one service fingerprinted one query differently twice")
 	}
-	for name, q := range map[string]*query.Query{
-		"empty":    {Tenant: "acme"},
-		"semantic": {Tenant: "acme", Text: "raft leader election", Vector: vec384, Limit: 10},
-		"keyword":  {Tenant: "acme", Text: "INV-2024", Keyword: true, Tags: []string{"finance", "q3"}},
-		"filtered": {Tenant: "acme", Vector: []float32{1, 0, -0.5, math.MaxFloat32},
-			Preds: attr.Preds{attr.Eq(attr.SlotPolicy, attr.Str("long_term"))}},
-		"related": {Tenant: "acme", Vector: vec384[:8], RelatedTo: &anchor, RelatedDepth: 2,
-			RelatedDirection: graph.Out, RelatedMinStrength: 0.25,
-			RelatedTypes: []graph.RelationshipType{graph.RelatedTo, graph.Supports}},
-	} {
-		for _, archived := range []bool{false, true} {
-			if got, want := (&Service{}).searchFingerprint(q, archived), legacyFingerprint(q, archived); got != want {
-				t.Errorf("%s (include_archived=%t): fingerprint changed", name, archived)
-			}
+	if two.searchFingerprint(q, false) != first {
+		t.Fatal("the seed is not process-wide")
+	}
+	other := *q
+	other.Text = "paxos leader election"
+	if one.searchFingerprint(&other, false) == first {
+		t.Fatal("two questions share a fingerprint")
+	}
+}
+
+// The vector is the whole of a semantic question. Hashing only its length, or
+// any prefix of it, would resume a cursor against the ranking of a different
+// embedding.
+func TestSearchFingerprintBindsEveryVectorComponent(t *testing.T) {
+	_, svc := newSearchPagingService(t, nil, Config{})
+	base := query.Query{Tenant: "acme", Vector: fingerprintVector(384), Limit: 10}
+	want := svc.searchFingerprint(&base, false)
+	for _, i := range []int{0, 1, 191, 382, 383} {
+		q := base
+		q.Vector = append([]float32(nil), base.Vector...)
+		q.Vector[i] += 1e-7
+		if svc.searchFingerprint(&q, false) == want {
+			t.Fatalf("component %d did not bind", i)
 		}
+	}
+	// A component moving to its neighbour keeps the byte stream's length and
+	// every other component, so only a position-sensitive hash separates them.
+	q := base
+	q.Vector = append([]float32(nil), base.Vector...)
+	q.Vector[7], q.Vector[8] = q.Vector[8], q.Vector[7]
+	if svc.searchFingerprint(&q, false) == want {
+		t.Fatal("swapping two components did not bind")
 	}
 }
 
 func BenchmarkSearchFingerprint384(b *testing.B) {
 	q := &query.Query{Tenant: "acme", Text: "raft leader election", Vector: make([]float32, 384)}
+	s := &Service{}
+	b.ReportAllocs()
+	for range b.N {
+		_ = s.searchFingerprint(q, false)
+	}
+}
+
+// A realistic search carries the archived predicate and a tag or two, where the
+// predicate's rendering is the only handle the attribute interface offers.
+func BenchmarkSearchFingerprint384Filtered(b *testing.B) {
+	q := &query.Query{Tenant: "acme", Text: "raft leader election", Vector: make([]float32, 384),
+		Tags:  []string{"infra", "consensus"},
+		Preds: attr.Preds{attr.Eq(attr.SlotArchived, attr.Bool(false))}}
 	s := &Service{}
 	b.ReportAllocs()
 	for range b.N {

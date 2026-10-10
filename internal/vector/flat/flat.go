@@ -36,16 +36,36 @@ import (
 type Index struct {
 	store  *vector.Store
 	metric distance.Metric
+	// model is the embedding model this server runs. When it is set, a search
+	// over a tenant whose vectors name another model is refused rather than
+	// answered, as the approximate index refuses one.
+	model string
 }
 
 var _ vector.Index = (*Index)(nil)
 
+// Option adjusts an Index.
+type Option func(*Index)
+
+// Serving names the embedding model this server runs.
+//
+// While the model was a fixed constant of the system the exact index could not
+// meet a corpus from another one; a server whose vectors come from the caller
+// can change its model by configuration, and then this check is what keeps two
+// spaces out of one ranking. Without it the index compares no model ids, which
+// is what a test or a rebuild with no opinion wants.
+func Serving(modelID string) Option { return func(x *Index) { x.model = modelID } }
+
 // New returns a flat index over store, comparing with metric.
-func New(store *vector.Store, metric distance.Metric) *Index {
+func New(store *vector.Store, metric distance.Metric, opts ...Option) *Index {
 	if metric == 0 {
 		metric = distance.L2
 	}
-	return &Index{store: store, metric: metric}
+	x := &Index{store: store, metric: metric}
+	for _, o := range opts {
+		o(x)
+	}
+	return x
 }
 
 // Insert writes a canonical vector.
@@ -101,10 +121,18 @@ func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, fil
 	// one pop. Sorting the whole corpus instead would be O(n log n) in the
 	// tenant's entire memory count for every query.
 	best := &worstFirst{}
-	err := x.store.Scan(ctx, t, func(rid id.ID, v []float32) error {
+	err := x.store.ScanVectors(ctx, t, func(rid id.ID, sv *vector.Vector) error {
+		// Before the filter: a corpus is refused whole, not only the part of it
+		// this query's filter happens to admit.
+		if x.model != "" && sv.ModelID != "" && sv.ModelID != x.model {
+			return errs.E(errs.Invalid, op, fmt.Errorf(
+				"tenant %s was embedded with %q and this server runs %q: searching one space with the other's queries returns confident nonsense, so the corpus must be re-embedded",
+				t, sv.ModelID, x.model))
+		}
 		if !filter.Allows(rid) {
 			return nil
 		}
+		v := sv.Values
 		d, err := distance.Compute(x.metric, q, v)
 		if err != nil {
 			return errs.E(errs.KindOf(err), op, fmt.Errorf("comparing against record %s: %w", rid, err))

@@ -11,10 +11,10 @@ import (
 )
 
 func TestARankedSessionIsCreatedOnceAndReused(t *testing.T) {
-	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL)
+	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL, nil)
 	defer p.close()
 
-	b := pagingBinding{tenant: "acme", fingerprint: [32]byte{1}}
+	b := pagingBinding{tenant: "acme", fingerprint: 1}
 	s1, err := p.acquireRanked(b, nil, "memory.Search", "search")
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
@@ -40,34 +40,34 @@ func TestARankedSessionIsCreatedOnceAndReused(t *testing.T) {
 // ranking that was computed for another question would return an arbitrary
 // slice of the corpus that looks like a page.
 func TestARankedSessionRefusesADifferentQuery(t *testing.T) {
-	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL)
+	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL, nil)
 	defer p.close()
 
-	s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: [32]byte{1}}, nil, "memory.Search", "search")
+	s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: 1}, nil, "memory.Search", "search")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	sid := s.id
 	p.release(s, false)
 
-	_, err = p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: [32]byte{2}}, &sid, "memory.Search", "search")
+	_, err = p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: 2}, &sid, "memory.Search", "search")
 	if !errs.Is(err, errs.Invalid) {
 		t.Fatalf("a different fingerprint returned %v, want Invalid", err)
 	}
 }
 
 func TestARankedSessionRefusesADifferentTenant(t *testing.T) {
-	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL)
+	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL, nil)
 	defer p.close()
 
-	s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: [32]byte{1}}, nil, "memory.Search", "search")
+	s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: 1}, nil, "memory.Search", "search")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	sid := s.id
 	p.release(s, false)
 
-	_, err = p.acquireRanked(pagingBinding{tenant: "globex", fingerprint: [32]byte{1}}, &sid, "memory.Search", "search")
+	_, err = p.acquireRanked(pagingBinding{tenant: "globex", fingerprint: 1}, &sid, "memory.Search", "search")
 	if !errs.Is(err, errs.Invalid) {
 		t.Fatalf("another tenant's session returned %v, want Invalid", err)
 	}
@@ -77,12 +77,12 @@ func TestARankedSessionRefusesADifferentTenant(t *testing.T) {
 // one budget. A listing past a budget full of idle ranked sessions reclaims the
 // oldest of them: the budget is shared in what it bounds, not in who it refuses.
 func TestRankedAndListingSessionsShareTheCapacityBudget(t *testing.T) {
-	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL)
+	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL, nil)
 	defer p.close()
 
 	var held []*pagingSession
 	for i := 0; i < pagingCapacity; i++ {
-		s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: [32]byte{byte(i)}}, nil, "memory.Search", "search")
+		s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: uint64(i)}, nil, "memory.Search", "search")
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
@@ -109,12 +109,12 @@ func TestRankedAndListingSessionsShareTheCapacityBudget(t *testing.T) {
 // the back of the queue — otherwise the one caller actively reading is the one
 // a newcomer displaces.
 func TestReclaimTakesTheLeastRecentlyUsedNotTheFirstOpened(t *testing.T) {
-	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL)
+	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL, nil)
 	defer p.close()
 
 	var held []*pagingSession
 	for i := 0; i < pagingCapacity; i++ {
-		s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: [32]byte{byte(i), 1}}, nil, "memory.Search", "search")
+		s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: uint64(i) | 1<<32}, nil, "memory.Search", "search")
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
@@ -130,7 +130,7 @@ func TestReclaimTakesTheLeastRecentlyUsedNotTheFirstOpened(t *testing.T) {
 	}
 	p.release(again, false)
 
-	fresh, err := p.acquireRanked(pagingBinding{tenant: "globex", fingerprint: [32]byte{9, 9}}, nil, "memory.Search", "search")
+	fresh, err := p.acquireRanked(pagingBinding{tenant: "globex", fingerprint: 9 | 9<<32}, nil, "memory.Search", "search")
 	if err != nil {
 		t.Fatalf("a new session at capacity: %v", err)
 	}
@@ -145,11 +145,11 @@ func TestReclaimTakesTheLeastRecentlyUsedNotTheFirstOpened(t *testing.T) {
 // reclaimed. When every pinned snapshot has a request reading through it, the
 // memory bound is the thing that must hold, and a new session is refused.
 func TestAFullBudgetOfActiveReadersStillRefuses(t *testing.T) {
-	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL)
+	p := newPagingRegistry(memkv.New(), clock.NewFake(clock.FakeStart), pagingTTL, nil)
 
 	var reading []*pagingSession
 	for i := 0; i < pagingCapacity; i++ {
-		s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: [32]byte{byte(i), 2}}, nil, "memory.Search", "search")
+		s, err := p.acquireRanked(pagingBinding{tenant: "acme", fingerprint: uint64(i) | 2<<32}, nil, "memory.Search", "search")
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}

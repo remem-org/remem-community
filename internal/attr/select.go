@@ -197,7 +197,7 @@ func Run(ctx context.Context, r Reader, sel Select) (Page, error) {
 // an error because one sidecar row was lost would be a listing that a single
 // damaged derived byte takes offline.
 func settle(ctx context.Context, r Reader, sel Select, rid id.ID, entryValue []byte) (bool, error) {
-	row, err := readRow(ctx, r, sel, rid)
+	row, err := ReadRow(ctx, r, sel.Slots, sel.Tenant, sel.Namespace, rid)
 	if err != nil || row == nil {
 		return false, err
 	}
@@ -211,21 +211,36 @@ func settle(ctx context.Context, r Reader, sel Select, rid id.ID, entryValue []b
 	return Match(row, sel.Preds), nil
 }
 
-// readRow reads and decodes one record's row, reporting a missing or
-// undecodable row as absent rather than as a failure. See [settle].
-func readRow(ctx context.Context, r Reader, sel Select, rid id.ID) (*Row, error) {
-	ns := sel.Namespace
+// ReadRow reads and decodes one record's row, reporting a missing or undecodable
+// row as absent rather than as a failure. See [settle].
+//
+// A reader that carries a row cache answers from it, and this is the one place
+// that asks: the [RowSource] assertion lives here rather than at each call site,
+// so a reader added later cannot miss the cache and a cache added later does not
+// need every caller changed. The query executor settles its own candidates
+// through this function for exactly that reason.
+func ReadRow(ctx context.Context, r Reader, slots *schema.Slots, t tenant.ID,
+	ns tenant.Namespace, rid id.ID) (*Row, error) {
 	if ns == "" {
 		ns = tenant.DefaultNamespace
 	}
-	value, err := r.Get(ctx, RowKey(sel.Tenant, ns, rid))
+	if src, ok := r.(RowSource); ok {
+		return src.Row(ctx, t, ns, rid)
+	}
+	return decodeRowFrom(ctx, r, slots, t, ns, rid)
+}
+
+// decodeRowFrom is [ReadRow] without the cache: one point read and one decode.
+func decodeRowFrom(ctx context.Context, r Reader, slots *schema.Slots, t tenant.ID,
+	ns tenant.Namespace, rid id.ID) (*Row, error) {
+	value, err := r.Get(ctx, RowKey(t, ns, rid))
 	if errs.Is(err, errs.NotFound) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	row, err := DecodeRow(value, sel.Slots)
+	row, err := DecodeRow(value, slots)
 	if err != nil {
 		return nil, nil
 	}

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
+	"github.com/remem-org/remem-go/internal/config"
 	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/embedding/onnx"
 	"github.com/remem-org/remem-go/internal/events"
@@ -136,11 +138,32 @@ func importCommand(args []string) (int, error) {
 		"the all-MiniLM-L6-v2 directory, for the embeddings an import recomputes")
 	onnxPath := fs.String("onnx-library-path", os.Getenv("REMEM_EMBEDDING_ONNX_LIBRARY_PATH"),
 		"the ONNX Runtime shared library")
+	provider := fs.String("embedding-provider", envOr("REMEM_EMBEDDING_PROVIDER", config.ProviderONNX),
+		"onnx, or external for a data directory whose server takes vectors from its callers")
+	externalModel := fs.String("external-model-id", os.Getenv("REMEM_EMBEDDING_EXTERNAL_MODEL_ID"),
+		"with --embedding-provider external: the model the destination's vectors come from")
+	dimension := fs.Int("dimension", envInt("REMEM_VECTOR_DIMENSION", config.EmbeddingDimension),
+		"with --embedding-provider external: the width of the destination's vectors")
 	if err := fs.Parse(args); err != nil {
 		return 0, err
 	}
 	if *dataDir == "" || *in == "" {
 		return 0, errors.New("import needs --data-dir and --in")
+	}
+	var external *embedding.External
+	switch *provider {
+	case config.ProviderONNX:
+	case config.ProviderExternal:
+		if *externalModel == "" {
+			return 0, errors.New("--embedding-provider external needs --external-model-id " +
+				"(or REMEM_EMBEDDING_EXTERNAL_MODEL_ID): the model the destination's vectors come from")
+		}
+		if *dimension <= 0 || *dimension > config.MaxExternalDimension {
+			return 0, fmt.Errorf("--dimension is %d; it must be from 1 to %d", *dimension, config.MaxExternalDimension)
+		}
+		external = embedding.NewExternal(*externalModel, *dimension)
+	default:
+		return 0, fmt.Errorf("--embedding-provider is %q; it is onnx or external", *provider)
 	}
 	mode, err := snapshot.ParseConflictMode(*onConflict)
 	if err != nil {
@@ -182,9 +205,17 @@ func importCommand(args []string) (int, error) {
 		return 0, err
 	}
 
-	embedder, err := importEmbedder(header, policy, *modelPath, *onnxPath)
-	if err != nil {
-		return 0, err
+	var embedder embedding.Embedder
+	if external != nil {
+		if err := checkExternalImport(f, header, policy, external); err != nil {
+			return 0, err
+		}
+		embedder = external
+	} else {
+		embedder, err = importEmbedder(header, policy, *modelPath, *onnxPath)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if c, ok := embedder.(interface{ Close() error }); ok && embedder != nil {
 		defer func() { _ = c.Close() }()
@@ -408,6 +439,70 @@ func parseVectorPolicy(s string) (snapshot.VectorPolicy, error) {
 		return 0, fmt.Errorf("%q is not a vector policy; the policies are auto, re-embed and "+
 			"verbatim", s)
 	}
+}
+
+// checkExternalImport refuses, before the destination exists, an import into a
+// data directory whose vectors come from the caller that could not complete.
+//
+// Such a destination has no model: it can take a snapshot's vectors only as
+// they stand, so a foreign snapshot, a request to re-embed, and a vector from
+// any other model all fail. The first two are in the header. The third is not —
+// every vector names its own model — so the file is read once to find out, and
+// rewound. That read is the price of the rule this command has kept since
+// Phase 12: a refused import leaves no database behind.
+func checkExternalImport(f *os.File, header *snapshot.Header, policy snapshot.VectorPolicy,
+	external *embedding.External,
+) error {
+	if header.GetSourceImpl() != "go" || policy == snapshot.VectorsReEmbed {
+		return fmt.Errorf(
+			"the destination takes vectors from its callers (embedding.provider = external, %s), so it "+
+				"can import a snapshot's vectors only verbatim and cannot re-embed. This snapshot was "+
+				"written by %q with --vectors=%s; re-embed it into a data directory that computes its own",
+			external.ModelID(), header.GetSourceImpl(), policyName(policy))
+	}
+	models, err := snapshot.VectorModels(f)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	want := snapshot.VectorModel{ModelID: external.ModelID(), Dim: external.Dim()}
+	for m, n := range models {
+		if m != want {
+			return fmt.Errorf(
+				"%d of this snapshot's vectors come from %q (%d dimensions), and the destination takes "+
+					"vectors from %q (%d dimensions) as supplied and cannot re-embed. Import into a data "+
+					"directory configured for %q",
+				n, m.ModelID, m.Dim, want.ModelID, want.Dim, m.ModelID)
+		}
+	}
+	return nil
+}
+
+func policyName(p snapshot.VectorPolicy) string {
+	switch p {
+	case snapshot.VectorsReEmbed:
+		return "re-embed"
+	case snapshot.VectorsVerbatim:
+		return "verbatim"
+	default:
+		return "auto"
+	}
+}
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envInt(name string, fallback int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil {
+		return v
+	}
+	return fallback
 }
 
 // importEmbedder loads the model, if this import needs one.

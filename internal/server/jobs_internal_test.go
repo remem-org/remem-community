@@ -143,6 +143,14 @@ func seedMemories(t *testing.T, d *deps, tid tenant.ID) []byte {
 			t.Fatalf("seeding a memory: %v", err)
 		}
 	}
+	// Vector indexing is asynchronous by default, so a fixture that is about
+	// to ask the index a question has to wait for it. This is the one
+	// mechanism these tests use for that: no sleeps, no polling, and nothing
+	// that reads differently from what production does — the queue is the same
+	// queue, flushed the same way the shutdown flushes it.
+	if err := d.flushVectors(ctx); err != nil {
+		t.Fatalf("flushing the vector index queue: %v", err)
+	}
 	return nil
 }
 
@@ -293,6 +301,24 @@ type noCheckpoint struct{}
 func (noCheckpoint) Save(context.Context, []byte) error { return nil }
 func (noCheckpoint) Processed(uint64)                   {}
 func (noCheckpoint) Changed(uint64)                     {}
+
+// flushVectors waits until every index operation queued before the call has
+// been applied, and is a no-op when indexing is synchronous.
+//
+// It lives with the fixtures because the fixtures are all that needs it: a test
+// that creates and then asks the index a question has to wait for the queue,
+// and this is the one mechanism for that — no sleeps, no polling, and nothing
+// that reads differently from what production does, since the queue is the same
+// queue the shutdown flushes. Production itself has no caller: the shutdown
+// closes the queue rather than flushing it, and an administrative endpoint that
+// wanted this would be a reason to move it back, not a reason to keep an
+// unused method in deps.go.
+func (d *deps) flushVectors(ctx context.Context) error {
+	if d.indexQueue == nil {
+		return nil
+	}
+	return d.indexQueue.Flush(ctx)
+}
 
 func mustDeps(t *testing.T) *deps {
 	t.Helper()

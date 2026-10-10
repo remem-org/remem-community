@@ -69,9 +69,30 @@ go.work.sum
 # printed in the output.
 testdata/rapid/
 
-# Benchmark runs write real databases here, never under /tmp. Kept for
-# inspection and never committed (bench/, scripts/benchmark.sh).
-/.benchmark-data/
+# Benchmark runs write real databases here, never under /tmp. Downloaded
+# datasets, virtualenvs, upstream checkouts and run outputs are kept for
+# inspection and never committed (bench/, scripts/benchmark.sh, benchmarks/).
+# The exception is the corpus stress study (benchmarks/stress/), which is
+# re-run from a checkout on any machine. Its corpus is generated from a fixed
+# seed, so what is committed is what defines the corpus and what it produced:
+#   stress/queries.json          the questions and their relevance labels
+#   stress/corpus-manifest.json  seed, size and the corpus's SHA-256
+#   results/stress/<date>/       each study's reports
+# Everything else the study writes -- the 39 MB corpus, the vectors, the Pebble
+# databases, raw JSONL and the harness binary -- is rebuilt by
+# `make -C benchmarks stress-prepare` and stays out. A regenerated corpus that
+# drifts shows up as a modified corpus-manifest.json in `git status`.
+/.benchmark-data/*
+!/.benchmark-data/stress/
+/.benchmark-data/stress/*
+!/.benchmark-data/stress/queries.json
+!/.benchmark-data/stress/corpus-manifest.json
+!/.benchmark-data/results/
+/.benchmark-data/results/*
+!/.benchmark-data/results/stress/
+# Go micro-benchmark output (`go test -bench`, benchstat tables), one directory
+# per measured change, beside the stress study it accompanies.
+!/.benchmark-data/results/gobench/
 /.superpowers/
 
 # The backoffice's Python virtual environment.
@@ -93,3 +114,4 @@ __pycache__/
 # (REMEM_DATA_DIR, docker-compose.yml). It is a live Pebble database, not
 # source.
 /remem-data/
+/logs/

@@ -29,8 +29,14 @@ import (
 // callers need it: the command, for a stopped server, and the `attr.rebuild`
 // job, for a running one. Until Phase 13 only the first existed, which left the
 // attribute rows the one derived space a running server could not repair.
-func RebuildRows(ctx context.Context, kv storage.KV, t tenant.ID, ns tenant.Namespace) (int, error) {
-	ix := NewIndexer(MustTable())
+func RebuildRows(ctx context.Context, kv storage.KV, t tenant.ID, ns tenant.Namespace,
+	opts ...IndexerOption) (int, error) {
+	// The options are the indexer's, and the one that matters is WithRowCache: a
+	// rebuild writes rows like any other writer, so a running server must hand it
+	// the cache its readers are using or those readers keep the rows this is here
+	// to replace. `remem-admin` runs against a stopped server and passes none,
+	// because there is no cache to invalidate.
+	ix := NewIndexer(MustTable(), opts...)
 	repo := record.NewRepo(kv, record.WithIndexer(ix))
 
 	snap := kv.NewSnapshot()

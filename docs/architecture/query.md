@@ -173,6 +173,275 @@ The two paths widen differently, and the difference is not incidental:
   nearest" and there is no position to continue from. The repeated work is the
   price of the access path.
 
+### What the vector search stopped paying twice for
+
+Plan item 16 (the server speed plan, finding 2). A restart used to repeat
+*all* of the previous round's work: every candidate was read from the attribute
+store and decoded again, and the budget doubled blindly, so a filter keeping one
+record in five reached a page of ten in two rounds and about ninety row reads
+where seventy distinct candidates were ever examined. Two changes, neither of
+which changes an answer:
+
+- **A settle decision is remembered for the life of the request.** The decision
+  is a function of the candidate and the request's pinned read view, so it cannot
+  change between rounds; a candidate the first round rejected is never read or
+  decoded again. The decisions are a slice indexed by the candidate's position in
+  the index's answer, with the record id compared rather than assumed, which costs
+  one allocation and no hashing; only a query that actually filters keeps one, and
+  one with nothing to settle fills its page in the first round or has run out of
+  corpus. Counted with the `countingReader` and `countingIndex` of
+  `internal/query/vector_widen_test.go`, over fifty random queries per shape: on
+  the shape `bench/`'s `selective_filter` has — 200 records, one in five passing,
+  a page of ten — row reads fall from 89 to 50 and walks from 2.2 to 1.0; at one
+  in twenty-five, from 499 to 222 and from 4.3 to 2.3; at one in sixty-four, from
+  770 to 320 and from 5.0 to 2.0.
+- **The next budget is informed by the pass rate.** A round that examined
+  `examined` candidates and kept `passed` of them measures `p = passed/examined`,
+  floored at 1/64 so nothing divides by zero, and asks next for about
+  `(target - passed) / p` more candidates plus a quarter for margin. It never
+  asks for less than double, so the budget still grows geometrically and still
+  stops at `MaxBudget`; what changes is that a selective filter reaches its
+  target in one or two rounds instead of log2 of them.
+
+Both budgets — the first and every later one — are rounded up to the index's
+`vector.Granular` step. HNSW walks at `ef = max(ef_search, k)`, so a query asking
+for fewer candidates than `ef_search` pays for the same traversal and is handed
+less of what it found; taking the rest is free, and it is what lets the common
+filtered page be answered by one walk. `flat` has no steps and does not implement
+the interface, which reads as a granularity of one.
+
+The answer is unchanged because the page is the first `Target` candidates that
+survive the filter, taken in the walk's own order: widening only extends that
+order, so reaching the fill point in one round rather than three produces the
+same page from the same candidates.
+`TestWidenedVectorSearchAnswersWhatTheRestartLoopDid` holds that against the loop
+this replaced, over a thousand randomised corpora, filters and limits: 667 of
+those thousand queries needed a second round under the old schedule, 107 came
+back truncated, 603 were answered in strictly fewer walks, and none answered
+differently.
+
+The one number that does move is `Examined`, which counts the candidates the
+final round was offered: a round that asked for the whole granularity was offered
+more of them. It is an `explain` diagnostic and the source of the
+`search_candidates_considered` histogram, so that histogram's floor rises to the
+index's granularity for a semantic search — fewer rounds, each offered more
+candidates. Nothing a caller is served depends on it.
+
+What is left is not widening. A page of ten under a filter keeping one record in
+five must settle about fifty candidates, and each costs an attribute-row point
+read and a decode. That is what the row cache below removes.
+
+### The row cache, and why a pinned snapshot never sees past it
+
+Plan item 18 (the server speed plan, finding 2). `attr.RowCache` is one
+bounded LRU of decoded `*attr.Row`, keyed by tenant, namespace and record id,
+shared by every request in the process and sized by `search.row_cache_entries`
+(16384 by default; zero turns it off and nothing is held or locked). Rows change
+rarely next to how often they are read, so the fifty candidates of a filtered
+page are mostly rows some earlier query already fetched and unpacked.
+
+The whole difficulty is that a request reads through a snapshot pinned for the
+life of its paging session, and the cache is shared by sessions holding different
+snapshots. Serving a row a session's snapshot does not hold would be worse than
+any saving: a filtered listing would include a memory archived before its
+snapshot, or drop one that was not. **A reader must see exactly what its own
+snapshot holds**, and two mechanisms together make that true. Neither is enough
+alone, and the second exists only because of the gap the first leaves.
+
+**A per-tenant generation** counts row writes that have finished — committed, or
+closed without committing, which the cache cannot tell apart and so treats alike
+(see *Both ends of a transaction* below). A session reads
+`g0 := cache.Generation(t)` *before* `kv.NewSnapshot()` — the order is the
+argument, not a detail — and the cache answers it only while
+`entry.gen == g0 == Generation(t)`. A generation only ever increases, so that
+equality proves no row write of this tenant finished between the
+session reading `g0` and this lookup, and the snapshot was taken inside that
+interval. Both directions follow: a reader on an older snapshot is never served a
+newer row, because the newer row's entry carries a generation it does not hold;
+and a reader on a newer snapshot is never served an older one, because a stale
+entry's generation has been left behind. A write landing between `g0` and the
+snapshot makes `g0` stale, and the session then reads every row from its own
+snapshot — conservative, which is the right way to be wrong here. Continuation
+pages of a ranked session keep the session's `g0`, because they keep its snapshot.
+
+**A staging mark, one per writer of the row,** closes the one gap. A batch becomes
+visible to a new snapshot when it is applied, and the generation moves a moment
+later, when the transaction ends. Inside that interval two readers can
+hold one generation while their snapshots straddle the write — and they would
+disagree about the row, one of them having cached what the other must not see.
+`attr.Indexer.Stage` therefore marks the row in the cache *before* the commit and
+gives the mark back in the same callback that moves the generation, and a marked
+row is neither served nor stored. `TestAReaderInsideACommitWindowReadsItsOwnSnapshot`
+is that interval, made deterministic with a transaction whose writes land at once
+and whose callbacks the test releases by hand; it fails on the generation alone.
+
+The invariant is that **a mark belongs to its transaction**: a row carries one for
+every transaction that has staged a write to it and not yet finished, and only the
+transaction that put a mark there removes it — on its commit, or on its close if
+it never commits. The row is therefore quiesced for the *union* of every in-flight
+writer's window, and no writer can shorten another's. A mark that instead recorded
+"the latest stager for this row" got that wrong: W1 marks the row and is preempted
+before it reads it; W2 marks the same row and commits, and its callback both moves
+the generation and takes W1's mark with it; W1 then reads the row W2 left, so its
+own `tx.Expect` condition still holds, and commits. For the whole length of W1's
+commit — an fsync, under `storage.sync_writes` — W1's row is visible with no mark
+and a generation that has not moved for it, and two readers on that generation are
+served each other's rows.
+`TestACommittedWriteDoesNotTakeAnotherWritersStagingMark` is that interleaving,
+made deterministic by hooking the instant between W1's mark and W1's read.
+
+Two writers overlapping on one row is rarer than it sounds — `memory.Service.write`
+holds a per-tenant `txn.Gate` around the whole transaction, so a tenant's memory
+writes do not overlap at all — but the ungated writers reach it: the lifecycle
+maintenance pass writes through `record.Repo.Put` on a bare transaction, and
+`attr.RebuildRows` commits five hundred rows at a time. What keeps the *data*
+right in that case is separate and worth naming, because it is easy to mistake for
+the thing that keeps the cache right: `Indexer.currentRow` reads the row inside the
+transaction and records `tx.Expect(rowKey, value, exists)`, and the store checks
+that condition while it applies the batch, under the Pebble write stripe of the
+row's key — serialised with every competing apply for that stripe. So two writers
+that read the same row cannot both commit; the loser conflicts and `txn.Do`'s retry
+re-reads, re-stages and takes a fresh mark. That is what makes the visible values
+of a row a chain in which each writer read its predecessor. It is not what makes
+the cache safe: the winner of the condition check still has a commit window, and
+the mark is what covers it.
+
+**Both ends of a transaction move the generation.** A transaction that is closed
+without committing gives its own mark back — and every transaction is closed,
+`defer tx.Close()` is the shape of every write here, so nothing has to heal a mark
+left behind — and its close moves the generation exactly as a commit does, because
+the cache cannot tell from a `Close` what became visible. The store applies a batch
+unsynced inside its write lock and syncs it separately (`pebble.batch.Commit`:
+apply, then `LogData(nil, Sync)`), so a sync failure returns an error from a batch
+every later snapshot already holds, while a condition check that failed wrote
+nothing at all. Both arrive as the same close. Reading that close as "nothing
+became visible" left a straddle wide open: the generation stayed put, a reader
+opened before such a write and one opened after it shared it, and whichever read
+first put its own row where the other was served it
+(`TestAFailedCommitThatMayBeVisibleStillMovesTheGeneration`). So
+`attr.Indexer.invalidate` registers one `RowCache.finishWrite` on both callbacks —
+there are two because a transaction reaches one end or the other, not because the
+ends differ. The price is one atomic increment per abandoned transaction, which is
+in the noise beside the increment every committed write already pays; what it buys
+is that no reader is ever served a row from the wrong side of a write whose fate
+the cache cannot know. The generation is therefore a count of row writes that
+*finished*, which an abandoned attempt inflates above the number that committed —
+harmless, because all a reader asks of it is that it has not moved.
+
+A `Stage` on a transaction that is already spent cannot register either callback,
+so it reports that and leaves no mark at all; the mark it had taken goes back
+through the same finish, which costs that tenant's entries one generation and
+nothing else. The marks handed out and not yet
+back are bounded at `maxStagedRows`; past that the cache logs a warning naming the
+count and turns itself off rather than hold a mark it cannot record, and it comes
+back when they drain to zero — at which instant no write is between its stage and
+its end, so an entry stored from then on cannot straddle one.
+
+Throwing that switch and dropping what the cache holds are one transition, taken
+under one hold of the gate's lock. A clear that ran after the lock was released could
+arrive behind a drain that had already turned the cache back on, and wipe the mark of
+a writer that staged in between — leaving that writer's commit window unguarded
+(`TestTheClearThatFollowsATripCannotWipeALaterWritersMark`). For the same reason the
+switch is read *inside* the shard lock on both the read and the write side, so that
+"off" means it at the instant a row is served or stored rather than at the instant the
+call started. A count that goes the other way, below zero, is a mark given back more
+times than it was handed out: no path does that, and if one ever did, "nothing is in
+flight" would be a lie and the cache would re-enable over live commit windows. It
+says so at error level, drops what it holds and stays off for the life of the
+process.
+
+`Indexer.Stage` is the only thing that writes an attribute row key — `StageDrop`
+delegates to it and `attr.RebuildRows` re-stages through it — so wiring the cache
+to the indexer in `internal/server/deps.go` reaches every writer in the server
+process. The same object goes to `memory.Service`, which is the point: two caches
+would be one that nothing invalidated.
+
+The one writer outside that wiring is `remem-admin snapshot import`
+(`cmd/remem-admin/snapshot.go`): it builds its own `attr.NewIndexer(attr.MustTable())`
+with no cache, so the rows it writes tell no cache anything. That is safe only
+because the importer opens the data directory itself and Pebble holds an exclusive
+lock on it — no server can be running, so there is no cache in the process or any
+other to invalidate. The same is true of `remem-admin`'s own rebuild, which passes
+no cache for the same reason. A future importer that ran inside a live server would
+have to be given the cache, exactly as the `attr.rebuild` job is.
+
+**The lock is sharded**, sixteen ways by a hash of the record id, with the
+generations in a small structure of their own outside them. A lookup is not
+read-only — an LRU moves the entry it served to the front of its order — so one
+mutex would make every candidate a query settles a point of serialisation between
+concurrent requests, which is what the cache was added to remove.
+`BenchmarkRowCacheConcurrentLookup` and `BenchmarkRowCacheConcurrentSettle`
+(`internal/attr`) are that measurement at eight goroutines. What one mutex costs is
+the same benchmarks rebuilt with `rowCacheShards = 1` and `rowCacheShardBits = 0`,
+which is not a configuration the code can be asked for, so there is no one-shard arm
+to point at — the figures below come from changing those two constants and putting
+them back. On an M1 Pro, `-benchtime=1s -count=6 -cpu=8`:
+
+| at 8 goroutines | one shard | sixteen |
+| --- | --- | --- |
+| lookup, keys spread over the working set | 233 ns | 85 ns |
+| lookup, sixteen hot keys | 184 ns | 86 ns |
+| settle, one writer in the pool | 508 ns | 165 ns |
+
+The hot arm is the worst case for a sharded lock, because the shards cannot separate
+what the keys do not; it still more than halves.
+
+Two consequences worth knowing: the entry bound is enforced per shard, so a cache
+holds the configured count rounded up to a multiple of sixteen and evicts LRU within
+a shard rather than across the whole of it; and the generations being under a
+different lock from the marks makes the order they are touched in load-bearing — a
+write that finishes moves the generation *before* it releases its mark, on either
+end, and a lookup reads the
+marks before it reads the generation, so a mark found absent proves the bump that
+removed it is already visible.
+
+The read seam is `attr.ReadRow`, which takes the cache when the reader
+implements `attr.RowSource` and reads and decodes otherwise. It is the one place
+that asks, so the attribute walk's own `settle` and `query.Executor.settle` share
+it and a third caller cannot miss the cache. An entry is the decoded row itself,
+shared read-only with every holder: `attr.Match` and every predicate only call
+`Row.Get`, and `Row.Set` is reached solely from `DecodeRow` and `Project`, each of
+which builds a fresh row. A consumer that ever needs to change a row must copy it.
+
+**What it buys.** `bench/`'s fixture wires the cache as `internal/server` does,
+and its queries repeat against an unchanging corpus, so its figures are the warm
+steady state of a read-mostly deployment. Interleaved against the same tree
+without the cache: a listing page 25.4 µs to 18.9 µs (-25%), an unfiltered
+semantic search 23.0 µs to 16.2 µs (-30%, because every search settles its
+candidates against the default `archived == false` row filter), the one-in-five
+filtered search 43.6 µs to 20.9 µs (-52%), and p99 across those fixtures down by
+half to three quarters, since the tail was the point reads that no longer happen.
+A page with the cache disabled allocates nothing for having one, so
+`row_cache_entries = 0` is exactly the old path. The cold and oversubscribed ends
+are in `BenchmarkListingRowCache` (`internal/memory`): with a one-entry cache
+every row misses and evicts the one before it, and a page costs 10 percent more
+than with no cache at all. `BenchmarkFilteredVectorStepRowCache`
+(`internal/query`) isolates the filtered vector step over the in-memory store,
+where a row read is a map lookup rather than a seek and the saving is therefore
+the conservative end: 17.59 µs to 10.70 µs (-39%), 201 allocations to 11.
+
+**The trade-off.** One finished row write retires a whole tenant's share of the
+cache — an abandoned write as much as a committed one, because the cache cannot
+tell a batch that failed its conditions from one that failed its sync after
+becoming visible, and so treats both as visible. A write-heavy tenant therefore
+gets few hits — and loses nothing by it, because a miss is exactly the read the
+cache replaced. A per-row version would need a sequence number
+`storage.Snapshot` deliberately does not expose (see its doc comment: the paging
+service retains the snapshot object, and a number cannot reopen that state).
+
+What a cache *does* cost is the case where it cannot help: a cold query, or a
+working set larger than the bound, pays the read it would have paid plus the store
+that does not survive. The `thrashing` arm of `BenchmarkListingRowCache` is that
+case at its worst, one entry so that every row read evicts the row before it:
+22.86 µs against the 20.74 µs of no cache at all, +10% on a page. The default of
+16384 entries is far above any page's working set; an operator who sizes it below
+one is paying that, and `remem_row_cache_hits_total` against
+`remem_row_cache_misses_total` is where it shows. Memory is bounded by the entry
+count rather than by the corpus, and the cache is shared by every tenant, so one
+tenant's working set can evict another's; the two counters carry a tenant label so
+an operator can see that happening, and `remem_row_cache_entries` says how close
+the bound is.
+
 ### `truncated` means one thing
 
 The widening budget was spent before the requested number of matches was found,

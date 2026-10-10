@@ -34,8 +34,23 @@ import (
 // use. Close must be called; Commit does not release it.
 type Tx interface {
 	Expect(key, value []byte, exists bool)
-	// OnCommit registers a callback run only after a successful commit.
-	OnCommit(func())
+	// OnCommit registers a callback run once, after a successful commit, and
+	// reports whether the registration took.
+	//
+	// A transaction that has already committed or been closed accepts none, and
+	// used to drop them silently. A caller whose callback *releases* something
+	// the staged write reserved cannot afford that — the reservation would be
+	// held for the life of the process — so the answer is reported and such a
+	// caller undoes its reservation itself. See attr.Indexer.Stage.
+	OnCommit(func()) bool
+	// OnClose registers a callback run once, when the transaction is closed
+	// without having committed, and reports whether the registration took.
+	//
+	// It is the other half of OnCommit for anything a staged write reserves
+	// outside the batch: the commit callback publishes it, this one gives it
+	// back. Commit and Close are exclusive, so exactly one of the two runs for
+	// a transaction that is closed — which Close always is, being deferred.
+	OnClose(func()) bool
 
 	// Get reads through the transaction: its own staged writes first, then the
 	// store. A key staged for deletion reads as errs.NotFound.
@@ -75,7 +90,8 @@ func New(kv storage.KV, opts ...Option) Tx {
 }
 
 type tx struct {
-	callbacks []func()
+	onCommit  []func()
+	onClose   []func()
 	batch     storage.Batch
 	sync      bool
 	committed bool
@@ -127,7 +143,11 @@ func (t *tx) Commit(ctx context.Context) error {
 		return err
 	}
 	t.committed = true
-	for _, f := range t.callbacks {
+	// The close callbacks are the undo of the commit callbacks, so a commit
+	// retires them before running theirs: the deferred Close that follows every
+	// transaction must not then undo what this commit just published.
+	t.onClose = nil
+	for _, f := range t.onCommit {
 		f()
 	}
 	return nil
@@ -139,6 +159,10 @@ func (t *tx) Close() {
 	}
 	t.closed = true
 	_ = t.batch.Close()
+	for _, f := range t.onClose {
+		f()
+	}
+	t.onClose = nil
 }
 
 func (t *tx) spent() bool { return t.closed || t.committed }
@@ -158,8 +182,18 @@ func (t *tx) Expect(key, value []byte, exists bool) {
 		t.batch.Expect(key, value, exists)
 	}
 }
-func (t *tx) OnCommit(f func()) {
-	if !t.spent() {
-		t.callbacks = append(t.callbacks, f)
+func (t *tx) OnCommit(f func()) bool {
+	if t.spent() {
+		return false
 	}
+	t.onCommit = append(t.onCommit, f)
+	return true
+}
+
+func (t *tx) OnClose(f func()) bool {
+	if t.spent() {
+		return false
+	}
+	t.onClose = append(t.onClose, f)
+	return true
 }

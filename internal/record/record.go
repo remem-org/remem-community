@@ -151,6 +151,17 @@ type Record struct {
 	// originalBody is the opaque optimistic concurrency token from a read.
 	originalBody []byte
 
+	// projected marks a record that came from [Repo.GetBodyFrom], which
+	// decodes only the fields a response shows. Such a record is missing its
+	// schema version, its original body and every field this binary does not
+	// understand, so [Repo.Put] refuses it rather than writing those away.
+	//
+	// It is a field on the record rather than a convention at the call sites
+	// because the call sites are where the mistake would be made. The marker
+	// travels with the record through [Record.Clone], which Service.peek
+	// performs on every result.
+	projected bool
+
 	ID     id.ID
 	Tenant tenant.ID
 	// Namespace subdivides a tenant. It is fixed at tenant.DefaultNamespace

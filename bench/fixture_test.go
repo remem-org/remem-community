@@ -10,6 +10,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
+	"github.com/remem-org/remem-go/internal/config"
 	"github.com/remem-org/remem-go/internal/graph"
 	"github.com/remem-org/remem-go/internal/memory"
 	"github.com/remem-org/remem-go/internal/record"
@@ -81,8 +82,16 @@ func service(b *testing.B, name string, o serviceOpts, seed func(*memory.Service
 	}
 	clk := clock.System()
 
-	repoOpts := []record.RepoOption{record.WithIndexer(attr.NewIndexer(slots))}
-	var memOpts []memory.Option
+	// One row cache behind the write path's indexer and the read path's service,
+	// at the shipped size, exactly as internal/server/deps.go wires it. A fixture
+	// that built no cache would measure a configuration no deployment runs: every
+	// candidate a filtered search or a listing examines would be a point read and
+	// a decode that a server answers from memory.
+	rows := attr.NewRowCache(config.DefaultRowCacheEntries)
+	repoOpts := []record.RepoOption{
+		record.WithIndexer(attr.NewIndexer(slots, attr.WithRowCache(rows))),
+	}
+	memOpts := []memory.Option{memory.WithRowCache(rows)}
 	if o.text {
 		ix := remtext.New()
 		repoOpts = append(repoOpts, record.WithIndexer(ix))

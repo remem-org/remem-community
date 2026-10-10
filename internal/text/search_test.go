@@ -276,8 +276,22 @@ func TestTiesAreBrokenDeterministically(t *testing.T) {
 	t.Cleanup(func() { _ = kv.Close() })
 	ix := text.New()
 
+	var written []id.ID
 	for range 8 {
-		write(t, ix, kv, acme, "identical content in every respect")
+		written = append(written, write(t, ix, kv, acme, "identical content in every respect"))
+	}
+	slices.SortFunc(written, func(a, b id.ID) int { return slices.Compare(a[:], b[:]) })
+
+	// The page is chosen by a bounded selection, not a sort of every
+	// candidate, and ranked() sorts whatever the selection kept. So "the three
+	// returned are in id order" holds even for a selection that kept the wrong
+	// three; what the tiebreak promises is the three *lowest* ids, and at a
+	// limit of one the lowest id alone.
+	for _, limit := range []int{1, 3} {
+		got := ids(search(t, ix, kv, acme, text.SearchReq{Optional: text.QueryTerms("identical"), Limit: limit}))
+		if !slices.Equal(got, written[:limit]) {
+			t.Fatalf("limit %d over eight tied hits returned %v, want the lowest ids %v", limit, got, written[:limit])
+		}
 	}
 
 	first := ids(search(t, ix, kv, acme, text.SearchReq{Optional: text.QueryTerms("identical"), Limit: 3}))

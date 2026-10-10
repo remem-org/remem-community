@@ -7,7 +7,7 @@ import (
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/query"
-	"github.com/remem-org/remem-go/internal/storage"
+	"github.com/remem-org/remem-go/internal/record"
 )
 
 // OrderCreatedAt is the ordering a listing takes when the caller names none.
@@ -155,9 +155,10 @@ func (s *Service) List(ctx context.Context, req ListReq) (ListResult, error) {
 	}
 	finished := true
 	defer func() { s.paging.release(session, finished) }()
-	snap := session.snapshot
+	reader, page := s.rowReader(session, t)
+	defer page.finish()
 
-	res, err := s.executor.Run(ctx, snap, q, plan)
+	res, err := s.executor.Run(ctx, reader, q, plan)
 	if err != nil {
 		return ListResult{}, err
 	}
@@ -175,7 +176,7 @@ func (s *Service) List(ctx context.Context, req ListReq) (ListResult, error) {
 	// The payload reads, and the only ones in this call. They go through the
 	// same snapshot as the walk that chose them, so a memory the index selected
 	// cannot have vanished by the time its body is read.
-	bodies, err := s.readPage(ctx, snap, res.Hits)
+	bodies, err := s.readPage(ctx, reader, res.Hits)
 	if err != nil {
 		return ListResult{}, err
 	}
@@ -198,10 +199,10 @@ func (s *Service) List(ctx context.Context, req ListReq) (ListResult, error) {
 // derived and the record is the authority on what exists, so a body that is
 // absent means the row has not caught up — which is a reason to omit one
 // memory, not to fail the listing.
-func (s *Service) readPage(ctx context.Context, snap storage.Snapshot, hits []query.Hit) ([]*Memory, error) {
+func (s *Service) readPage(ctx context.Context, from record.BodyReader, hits []query.Hit) ([]*Memory, error) {
 	out := make([]*Memory, 0, len(hits))
 	for _, hit := range hits {
-		rec, err := s.repo.GetBodyFrom(ctx, snap, hit.ID)
+		rec, err := s.repo.GetBodyFrom(ctx, from, hit.ID)
 		if errs.Is(err, errs.NotFound) {
 			continue
 		}

@@ -2,10 +2,12 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/lifecycle"
@@ -13,6 +15,7 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/txn"
 	"github.com/remem-org/remem-go/internal/vector"
+	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
 // Create stores one memory.
@@ -51,24 +54,15 @@ func (s *Service) CreateBatch(ctx context.Context, reqs []CreateReq) ([]*Memory,
 			"a batch of %d memories; the limit is %d, so send it in parts", len(reqs), MaxBatch))
 	}
 
-	texts := make([]string, len(reqs))
 	for i, r := range reqs {
 		if err := validateCreate(i, r, op); err != nil {
 			return nil, err
 		}
-		texts[i] = r.Content
 	}
 
-	// One embedding call for the whole batch. The service below chunks to its
-	// own batch size and coalesces with other callers; asking it once per
-	// memory would defeat both.
-	vectors, err := s.embedder.Embed(ctx, texts)
+	vectors, err := s.vectorsFor(ctx, reqs, op)
 	if err != nil {
 		return nil, err
-	}
-	if len(vectors) != len(reqs) {
-		return nil, errs.E(errs.Storage, op, fmt.Errorf(
-			"the embedder returned %d vectors for %d memories", len(vectors), len(reqs)))
 	}
 
 	// Everything a retry must not redraw is drawn here, before the transaction
@@ -184,6 +178,78 @@ func (s *Service) CreateBatch(ctx context.Context, reqs []CreateReq) ([]*Memory,
 		s.indexed(ctx, t, m.ID, vectors[i])
 	}
 	return out, nil
+}
+
+// vectorsFor returns one vector per request, from wherever this server's
+// vectors come from, and refuses the batch whole if any request disagrees with
+// that. It runs before the transaction exists, so a refusal writes nothing.
+func (s *Service) vectorsFor(ctx context.Context, reqs []CreateReq, op string) ([][]float32, error) {
+	if !embedding.CallerSupplied(s.embedder) {
+		texts := make([]string, len(reqs))
+		for i, r := range reqs {
+			if r.Embedding != nil {
+				return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+					"embedding was supplied%s, but this server computes its own embeddings from content; send the content alone",
+					batchPosition(i)))
+			}
+			texts[i] = r.Content
+		}
+		// One embedding call for the whole batch. The service below chunks to
+		// its own batch size and coalesces with other callers; asking it once
+		// per memory would defeat both.
+		vectors, err := s.embedder.Embed(ctx, texts)
+		if err != nil {
+			return nil, err
+		}
+		if len(vectors) != len(reqs) {
+			return nil, errs.E(errs.Storage, op, fmt.Errorf(
+				"the embedder returned %d vectors for %d memories", len(vectors), len(reqs)))
+		}
+		return vectors, nil
+	}
+
+	vectors := make([][]float32, len(reqs))
+	for i, r := range reqs {
+		v, err := s.suppliedVector("embedding", r.Embedding, op, batchPosition(i))
+		if err != nil {
+			return nil, err
+		}
+		vectors[i] = v
+	}
+	return vectors, nil
+}
+
+// suppliedVector checks one caller's vector against this server's declared
+// model. field is the request field it came in, which the refusal names, and
+// where says which memory of a batch it belonged to.
+//
+// The reason is classified once, under op: the refusal is a problem document's
+// detail verbatim, and a second operation prefix in it would be noise to the
+// caller reading it.
+func (s *Service) suppliedVector(field string, v []float32, op, where string) ([]float32, error) {
+	if v == nil {
+		return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+			"%s is required: this server's vectors come from the caller (%s, %d dimensions), and it computes none%s",
+			field, s.embedder.ModelID(), s.embedder.Dim(), where))
+	}
+	out, err := embedding.CheckSupplied(field, v, s.embedder.Dim(), s.cfg.Metric == distance.Cosine)
+	if err != nil {
+		var reason *errs.Error
+		if errors.As(err, &reason) {
+			err = reason.Err
+		}
+		return nil, errs.E(errs.Invalid, op, fmt.Errorf("%w%s", err, where))
+	}
+	return out, nil
+}
+
+// batchPosition is the suffix that says which memory of a batch was refused.
+// The first is unmarked, so a single create reads naturally.
+func batchPosition(i int) string {
+	if i == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (memory %d of the batch)", i)
 }
 
 // applyFlashbulb promotes a highly-arousing memory and protects it.

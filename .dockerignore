@@ -9,6 +9,8 @@
 .env
 .env.*
 .benchmark-data
+# The benchmark suites are development tooling and never part of an image.
+benchmarks
 .tools
 .models
 .remember

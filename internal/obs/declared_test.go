@@ -22,6 +22,10 @@ func TestDeclaredNamesListEveryRegisteredFamily(t *testing.T) {
 		"remem_storage_compactions_total",
 		"remem_storage_cache_accesses_total",
 		"remem_search_truncated_total",
+		"remem_row_cache_hits_total",
+		"remem_row_cache_misses_total",
+		"remem_row_cache_entries",
+		"remem_vector_index_queue_depth",
 		"remem_migration_records_remaining",
 	} {
 		if !slices.Contains(names, want) {
@@ -36,10 +40,11 @@ func TestDeclaredNamesListEveryRegisteredFamily(t *testing.T) {
 	if !slices.IsSorted(names) {
 		t.Error("DeclaredNames is not sorted")
 	}
-	// Three API, six storage, three search, five jobs, three lifecycle, four
-	// discovery, four migrations. A family added without updating this number
-	// is a family the coverage guard must now be told about.
-	if len(names) != 28 {
-		t.Fatalf("%d families declared, want 28:\n%s", len(names), strings.Join(names, "\n"))
+	// Three API, six storage, three search, three row cache, three vector, five
+	// jobs, three lifecycle, four discovery, four migrations. A family added
+	// without updating this number is a family the coverage guard must now be
+	// told about.
+	if len(names) != 34 {
+		t.Fatalf("%d families declared, want 34:\n%s", len(names), strings.Join(names, "\n"))
 	}
 }

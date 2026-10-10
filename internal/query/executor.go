@@ -28,6 +28,11 @@ type Executor struct {
 	metric distance.Metric
 	texts  *text.Index
 
+	// efStep is the index's [vector.Granular] step, read once: a widening budget
+	// below it costs the index the same walk and returns fewer candidates. One
+	// for an index that has no steps, and for no index at all.
+	efStep int
+
 	// textRebuilds is where a degraded keyword index reports itself. Nil means
 	// the discovery ends as a log line, which is what it was before Phase 9.
 	textRebuilds text.Rebuilder
@@ -61,7 +66,10 @@ func WithTextRebuilder(r text.Rebuilder) ExecutorOption {
 // answered emptily.
 func NewExecutor(slots *schema.Slots, index vector.Index, metric distance.Metric,
 	opts ...ExecutorOption) *Executor {
-	e := &Executor{slots: slots, index: index, metric: metric}
+	e := &Executor{slots: slots, index: index, metric: metric, efStep: 1}
+	if g, ok := index.(vector.Granular); ok && g.SearchGranularity() > 1 {
+		e.efStep = g.SearchGranularity()
+	}
 	for _, o := range opts {
 		o(e)
 	}
@@ -239,84 +247,6 @@ func (e *Executor) runAttrScan(ctx context.Context, r attr.Reader, q *Query, pla
 	return out, nil
 }
 
-// runVector searches canonical vectors, widening k until the predicates it
-// cannot push down have left a full page.
-//
-// Unlike an ordered walk this restarts rather than resumes: a nearest-neighbour
-// index answers "the k nearest", and there is no position to continue from. The
-// repeated work is the price of the access path, and it is bounded by the same
-// 32× factor.
-func (e *Executor) runVector(ctx context.Context, r attr.Reader, q *Query, plan Plan, step Step) (stepPage, error) {
-	const op = "query.Executor.runVector"
-
-	if e.index == nil {
-		return stepPage{}, errs.E(errs.Invalid, op,
-			fmt.Errorf("this build has no vector index, so a semantic search cannot be answered"))
-	}
-
-	// An index that cannot answer completely for this tenant makes the page
-	// incomplete however the widening below goes, so the flag is settled before
-	// the search rather than inferred from its results. This is the one caller
-	// of vector.Health, and it is the caller the interface's own documentation
-	// promises is pinned by a test: an index damaged for a tenant would
-	// otherwise return a short page that reads exactly like a small corpus.
-	health, err := e.index.Health(ctx, q.Tenant)
-	if err != nil {
-		return stepPage{}, err
-	}
-
-	var out stepPage
-	out.truncated = health.Degraded
-	budget := plan.StartBudget
-	for {
-		hits, err := e.index.Search(ctx, q.Tenant, q.Vector, budget, nil)
-		if err != nil {
-			return stepPage{}, err
-		}
-		out.examined = len(hits)
-		out.items = out.items[:0]
-
-		for _, h := range hits {
-			ok, err := e.settle(ctx, r, q, h.ID)
-			if err != nil {
-				return stepPage{}, err
-			}
-			if !ok {
-				continue
-			}
-			out.items = append(out.items, RankedItem{
-				ID:    h.ID,
-				Score: distance.Relevance(e.metric, h.Distance),
-				// 1/(1+d), which is the scale Rust's single-source path
-				// reports and the one the differential harness compares
-				// (behaviour baseline §1.4).
-				Ordering: distance.Score(h.Distance),
-				Distance: h.Distance,
-			})
-			if len(out.items) == plan.Target {
-				break
-			}
-		}
-
-		switch {
-		case len(out.items) >= plan.Target:
-			return out, nil
-		case len(hits) < budget:
-			// The index returned fewer candidates than asked for, so it has no
-			// more to give. The page is short because the corpus is, not
-			// because the budget ran out.
-			return out, nil
-		case budget >= plan.MaxBudget:
-			out.truncated = true
-			return out, nil
-		}
-		budget *= 2
-		if budget > plan.MaxBudget {
-			budget = plan.MaxBudget
-		}
-	}
-}
-
 // runText looks the query's terms up in the inverted index, widening its limit
 // until the predicates it cannot push down have left a full page.
 //
@@ -483,16 +413,14 @@ func (e *Executor) settle(ctx context.Context, r attr.Reader, q *Query, rid id.I
 	if len(q.Preds) == 0 {
 		return true, nil
 	}
-	value, err := r.Get(ctx, attr.RowKey(q.Tenant, ns, rid))
-	if errs.Is(err, errs.NotFound) {
-		return false, nil
-	}
-	if err != nil {
+	// Through attr.ReadRow rather than a Get and a DecodeRow of its own, so that a
+	// reader carrying a row cache is used by this path too. A candidate a previous
+	// request already settled then costs a map lookup instead of a point read and
+	// a decode, and the cache's generation is what keeps the answer the one this
+	// request's snapshot would give (see attr.RowCache).
+	row, err := attr.ReadRow(ctx, r, e.slots, q.Tenant, ns, rid)
+	if err != nil || row == nil {
 		return false, err
-	}
-	row, err := attr.DecodeRow(value, e.slots)
-	if err != nil {
-		return false, nil
 	}
 	return attr.Match(row, q.Preds), nil
 }

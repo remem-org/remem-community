@@ -30,6 +30,7 @@ import (
 // spec §51 names.
 type Config struct {
 	Node      NodeConfig      `toml:"node"`
+	Runtime   RuntimeConfig   `toml:"runtime"`
 	Storage   StorageConfig   `toml:"storage"`
 	Server    ServerConfig    `toml:"server"`
 	Tenant    TenantConfig    `toml:"tenant"`
@@ -55,6 +56,40 @@ type NodeConfig struct {
 	ID string `toml:"id"`
 }
 
+// RuntimeConfig covers the Go runtime's own two dials.
+//
+// They are configuration rather than constants because they are the one
+// trade-off an operator has to make against their own machine: both buy speed
+// with resident memory, and how much memory there is to spend is not something
+// this repository knows.
+//
+// The environment wins over both. GOGC and GOMEMLIMIT are the runtime's own
+// names, and an operator who set one in a unit file or a container manifest has
+// already said what they want; a configuration file quietly overriding it would
+// be the "two names, one setting" defect this package exists to prevent. The
+// composition root logs which value is in force either way.
+type RuntimeConfig struct {
+	// GCPercent is GOGC: how far the heap may grow past live data, as a
+	// percentage, before the collector runs. Go's own default is 100, which
+	// collects when the heap has doubled; 200 lets it reach roughly three times
+	// live data, so the collector runs about half as often for about half as
+	// much resident memory again.
+	//
+	// -1 turns the collector off. That is the Go runtime's own spelling of it,
+	// and it is for a bounded profiling run rather than a server.
+	GCPercent int `toml:"gc_percent"`
+
+	// MemoryLimitBytes is GOMEMLIMIT, a soft limit on the memory the whole
+	// process keeps. Zero is no limit.
+	//
+	// It is what makes a larger gc_percent safe where memory is bounded: as the
+	// process approaches the limit the collector runs harder and gc_percent
+	// stops mattering, so the heap is capped instead of the process being
+	// killed. It is soft on purpose — Go will exceed it rather than stall
+	// forever — so it is a budget, not a guarantee.
+	MemoryLimitBytes int64 `toml:"memory_limit_bytes"`
+}
+
 // StorageConfig covers the durable store.
 type StorageConfig struct {
 	// Path is the data directory. Remem owns everything under it.
@@ -68,6 +103,22 @@ type StorageConfig struct {
 	// writes for throughput, and is a decision an operator must make
 	// explicitly rather than discover.
 	SyncWrites bool `toml:"sync_writes"`
+	// MemTableSizeBytes is how much the engine buffers in memory before
+	// flushing it to a table. Pebble's own default is 4 MiB, which is sized
+	// for a short-lived test instance: a larger buffer absorbs more
+	// overwrites, so less is written and less is compacted afterwards. Zero
+	// takes the engine's default.
+	//
+	// The cost is memory and recovery time. Up to two buffers of this size may
+	// be queued, and everything in them is a WAL the next start has to replay
+	// after a crash.
+	MemTableSizeBytes int64 `toml:"memtable_size_bytes"`
+	// BloomBitsPerKey sizes the bloom filter in each table, which is what lets
+	// a point read skip a table it cannot contain the key for. Pebble writes
+	// no filter by default. Ten bits is the usual choice: about a 1%
+	// false-positive rate for about 1.25 bytes of filter memory per key. Zero
+	// writes no filter.
+	BloomBitsPerKey int `toml:"bloom_bits_per_key"`
 }
 
 // ServerConfig covers the delivery surfaces.
@@ -121,6 +172,20 @@ type TenantConfig struct {
 // model is not comparable with the ones already stored, which is why every
 // vector records the model that produced it.
 type EmbeddingConfig struct {
+	// Provider decides where a vector comes from: "onnx" computes it in this
+	// process from the memory's text, "external" takes it from the caller.
+	//
+	// It is server-wide rather than per request because one corpus holds
+	// vectors from one model: a caller-supplied vector and one this server
+	// computed are points in different spaces even at the same width, and a
+	// search comparing them would rank by nothing.
+	Provider string `toml:"provider"`
+	// ExternalModelID names the model the caller's vectors come from. Required
+	// under the external provider and refused under onnx. It is stamped on
+	// every stored vector, which is what lets a later start with a different
+	// model refuse the corpus instead of mixing two spaces in one ranking.
+	ExternalModelID string `toml:"external_model_id"`
+
 	Model string `toml:"model"`
 	// ModelPath is the directory holding model.onnx and tokenizer.json,
 	// populated by scripts/fetch-model.sh. Nothing is downloaded at runtime: a
@@ -136,9 +201,20 @@ type EmbeddingConfig struct {
 	MaxSequenceTokens int `toml:"max_sequence_tokens"`
 	// CacheSize is how many vectors the embedding LRU remembers.
 	CacheSize int `toml:"cache_size"`
-	// Workers bounds concurrent model runs.
+	// Workers bounds how many batches wait on the model at once. The model
+	// itself runs one inference at a time, so this is a queue depth and not a
+	// degree of parallelism: raising it does not make inference faster. For
+	// that, see IntraOpThreads.
 	Workers int `toml:"workers"`
-	// FillWindow is how long a partly-filled batch waits for company.
+	// IntraOpThreads bounds ONNX Runtime's own parallelism within one
+	// inference. Zero derives it from the CPUs this process may use — the
+	// affinity mask and any container CPU quota, as runtime.GOMAXPROCS reports
+	// them — rather than leaving it to ONNX Runtime, whose default counts the
+	// host's cores and ignores a quota. See embedding.IntraOpThreads.
+	IntraOpThreads int `toml:"intra_op_threads"`
+	// FillWindow is how long a partly-filled batch waits for company, and how
+	// recently another request must have arrived for a batch to wait at all: a
+	// request that arrives alone goes to the model at once.
 	FillWindow time.Duration `toml:"fill_window"`
 }
 
@@ -160,6 +236,31 @@ type VectorConfig struct {
 	// needs it. A tenant whose graph is evicted is re-read from its node
 	// records on the next search, which costs a scan and never an answer.
 	ResidentBudgetMB int `toml:"resident_budget_mb"`
+
+	// AsyncIndexing takes the index insert off the request path: a create
+	// commits its canonical vector and queues the index work, and the response
+	// no longer waits for a graph insert and a second commit.
+	//
+	// It is off by default, because what it trades is visible to every caller:
+	// a new memory becomes vector-searchable only once the queue applies its
+	// insert, so a search issued immediately after a create may not see it, and
+	// may say truncated: false while missing it. That breaks read-your-writes
+	// between agents sharing a tenant, which an operator may choose and a default
+	// must not. config/remem.toml and docs/architecture/vector.md state it, and
+	// openspec/changes/async-vector-indexing is the design that removes the
+	// window. Nothing is lost either way: the canonical vector is committed, and
+	// an operation the queue could not apply degrades the tenant and schedules a
+	// rebuild.
+	//
+	// With it off the index is called inline, which is what it did before this
+	// setting existed. The exact index ignores it entirely: there is no
+	// derived structure to maintain and nothing to queue.
+	AsyncIndexing bool `toml:"async_indexing"`
+
+	// IndexQueueSize is how many operations one indexing worker may have
+	// waiting. It is the backpressure point: with the queue full a create
+	// waits for a worker rather than returning with its vector unindexed.
+	IndexQueueSize int `toml:"index_queue_size"`
 }
 
 // TextConfig covers the inverted index behind keyword search.
@@ -202,6 +303,18 @@ type SearchConfig struct {
 	// re-runs a similarity walk. Rust's number, 128 (config.rs:290-300).
 	ListMaxFactor       int     `toml:"list_max_factor"`
 	SimilarityThreshold float64 `toml:"similarity_threshold"`
+	// RowCacheEntries bounds the process-wide cache of decoded attribute rows
+	// that filtered searches and listings settle their candidates from. Zero
+	// disables it, and every candidate is then a point read and a decode as
+	// before.
+	//
+	// Size it in bytes, not in rows: a decoded entry costs about 689 bytes with
+	// the twelve slots the memory table declares — the row's slot map and a
+	// string header and backing array per value, not the few dozen bytes the
+	// encoded row occupies on disk. Measured at 13.8 MB for 20,000 entries. The
+	// cache is shared by every tenant: see attr.RowCache for why a write retires
+	// a whole tenant's share of it.
+	RowCacheEntries int `toml:"row_cache_entries"`
 }
 
 // PagingConfig bounds how long abandoned ranked searches pin snapshots.
@@ -331,172 +444,6 @@ type MetricsConfig struct {
 	Enabled bool   `toml:"enabled"`
 	Addr    string `toml:"addr"` // empty serves on the main HTTP listener
 	Path    string `toml:"path"`
-}
-
-// The defaults. Every one of them is here, named, so that the behaviour of an
-// unconfigured Remem is readable in one place (spec §51).
-const (
-	DefaultStoragePath      = "./data"
-	DefaultStorageEngine    = "pebble"
-	DefaultCacheSizeBytes   = 256 << 20 // 256 MiB
-	DefaultSyncWrites       = true
-	DefaultServerEnv        = "development"
-	DefaultHTTPAddr         = "127.0.0.1:4545"
-	DefaultReadTimeout      = 30 * time.Second
-	DefaultWriteTimeout     = 30 * time.Second
-	DefaultShutdownTimeout  = 30 * time.Second
-	DefaultMaxRequestBytes  = 8 << 20 // 8 MiB
-	DefaultRateLimitRPS     = 100     // Rust's default, per tenant rather than per address
-	DefaultRateLimitBurst   = 50
-	DefaultTenant           = "default"
-	DefaultAutoProvision    = true
-	DefaultEmbeddingBatch   = 32
-	DefaultMaxSeqTokens     = 256
-	DefaultEmbeddingCache   = 4096
-	DefaultEmbeddingWorkers = 2
-	DefaultEmbeddingFill    = 5 * time.Millisecond
-	DefaultVectorIndex      = "flat"
-	DefaultVectorMetric     = "cosine"
-	DefaultHNSWM            = 16
-	DefaultHNSWEfConstruct  = 200
-	DefaultHNSWEfSearch     = 64
-	DefaultResidentBudget   = 512
-	DefaultTextEnabled      = true
-	DefaultSearchLimit      = 10
-	DefaultSearchMaxLimit   = 200
-	DefaultMaxPageDepth     = 2000
-	DefaultRankedTTL        = time.Minute
-	DefaultSimilarity       = 0.0
-	DefaultLifecycleEnabled = true
-	DefaultSweepInterval    = time.Hour
-	DefaultRunBudget        = 10_000
-	DefaultRecallWindow     = 30 * time.Second
-	DefaultEventRetention   = 90 * 24 * time.Hour
-	DefaultDiscoveryEnabled = true
-	// The three discovery numbers are repeated here rather than imported from
-	// internal/discovery, because internal/config is imported by everything and
-	// discovery pulls in the graph, the record repository and the job
-	// framework. TestConfigDefaultsMatchTheDiscoveryPackage in internal/server
-	// is what stops the two copies drifting.
-	DefaultDiscoveryThreshold     = 0.7
-	DefaultDiscoveryTopK          = 5
-	DefaultDiscoveryMaxCandidates = 64
-
-	DefaultJobWorkers      = 4
-	DefaultJobLease        = time.Minute
-	DefaultJobMaxRetries   = 5
-	DefaultJobPollInterval = time.Second
-	DefaultJobRetention    = 24 * time.Hour
-	DefaultJobDrainTimeout = 15 * time.Second
-	DefaultLogLevel        = "info"
-	DefaultLogFormat       = "json"
-	DefaultMetricsEnabled  = true
-	DefaultMetricsPath     = "/metrics"
-)
-
-// Fixed constants of the system. These are defaults in the sense that they can
-// be written in a file, and constants in the sense that validation refuses the
-// combinations that would make stored data incomparable.
-const (
-	// EmbeddingModel is the only model whose vectors are comparable with the
-	// ones already stored.
-	EmbeddingModel = "all-MiniLM-L6-v2"
-	// EmbeddingDimension is that model's output width: 384, mean-pooled and
-	// L2-normalised.
-	EmbeddingDimension = 384
-	// RRFK is reciprocal-rank fusion's k.
-	RRFK = 60
-	// WidenMaxFactor bounds candidate-set widening.
-	WidenMaxFactor = 32
-	// ListMaxFactor bounds a listing's widening.
-	ListMaxFactor = 128
-)
-
-// Default returns the configuration of an unconfigured Remem: a development
-// server on localhost, storing under ./data, with no API key.
-//
-// It validates. A default that does not pass its own validation is a trap for
-// the first person who runs the binary without a config file.
-func Default() Config {
-	return Config{
-		Storage: StorageConfig{
-			Path:           DefaultStoragePath,
-			Engine:         DefaultStorageEngine,
-			CacheSizeBytes: DefaultCacheSizeBytes,
-			SyncWrites:     DefaultSyncWrites,
-		},
-		Server: ServerConfig{
-			Env:             DefaultServerEnv,
-			HTTPAddr:        DefaultHTTPAddr,
-			ReadTimeout:     DefaultReadTimeout,
-			WriteTimeout:    DefaultWriteTimeout,
-			ShutdownTimeout: DefaultShutdownTimeout,
-			MaxRequestBytes: DefaultMaxRequestBytes,
-			RateLimitRPS:    DefaultRateLimitRPS,
-			RateLimitBurst:  DefaultRateLimitBurst,
-		},
-		Tenant: TenantConfig{
-			Default:       DefaultTenant,
-			AutoProvision: DefaultAutoProvision,
-		},
-		Embedding: EmbeddingConfig{
-			Model:             EmbeddingModel,
-			BatchSize:         DefaultEmbeddingBatch,
-			MaxSequenceTokens: DefaultMaxSeqTokens,
-			CacheSize:         DefaultEmbeddingCache,
-			Workers:           DefaultEmbeddingWorkers,
-			FillWindow:        DefaultEmbeddingFill,
-		},
-		Vector: VectorConfig{
-			Dimension:          EmbeddingDimension,
-			Index:              DefaultVectorIndex,
-			Metric:             DefaultVectorMetric,
-			HNSWM:              DefaultHNSWM,
-			HNSWEfConstruction: DefaultHNSWEfConstruct,
-			HNSWEfSearch:       DefaultHNSWEfSearch,
-			ResidentBudgetMB:   DefaultResidentBudget,
-		},
-		Text: TextConfig{Enabled: DefaultTextEnabled},
-		Search: SearchConfig{
-			DefaultLimit:        DefaultSearchLimit,
-			MaxLimit:            DefaultSearchMaxLimit,
-			MaxPageDepth:        DefaultMaxPageDepth,
-			RRFK:                RRFK,
-			WidenMaxFactor:      WidenMaxFactor,
-			ListMaxFactor:       ListMaxFactor,
-			SimilarityThreshold: DefaultSimilarity,
-		},
-		Paging: PagingConfig{RankedTTL: DefaultRankedTTL},
-		Lifecycle: LifecycleConfig{
-			Enabled:        DefaultLifecycleEnabled,
-			SweepInterval:  DefaultSweepInterval,
-			RunBudget:      DefaultRunBudget,
-			RecallWindow:   DefaultRecallWindow,
-			EventRetention: DefaultEventRetention,
-		},
-		Discovery: DiscoveryConfig{
-			Enabled:       DefaultDiscoveryEnabled,
-			Threshold:     DefaultDiscoveryThreshold,
-			TopK:          DefaultDiscoveryTopK,
-			MaxCandidates: DefaultDiscoveryMaxCandidates,
-		},
-		Jobs: JobsConfig{
-			Workers:       DefaultJobWorkers,
-			LeaseDuration: DefaultJobLease,
-			MaxRetries:    DefaultJobMaxRetries,
-			PollInterval:  DefaultJobPollInterval,
-			Retention:     DefaultJobRetention,
-			DrainTimeout:  DefaultJobDrainTimeout,
-		},
-		Log: LogConfig{
-			Level:  DefaultLogLevel,
-			Format: DefaultLogFormat,
-		},
-		Metrics: MetricsConfig{
-			Enabled: DefaultMetricsEnabled,
-			Path:    DefaultMetricsPath,
-		},
-	}
 }
 
 // LogConfig converts the user-facing logging settings into the form

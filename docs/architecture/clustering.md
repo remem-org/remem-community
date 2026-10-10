@@ -17,3 +17,12 @@ required to leave, so that clustering is additive rather than a rewrite:
 `version.ClusterCompat` is zero, and stays zero until a cluster format is
 active. This document will say what is authoritative across nodes, what shards
 own, and how the `tenant → []shard` mapping is kept, when Phase 14 builds it.
+
+**Phase 14 now follows maintained memory** (maintained-memory P0.3,
+`docs/architecture/belief.md`). It will be replanned against the managed model,
+and inherits one placement constraint from it: **a tenant is one atomic revision
+domain**. Its tenant control counters, change events, projections and
+publication must be co-located on one shard until a distributed revision
+protocol exists. Accepted managed commands carry their ids, times, vectors and
+versions, so a replica applies them without a model call (proposal Invariant 4).
+That is a fourth seam, alongside the three above.

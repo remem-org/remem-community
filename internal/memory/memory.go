@@ -78,6 +78,12 @@ type CreateReq struct {
 	// TTL is how long the memory lives. Zero means the policy's default, which
 	// for every built-in is "never expires".
 	TTL time.Duration
+
+	// Embedding is the caller's vector for Content. It is required when the
+	// server's vectors come from the caller and refused when the server
+	// computes its own: the two are points in different spaces, and a corpus
+	// holding both would rank by nothing.
+	Embedding []float32
 }
 
 // UpdateReq changes an existing memory.
@@ -108,6 +114,14 @@ type UpdateReq struct {
 	Valence    *float32
 	Arousal    *float32
 	TTL        *time.Duration
+
+	// Embedding is the caller's vector for the new Content, and travels with it:
+	// required with Content when the server's vectors come from the caller,
+	// refused without Content, and refused when the server computes its own.
+	// Rewriting Content to the identical string is not a change, so its vector
+	// is not applied either — the vector describes the content, and to change
+	// one, change the other.
+	Embedding []float32
 }
 
 // GetOpts varies a read.
@@ -187,6 +201,12 @@ type SearchReq struct {
 	// an archived memory is retired *from retrieval*, which is the whole point
 	// of the state.
 	IncludeArchived bool
+
+	// QueryVector is the caller's vector for the search. It is required for a
+	// semantic or hybrid search when the server's vectors come from the caller,
+	// and refused everywhere else. A semantic search needs no Query beside it; a
+	// hybrid one needs both, because its keyword half reads the text.
+	QueryVector []float32
 }
 
 // Result is one ranked memory.

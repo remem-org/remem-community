@@ -465,38 +465,6 @@ func ParseSpace(k []byte) (tenant.ID, tenant.Namespace, Space, error) {
 	return t, ns, s, nil
 }
 
-// parseScope decodes the tenant and namespace prefix, returning the remainder.
-func parseScope(k []byte, op string) (tenant.ID, tenant.Namespace, []byte, error) {
-	t, rest, err := parseComponent(k, op, "tenant")
-	if err != nil {
-		return "", "", nil, err
-	}
-	ns, rest, err := parseComponent(rest, op, "namespace")
-	if err != nil {
-		return "", "", nil, err
-	}
-	return tenant.ID(t), tenant.Namespace(ns), rest, nil
-}
-
-func parseComponent(k []byte, op, what string) (string, []byte, error) {
-	n, w := binary.Uvarint(k)
-	if w <= 0 {
-		return "", nil, corrupt(op, "key ends before its "+what+" length")
-	}
-	// binary.Uvarint accepts padded encodings — 0x80 0x00 is zero — and the
-	// encoder never writes one. Accepting it would admit a second byte string
-	// for the same key, which a range built by the encoder does not cover: the
-	// row would exist and no scan would find it. FuzzKeyDecoders found this.
-	if w != uvarintLen(int(n)) {
-		return "", nil, corrupt(op, "key has a non-minimal "+what+" length prefix")
-	}
-	k = k[w:]
-	if uint64(len(k)) < n {
-		return "", nil, corrupt(op, "key ends inside its "+what)
-	}
-	return string(k[:n]), k[n:], nil
-}
-
 // --- internals --------------------------------------------------------------
 
 // begin writes the scope prefix and the space byte into a slice sized for the

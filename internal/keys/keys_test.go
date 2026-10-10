@@ -2,6 +2,7 @@ package keys_test
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/errs"
@@ -407,6 +408,80 @@ func TestSpaceNamesAreStable(t *testing.T) {
 	}
 	if got := keys.RecordMemory.String(); got != "memory" {
 		t.Errorf("RecordMemory is named %q", got)
+	}
+}
+
+// TenantOf is the write path's question about a key: whose writes must this one
+// be ordered against. It is asked for every key of every batch, so it answers
+// from the scope prefix alone and never decodes the body.
+func TestTenantOfReadsTheTenantOutOfAnyKey(t *testing.T) {
+	rid := id.New()
+	long := tenant.ID(strings.Repeat("t", tenant.MaxIDLen))
+	cases := map[string]struct {
+		key  []byte
+		want tenant.ID
+	}{
+		"record":        {keys.Record(acme, ns, keys.RecordMemory, rid), acme},
+		"vector":        {keys.Vector(acme, ns, rid), acme},
+		"text":          {keys.Text(acme, ns, "term", rid), acme},
+		"job":           {keys.Job(acme, ns, keys.JobPending, 7, rid), acme},
+		"session":       {keys.Session("other-tenant", ns, rid), "other-tenant"},
+		"another space": {keys.AttrIndex("acmecorp", "prod", 3, []byte("v"), rid), "acmecorp"},
+		// The system space is untenanted by construction, and its keys carry an
+		// empty tenant rather than no tenant at all. The answer is the empty id
+		// and not a miss: these keys exist and are written.
+		"system": {keys.System("/tenants/acme"), ""},
+		// A tenant id at the limit needs a two-byte length prefix, which is the
+		// case a hand-written example forgets.
+		"longest id": {keys.Record(long, ns, keys.RecordMemory, rid), long},
+	}
+	for name, c := range cases {
+		got, ok := keys.TenantOf(c.key)
+		if !ok {
+			t.Errorf("%s: TenantOf reported no tenant for a key it built", name)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: TenantOf = %q, want %q", name, got, c.want)
+		}
+		// The answer must agree with the full parser, which is the only other
+		// thing that reads this prefix.
+		if parsed, _, _, err := keys.ParseSpace(c.key); err == nil && parsed != c.want {
+			t.Errorf("%s: ParseSpace says %q, TenantOf says %q", name, parsed, got)
+		}
+	}
+}
+
+func TestTenantOfReportsAMissForAKeyItCannotRead(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":            {},
+		"nil":              nil,
+		"length only":      {0x04},
+		"truncated tenant": {0x04, 'a', 'c'},
+		// A padded length prefix is a second spelling of the same key, which the
+		// builders never emit; parseComponent refuses it and so must this.
+		"non-minimal length": {0x80, 0x00, 0x00, 0x01, 0x02},
+		// Not a Remem key at all: the first byte reads as a length far past the
+		// end of the key.
+		"foreign": []byte("bench/00000000000000000001"),
+	}
+	for name, k := range cases {
+		if got, ok := keys.TenantOf(k); ok {
+			t.Errorf("%s: TenantOf = %q, true; want a miss", name, got)
+		}
+	}
+}
+
+// The write path asks TenantOf for every key of every batch. An allocation here
+// would be an allocation per key per write.
+func TestTenantOfDoesNotAllocate(t *testing.T) {
+	key := keys.Record(acme, ns, keys.RecordMemory, id.New())
+	if n := testing.AllocsPerRun(100, func() {
+		if _, ok := keys.TenantOf(key); !ok {
+			t.Fatal("TenantOf missed a key it built")
+		}
+	}); n > 0 {
+		t.Errorf("TenantOf allocates %.0f times per key, want 0", n)
 	}
 }
 

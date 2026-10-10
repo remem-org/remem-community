@@ -18,6 +18,28 @@
 # This node's stable identity. Empty derives it from the hostname.
 id = ""
 
+[runtime]
+# The Go runtime's own two dials, and the one trade-off that is memory against
+# speed rather than durability against speed.
+#
+# gc_percent is GOGC: how far the heap may grow past live data, as a percentage,
+# before the collector runs. Go's default is 100 — collect when the heap has
+# doubled. 200 lets the heap reach roughly three times live data, so the
+# collector runs about half as often and the process keeps about half as much
+# memory again. A profile of the search benchmark spent over 40% of CPU in the
+# collector and in releasing pages under 100. -1 turns the collector off, which
+# is for a bounded profiling run and not for a server.
+gc_percent = 200
+# memory_limit_bytes is GOMEMLIMIT, a soft cap on everything the process keeps.
+# Zero is no cap. This is what makes a larger gc_percent safe where memory is
+# bounded: as the process approaches the cap the collector works harder and
+# gc_percent stops mattering, so the heap is held down instead of the container
+# being killed. It is soft — Go overshoots rather than stalling forever — so set
+# it somewhat below the real limit, e.g. 1500000000 under a 2 GiB cgroup.
+memory_limit_bytes = 0
+# GOGC and GOMEMLIMIT in the environment win over both keys and are not
+# overridden; the startup log says which value is in force.
+
 [storage]
 path = "./data"
 # "pebble" is durable; "memory" keeps nothing across a restart.
@@ -25,6 +47,19 @@ engine = "pebble"
 cache_size_bytes = 268435456 # 256 MiB
 # fsync every commit. Turning this off trades the last writes for throughput.
 sync_writes = true
+# How much the engine buffers in memory before flushing it to a table. Pebble's
+# own default is 4 MiB, which is sized for a short-lived test instance; a larger
+# buffer absorbs more overwrites, so less is written and less is compacted
+# afterwards. The cost is memory and recovery time: up to two buffers of this
+# size may be queued — so up to 128 MiB here — and everything in them is a WAL
+# the next start has to replay after a crash. Zero takes the engine's default.
+memtable_size_bytes = 67108864 # 64 MiB
+# Bits of bloom filter per key, which is what lets a point read skip a table
+# that cannot hold the key. Pebble writes no filter unless asked. Ten is the
+# usual choice: about a 1% false-positive rate for about 1.25 bytes of filter
+# memory per key, so a million memories cost roughly 1.25 MB. Zero writes no
+# filter.
+bloom_bits_per_key = 10
 
 [server]
 # "development" or "production". In production an api_key is required.
@@ -48,12 +83,28 @@ default = "default"
 auto_provision = true
 
 [embedding]
+# Where vectors come from. "onnx" computes them here from each memory's text.
+# "external" takes them from the caller: a create carries `embedding` and a
+# semantic search carries `query_vector`, the server needs no model, and
+# vector.dimension is whatever external_model_id produces (at most 4096).
+provider = "onnx"
+# Required under "external", refused under "onnx". Stamped on every vector, so a
+# corpus written by one model is refused rather than searched by another.
+external_model_id = ""
 # Fixed: vectors from another model are not comparable with the stored ones,
 # which is why every vector records the model that produced it.
 model = "all-MiniLM-L6-v2"
 model_path = ""
 batch_size = 32
 max_sequence_tokens = 256
+# ONNX Runtime's parallelism within one inference. Zero derives it from the
+# CPUs this process may use, which respects a container's CPU quota and an
+# explicit GOMAXPROCS; ONNX Runtime's own default counts the host's cores and
+# would oversubscribe a quota. The startup log states the count in force.
+# This is the setting that
+# makes a single inference faster; `workers` is not — the model runs one
+# inference at a time, and workers only bounds how many batches wait on it.
+intra_op_threads = 0
 
 [vector]
 # 384 is all-MiniLM-L6-v2's output width. Changing one without the other is
@@ -65,6 +116,34 @@ metric = "cosine"
 hnsw_m = 16
 hnsw_ef_construction = 200
 hnsw_ef_search = 64
+# Index maintenance off the request path. A create commits its canonical vector
+# and queues the index work, so the response no longer waits for a graph insert
+# and a second commit — about a millisecond at 384 dimensions, and the tenant's
+# graph write lock with it.
+#
+# Off by default, because the trade-off is visible to every caller: a new memory
+# becomes vector-searchable only *after* the queue applies it, so a search
+# issued immediately after a create may not see it -- and reports
+# truncated: false while missing it. Agents sharing a tenant lose
+# read-your-writes. Turn it on only where write latency matters more than that.
+# Nothing is lost. The canonical vector is committed either way, and a node
+# record the queue never applied is one the next materialisation of that tenant
+# inserts — which is the same guarantee that already covered a crash, and is
+# why docs/architecture/vector.md calls this index the asynchronous one.
+#
+# An operation the queue cannot apply after its memory committed marks the
+# tenant degraded, so searches report truncated: true, and schedules a
+# vector.rebuild that clears it.
+#
+# Off, the index is called inline, as it was before this setting existed. The
+# exact index ignores it: there is no derived structure to maintain, so there
+# is nothing to queue.
+async_indexing = false
+# How many operations one indexing worker may have waiting. It is the
+# backpressure point rather than a discard point: with the queue full a create
+# waits for a worker instead of returning with its vector unindexed. Two
+# workers, so the bound is twice this in total.
+index_queue_size = 1024
 
 [text]
 # The inverted index behind keyword and hybrid search. There is one setting:
@@ -85,6 +164,17 @@ widen_max_factor = 32
 # where a widened search re-runs a similarity walk. Rust's number, 128.
 list_max_factor = 128
 similarity_threshold = 0.0
+# How many decoded attribute rows the process keeps, shared by every tenant.
+# Every candidate a filtered search or listing examines is one row read and one
+# decode, and rows change rarely next to how often they are read. A tenant's
+# share is retired whole when one of its memories is written, so a write-heavy
+# tenant gets few hits and loses nothing by it: a miss is exactly the read the
+# cache replaced. Zero turns it off.
+#
+# Budget it in bytes: a decoded entry costs about 689 bytes with the twelve slots
+# the memory table declares — much more than the encoded row on disk, because it
+# holds the slot map and a string per value — so this default is about 11 MB.
+row_cache_entries = 16384
 
 [lifecycle]
 # Turns the per-tenant maintenance job and durable recall recording on. With it

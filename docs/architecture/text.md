@@ -173,8 +173,9 @@ BM25, with `k1 = 1.2` and `b = 0.75`, per tenant.
   them, and graceful is better than inverted.
 
 Ties break on the record id, ascending. Without a deterministic tiebreak the
-order falls back to map iteration and two identical queries return different
-truncated result *sets*, not merely different orders.
+order falls back to whatever order the merge visited the candidates in, and two
+identical queries return different truncated result *sets*, not merely different
+orders.
 
 ## Corpus statistics: exact, and what that costs
 
@@ -255,6 +256,87 @@ what its inverse document frequency then says about it.
 
 Rust scans every record on every keyword query (§II.10 row 1, the defect REM-29
 never fixed).
+
+### The merge is not linear in the query's terms
+
+**It was, and that was a defect.** The merge that replaced the three-map
+implementation found each next candidate by scanning every term's cursor and then
+scanned every cursor again to score it, on the argument that the query's terms
+are a handful. They are not bounded by anything of the sort: a query is bounded
+at `memory.MaxQueryBytes`, 64 KiB, so a valid 59,999-byte query holds six
+thousand distinct terms, and the cost was candidates × terms with an exhausted
+term costing exactly as much as a live one. Measured on that query over six
+thousand matching documents:
+
+| 6,000-term query, 6,000 matching documents | Answer |
+|---|---|
+| Scanning every cursor per candidate | 134 ms |
+| The three-map implementation it had replaced | 5.1 ms |
+| A k-way merge over a heap of the cursors | 3.9 ms |
+
+**A heap everywhere was not the answer either**, and finding that out is what
+produced the shape the code has. For two terms a heap is a pop, a sift and a push
+where a scan is two comparisons, and replacing the scan with a heap outright cost
+**+10%** on `BenchmarkSearchCommonTerms` — twenty thousand documents, two terms
+each in about a quarter of them, a page of ten (1.479 ms → 1.633 ms, p=0.000,
+n=20). A keyword search is the ordinary case of this whole package; paying a
+tenth of it everywhere to fix a query shape nobody has sent yet is the wrong
+trade.
+
+So the candidate-finding step has two implementations and `heapMergeMinTerms`,
+which is 8, picks one per query:
+
+- **Under eight terms, a scan of the live cursors.** One pass that drops the
+  cursors the previous candidate exhausted, tracks the lowest head record id and
+  accumulates the cursors carrying it. A candidate costs the terms still carrying
+  postings, never the terms that have run out — which is the half of the defect
+  that was about bookkeeping rather than about scale.
+- **At eight or more, a min-heap** keyed by the record id at each cursor's head. A
+  candidate costs the terms carrying it times the logarithm of the terms still
+  active, and a term leaves the cost for good when its last posting is consumed.
+
+Everything after the collection — the sort back into term order, the scoring, the
+gate and the bounded selection — is shared between them, so the summation order
+and the gating rules have one home. That matters more than it sounds: scores are
+float64 sums, float64 addition is not associative, and
+`TestSearchMatchesTheReferenceImplementation` pins every score bit-for-bit
+against the three-map oracle. It therefore runs its whole corpus and all 204
+queries **twice, once per strategy** (the threshold is a `var` so a test can force
+the heap onto a short query), and so does
+`TestKeywordSearchAllocationsDoNotFollowTheCandidateCount`. Two strategies that
+agree only on the queries nobody ran is not agreement.
+
+| `BenchmarkSearchCommonTerms`, 2 terms, 20,000 documents | vs the first merge |
+|---|---|
+| A heap for every query | +10% (p=0.000, n=20) |
+| Threshold, with each collection step behind its own method | +10% (p=0.000, n=20) |
+| Threshold, with both collection steps inline in the loop | +3.5% (p=0.002, n=20) |
+
+The middle row is the one worth keeping. Factoring the two strategies into a
+method each — the obvious way to write it — gave back none of the 10%, because a
+method whose body contains a loop will not inline and a short query then pays a
+call per candidate. A CPU profile put the merge at 0.84 s against the first
+implementation's 0.54 s with the methods, and at 0.68 s with the bodies written
+out inside the loop. The remaining 3.5% is the intermediate list the shared
+scoring pass reads; removing it means fusing scoring into each collection body,
+and owning two copies of the gating rules and the summation order is worse than
+owning 3.5%.
+
+Twenty interleaved pairs per measurement, not six, because this host drifts by
+about as much as the effect: one six-pair run of the heap-everywhere change came
+out at +1.6% with p=0.48 and the quietest at +12.2%. Only twenty-pair runs with
+both samples inside ±2% are quoted here.
+
+`TestKeywordSearchCostDoesNotGrowWithExhaustedTerms` holds the long query where
+it now is, by requiring the merge to stay within three times the reference
+implementation rather than within an absolute number of milliseconds that a busy
+host would flake. It also asserts which strategy a 6,000-term query and a 3-term
+query each get, because the timing alone would pass just as well with the
+threshold dropped to zero and the +10% quietly back.
+
+**The merge also checks for cancellation**, every 1,024 candidates. A query whose
+caller has gone away, or whose server is shedding load, stops with `Unavailable`
+instead of ranking its way to an answer nobody is waiting for.
 
 ## Tags
 

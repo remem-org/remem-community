@@ -3,9 +3,7 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"time"
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/auth"
@@ -13,8 +11,6 @@ import (
 	"github.com/remem-org/remem-go/internal/config"
 	"github.com/remem-org/remem-go/internal/discovery"
 	"github.com/remem-org/remem-go/internal/embedding"
-	"github.com/remem-org/remem-go/internal/embedding/onnx"
-	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/events"
 	"github.com/remem-org/remem-go/internal/graph"
 	"github.com/remem-org/remem-go/internal/jobs"
@@ -26,15 +22,14 @@ import (
 	"github.com/remem-org/remem-go/internal/schema"
 	"github.com/remem-org/remem-go/internal/session"
 	"github.com/remem-org/remem-go/internal/storage"
-	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/storage/metered"
-	"github.com/remem-org/remem-go/internal/storage/pebble"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/tenant/tenantkv"
 	"github.com/remem-org/remem-go/internal/text"
 	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"github.com/remem-org/remem-go/internal/vector/indexes"
+	"github.com/remem-org/remem-go/internal/vector/indexqueue"
 	"github.com/remem-org/remem-go/internal/version"
 )
 
@@ -56,10 +51,20 @@ type deps struct {
 	kv      storage.KV
 	slots   *schema.Slots
 	indexer *attr.Indexer
-	texts   *text.Index
-	vectors vector.Index
-	edges   graph.Service
-	repo    record.Repo
+	// rowCache is the shared cache of decoded attribute rows. It is built once,
+	// here, and handed to two places: the indexer, which invalidates it inside
+	// the writing transaction, and the memory service, which reads through it.
+	// Two caches would be a cache nothing invalidated.
+	rowCache *attr.RowCache
+	texts    *text.Index
+	vectors  vector.Index
+	// indexQueue is the vectors index when asynchronous indexing is on and the
+	// configured index has a structure to maintain, and nil otherwise. It is
+	// kept beside `vectors` only so that the shutdown can drain it: everything
+	// else reaches it through the vector.Index it is.
+	indexQueue *indexqueue.Queue
+	edges      graph.Service
+	repo       record.Repo
 
 	// The background job framework. The queue is durable, the registry maps a
 	// type to its handler, the pool runs them and the scheduler enqueues the
@@ -87,6 +92,12 @@ type deps struct {
 	// session sweep and the policy routes single-tenant without an edition
 	// check at each of them.
 	tenants tenant.Directory
+	// requestTenants is tenants with a short-lived cache of its successful
+	// lookups, and it is what the API surfaces are given. The existence check
+	// in authenticate is a KV read on every request for an answer that changes
+	// about never; everything else here keeps the uncached directory, because a
+	// maintenance job that walks tenants must see them as they are.
+	requestTenants tenant.Directory
 	// allTenants is the unconfined directory. Exactly two things use it: the
 	// start-up inventory, which has to see what it is about to refuse, and the
 	// migration runner, which must not skip a tenant's rows. Both are audited
@@ -96,14 +107,23 @@ type deps struct {
 	keyring    *auth.Keyring
 }
 
-// maintainerOf asks an index whether it keeps a structure of its own beside the
-// canonical vectors, the way memory.Service does. An exact index does not: it
-// *is* a scan of those vectors, so there is nothing for a deletion to tidy.
-func maintainerOf(index vector.Index) vector.Maintainer {
-	if m, ok := index.(vector.Maintainer); ok {
-		return m
+// abandon closes whatever build has opened so far and reports err.
+//
+// Every one of build's failure paths used to repeat the same two or three
+// closes, which is how a dependency added later ends up released on some paths
+// and leaked on others. One function instead, nil-tolerant so that a failure
+// before a thing exists is the same code as a failure after it: a failed start
+// must not leave the data directory locked against the next attempt, and must
+// not leave a background goroutine running either.
+func (d *deps) abandon(err error) (*deps, error) {
+	d.closeVectors()
+	if d.embedding != nil {
+		_ = d.embedding.Close()
 	}
-	return nil
+	if d.kv != nil {
+		_ = d.kv.Close()
+	}
+	return nil, err
 }
 
 // build assembles the server's dependencies.
@@ -148,19 +168,26 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	d.allTenants = tenantkv.New(kv, d.clk)
 	d.capability = opts.capability
 	if d.tenants, err = scopeDirectory(cfg, opts.capability, d.allTenants); err != nil {
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
+	// Wrapped outside the confinement, so that a tenant this build refuses is
+	// refused before the cache is consulted — and only for the request path:
+	// the sweep, the scheduler, the metrics labels and a snapshot read the
+	// directory as it is.
+	d.requestTenants = tenant.Cached(d.tenants, d.clk, tenant.CacheTTL)
 
 	// The registered attribute slot table, built before the migrations because
 	// a migration that backfills attribute rows needs it to write them with.
 	slots, err := attr.Table()
 	if err != nil {
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 	d.slots = slots
-	d.indexer = attr.NewIndexer(slots)
+	// The row cache before the indexer, because the indexer is what invalidates
+	// it: a write path wired without it would serve stale rows for ever.
+	d.rowCache = attr.NewRowCache(cfg.Search.RowCacheEntries,
+		attr.WithRowCacheMetrics(&d.metrics.RowCache))
+	d.indexer = attr.NewIndexer(slots, attr.WithRowCache(d.rowCache))
 
 	// The job queue, built before anything that reports damage to it. Nothing
 	// runs yet: Server.Run starts the pool, so a `remem-admin` command or a
@@ -182,8 +209,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	// written. A directory this binary cannot interpret is refused here rather
 	// than discovered by a read that returns something plausible.
 	if err := d.migrate(context.Background()); err != nil {
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 
 	// The slot table is validated against the one on disk and persisted, after
@@ -191,31 +217,38 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	// registered table legal to install, and stamping it first would record a
 	// table the data has not been brought up to.
 	if err := schema.OpenSlots(context.Background(), kv, slots); err != nil {
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 
-	d.embedder = opts.embedder
-	if d.embedder == nil {
-		e, err := openEmbedder(cfg)
-		if err != nil {
-			_ = kv.Close()
-			return nil, err
+	// memoryEmbedder is what the memory service embeds through: the batching
+	// service around a model, or — when vectors come from the caller — the bare
+	// declaration of their model, with no service, no cache and no goroutine,
+	// because there is nothing to batch.
+	var memoryEmbedder embedding.Embedder
+	if cfg.Embedding.Provider == config.ProviderExternal {
+		d.embedder = embedding.NewExternal(cfg.Embedding.ExternalModelID, cfg.Vector.Dimension)
+		memoryEmbedder = d.embedder
+	} else {
+		d.embedder = opts.embedder
+		if d.embedder == nil {
+			e, err := openEmbedder(cfg)
+			if err != nil {
+				return d.abandon(err)
+			}
+			d.embedder = e
 		}
-		d.embedder = e
+		d.embedding = embedding.NewService(d.embedder, embedding.ServiceConfig{
+			BatchSize:  cfg.Embedding.BatchSize,
+			FillWindow: cfg.Embedding.FillWindow,
+			Workers:    cfg.Embedding.Workers,
+			CacheSize:  cfg.Embedding.CacheSize,
+		})
+		memoryEmbedder = d.embedding
 	}
-	d.embedding = embedding.NewService(d.embedder, embedding.ServiceConfig{
-		BatchSize:  cfg.Embedding.BatchSize,
-		FillWindow: cfg.Embedding.FillWindow,
-		Workers:    cfg.Embedding.Workers,
-		CacheSize:  cfg.Embedding.CacheSize,
-	})
 
 	metric, err := distance.Parse(cfg.Vector.Metric)
 	if err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 
 	// The index is chosen by name and built behind vector.Index. Nothing here
@@ -233,9 +266,23 @@ func build(cfg config.Config, opts options) (*deps, error) {
 		Rebuilds:            d.repairs.vectorRebuilder(),
 	})
 	if err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
+	}
+	// Indexing off the request path, when the configuration asks for it and
+	// the index has a structure to maintain. The queue *is* a vector.Index and
+	// a vector.Maintainer, so nothing below this line knows it is there: the
+	// memory service still asks the index whether it needs telling about
+	// writes, and still tells it after the commit. An exact index is not
+	// wrapped, because there is nothing to tell it and a queue in front of it
+	// would make the write path believe otherwise.
+	if maintained, ok := index.(indexqueue.Maintained); ok && cfg.Vector.AsyncIndexing {
+		d.indexQueue = indexqueue.New(maintained,
+			indexqueue.WithSize(cfg.Vector.IndexQueueSize),
+			indexqueue.WithMetrics(&d.metrics.Vector),
+			// A lost operation degrades the tenant and is repaired through the
+			// same path as a damaged index.
+			indexqueue.WithRebuilder(d.repairs.vectorRebuilder()))
+		index = d.indexQueue
 	}
 	d.vectors = index
 
@@ -246,9 +293,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	// pays for a migration none of them are running.
 	upgrader, err := schema.NewRecordUpgrader()
 	if err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 	var repoOpts []record.RepoOption
 	if upgrader != nil {
@@ -280,7 +325,11 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	// Discovery, before the memory service, because the write path is given the
 	// enqueuer. The handler itself is built after the repository below, since
 	// it reads records through the same one the write path writes to.
-	memoryOpts := []memory.Option{memory.WithSearchMetrics(&d.metrics.Search)}
+	memoryOpts := []memory.Option{
+		memory.WithSearchMetrics(&d.metrics.Search),
+		// The same cache the indexer above invalidates.
+		memory.WithRowCache(d.rowCache),
+	}
 	if cfg.Discovery.Enabled {
 		memoryOpts = append(memoryOpts,
 			memory.WithDiscovery(discovery.NewEnqueuer(d.queue, TypeDiscoverySimilar)))
@@ -298,7 +347,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	// would maintain a different world than the one a search reads.
 	d.repo = record.NewRepo(kv, repoOpts...)
 	d.memories = memory.New(kv, d.repo,
-		index, d.embedding, d.clk, d.slots, d.edges, memory.Config{
+		index, memoryEmbedder, d.clk, d.slots, d.edges, memory.Config{
 			DefaultLimit:   cfg.Search.DefaultLimit,
 			MaxLimit:       cfg.Search.MaxLimit,
 			MaxPageDepth:   cfg.Search.MaxPageDepth,
@@ -325,9 +374,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	}
 	keyring, err := auth.NewKeyring(converted)
 	if err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 	d.keyring = keyring
 
@@ -353,9 +400,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 		RecallWindow:   cfg.Lifecycle.RecallWindow,
 	})
 	if err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 	d.maintainer = maintainer
 
@@ -380,9 +425,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 		MaxCandidates: cfg.Discovery.MaxCandidates,
 	})
 	if err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 	d.discoverer = discoverer
 
@@ -390,89 +433,13 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	// after everything they close over exists is what lets each handler be a
 	// closure rather than a struct with its own copy of the dependency graph.
 	if err := d.registerBuiltinJobs(); err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 	if err := d.buildJobRunners(); err != nil {
-		_ = d.embedding.Close()
-		_ = kv.Close()
-		return nil, err
+		return d.abandon(err)
 	}
 
 	return d, nil
-}
-
-// buildJobRunners constructs the pool and the scheduler.
-func (d *deps) buildJobRunners() error {
-	pool, err := jobs.NewPool(jobs.PoolConfig{
-		Queue: d.queue, Registry: d.registry, Tenants: d.tenants, Clock: d.clk,
-		Owner:        d.nodeID(),
-		Workers:      d.cfg.Jobs.Workers,
-		PollInterval: d.cfg.Jobs.PollInterval,
-		DrainTimeout: d.cfg.Jobs.DrainTimeout,
-		Metrics:      d.metrics,
-	})
-	if err != nil {
-		return err
-	}
-	d.pool = pool
-
-	interval := schedulerTick(d.registry.Recurring(), d.cfg.Jobs.PollInterval)
-	sched, err := jobs.NewScheduler(jobs.SchedulerConfig{
-		Queue: d.queue, Registry: d.registry, Tenants: d.tenants, Clock: d.clk,
-		Interval: interval,
-	})
-	if err != nil {
-		return err
-	}
-	d.scheduler = sched
-	return nil
-}
-
-// schedulerTick is how often the scheduler looks at its registrations.
-//
-// # It comes from the registrations, not from a setting
-//
-// It used to be derived from jobs.retention — a Phase 9 shortcut that held only
-// because the reaper was the one recurring type and its interval came from the
-// same setting. Phase 10 registers lifecycle.maintain at lifecycle.sweep_interval,
-// and the end-to-end run found what that produced: a tick of three hours over a
-// sweep asked to run hourly. An operator setting a dial and getting something
-// else is the class of defect Phase 9's configuration work exists to prevent, so
-// the tick is derived from the shortest interval anything actually registered.
-//
-// # And it is bounded on both sides
-//
-// A quarter of the shortest interval, so a run is at most 25% of a period late —
-// and with the drift fix in jobs.Scheduler.advance, late once rather than later
-// every time. Never finer than the pool polls, because a tick that enqueues work
-// nothing will look at for another second is a directory walk for nothing. Never
-// coarser than a minute, so a long interval does not make start-up recovery slow.
-func schedulerTick(recurring []jobs.Entry, poll time.Duration) time.Duration {
-	shortest := time.Duration(0)
-	for _, e := range recurring {
-		if shortest == 0 || e.Every < shortest {
-			shortest = e.Every
-		}
-	}
-	if shortest == 0 {
-		// Nothing recurring is registered. The scheduler still runs, because a
-		// type may be registered by a later phase, and a minute is cheap.
-		return time.Minute
-	}
-
-	tick := shortest / 4
-	if floor := poll; tick < floor {
-		tick = floor
-	}
-	if tick < time.Second {
-		tick = time.Second
-	}
-	if tick > time.Minute {
-		tick = time.Minute
-	}
-	return tick
 }
 
 // nodeID is what a lease is granted to.
@@ -534,40 +501,6 @@ func (d *deps) migrate(ctx context.Context) error {
 	return runner.Run(ctx, startup)
 }
 
-func openStore(cfg config.Config) (storage.KV, error) {
-	switch cfg.Storage.Engine {
-	case "memory":
-		return memkv.New(), nil
-	case "pebble":
-		return pebble.Open(cfg.Storage.Path, pebble.Options{
-			CacheSizeBytes: cfg.Storage.CacheSizeBytes,
-		})
-	default:
-		return nil, errs.E(errs.Invalid, "server.openStore",
-			fmt.Errorf("storage.engine %q is not one this binary knows", cfg.Storage.Engine))
-	}
-}
-
-// openEmbedder loads the model.
-//
-// A build without the onnx tag fails here, and that is on purpose: the
-// alternative is a server that starts, produces meaningless vectors, and stamps
-// the real model's name on every one of them. A durable corpus filled that way
-// cannot be told from a good one afterwards.
-func openEmbedder(cfg config.Config) (embedding.Embedder, error) {
-	if cfg.Embedding.Model != embedding.Model {
-		return nil, errs.E(errs.Invalid, "server.openEmbedder", fmt.Errorf(
-			"embedding.model is %q; this binary produces vectors comparable only with %q",
-			cfg.Embedding.Model, embedding.Model))
-	}
-	return onnx.Open(onnx.Config{
-		ModelPath:         cfg.Embedding.ModelPath,
-		SharedLibraryPath: cfg.Embedding.ONNXLibraryPath,
-		MaxSequenceTokens: cfg.Embedding.MaxSequenceTokens,
-		IntraOpThreads:    cfg.Embedding.Workers,
-	})
-}
-
 // close releases everything, in reverse order of construction, and reports the
 // first failure without skipping the rest. A shutdown that stopped at the first
 // error would leave a data directory locked.
@@ -582,6 +515,11 @@ func (d *deps) close() error {
 	// queue, and closing the store under them would turn a shutdown into a
 	// handful of errors nobody asked for.
 	d.repairs.close()
+	// Then the index queue, for the same reason and one more: its workers
+	// write node records, so it has to be drained — and its workers have to be
+	// *gone* — while the store is still open. Server.Run reaches here after the
+	// HTTP listener has stopped accepting, so nothing is still enqueueing.
+	d.closeVectors()
 	if d.memories != nil {
 		keep(d.memories.Close())
 	}

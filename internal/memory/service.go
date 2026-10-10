@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
 	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
@@ -129,6 +130,14 @@ type Service struct {
 	executor *query.Executor
 	paging   *pagingRegistry
 
+	// slots is the registered attribute table, kept so that a request can build
+	// a reader that decodes rows with it.
+	slots *schema.Slots
+	// rows is the shared cache of decoded attribute rows, or nil. It is the
+	// composition root's, because the write path invalidates through the same
+	// object; see attr.RowCache.
+	rows *attr.RowCache
+
 	// texts is the inverted index. It is nil when text.enabled is off, and a
 	// keyword or hybrid search is then refused by name rather than silently
 	// answered as a semantic one — a caller who asked for an exact-term search
@@ -207,6 +216,19 @@ func WithTextRebuilder(r text.Rebuilder) Option {
 	return func(s *Service) { s.textRebuilds = r }
 }
 
+// WithRowCache makes a search, a listing and a related query settle their
+// candidates from a shared cache of decoded attribute rows.
+//
+// The same cache must be given to the attr.Indexer the write path uses, because
+// that is what invalidates it. It is therefore built once in the composition root
+// and handed to both, rather than created here: a service that made its own would
+// be a cache nothing ever invalidated.
+//
+// Without it every candidate is a point read and a decode, exactly as before.
+func WithRowCache(c *attr.RowCache) Option {
+	return func(s *Service) { s.rows = c }
+}
+
 // Enqueuer stages a memory write's follow-up discovery work into that write's
 // own transaction.
 //
@@ -267,7 +289,8 @@ func New(kv storage.KV, repo record.Repo, index vector.Index, embedder embedding
 		o(s)
 	}
 	if slots != nil {
-		s.paging = newPagingRegistry(kv, clk, c.RankedTTL)
+		s.slots = slots
+		s.paging = newPagingRegistry(kv, clk, c.RankedTTL, s.rows)
 		s.planner = query.NewPlanner(slots, c.WidenMaxFactor, c.ListMaxFactor)
 		var executorOpts []query.ExecutorOption
 		if s.texts != nil {
@@ -283,6 +306,12 @@ func New(kv storage.KV, repo record.Repo, index vector.Index, embedder embedding
 	}
 	return s
 }
+
+// CallerSuppliedVectors reports whether this service's vectors come from the
+// caller rather than from a model it runs. A delivery surface with no way to
+// carry a vector asks this, so it can refuse by saying why rather than by
+// relaying a demand for a field it does not have.
+func (s *Service) CallerSuppliedVectors() bool { return embedding.CallerSupplied(s.embedder) }
 
 // indexed tells a derived vector index that a canonical vector has committed.
 //

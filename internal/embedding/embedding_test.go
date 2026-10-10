@@ -157,6 +157,49 @@ func TestConcurrentCallersAreCoalescedIntoBatches(t *testing.T) {
 	}
 }
 
+// An isolated request is the common case behind a search or a single create,
+// and the fill window is all of its added latency: there is no company coming
+// for it to wait for.
+func TestAnIsolatedRequestIsNotHeldForTheFillWindow(t *testing.T) {
+	const window = 500 * time.Millisecond
+	s := newService(t, embeddingtest.New(), embedding.ServiceConfig{FillWindow: window})
+
+	start := time.Now()
+	if _, err := s.Embed(context.Background(), []string{"a lone memory"}); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 100*time.Millisecond {
+		t.Fatalf("an isolated Embed took %v with a fill window of %v; a batch of one should not wait for company", took, window)
+	}
+}
+
+// Dispatching a lone request at once must not cost the coalescing a burst
+// depends on, however long the window is.
+func TestABurstStillCoalescesWithALongFillWindow(t *testing.T) {
+	const (
+		window  = 500 * time.Millisecond
+		callers = 20
+	)
+	fake := &countingEmbedder{inner: embeddingtest.New()}
+	s := newService(t, fake, embedding.ServiceConfig{FillWindow: window})
+
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Embed(context.Background(), []string{fmt.Sprintf("memory %d", i)}); err != nil {
+				t.Errorf("Embed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := fake.calls(); got >= callers {
+		t.Fatalf("%d concurrent single-text callers produced %d model runs; coalescing is not happening", callers, got)
+	}
+}
+
 func TestAnEmptyRequestIsRefused(t *testing.T) {
 	s := newService(t, embeddingtest.New(), embedding.ServiceConfig{})
 	if _, err := s.Embed(context.Background(), nil); !errs.Is(err, errs.Invalid) {

@@ -136,9 +136,23 @@ func numFromKey(k []byte) (uint32, error) {
 
 // loadResult is what one materialisation learned, beyond the graph itself.
 type loadResult struct {
-	// Corrupt counts node records that could not be decoded. Any at all means
-	// the tenant is served degraded and a rebuild is wanted.
+	// Corrupt counts node records that could not be decoded, or that were
+	// written under another M. Any at all means the tenant is served degraded
+	// and a rebuild is wanted — and will help, because the canonical vectors
+	// behind those records are intact and a rebuild derives the graph from
+	// them afresh.
 	Corrupt int
+	// Unplaceable counts canonical vectors the arena cannot hold: empty ones,
+	// and ones of another width than the tenant's. It is counted apart from
+	// Corrupt because a rebuild does not repair it — it rewrites the same row
+	// at the same width — so asking for one would be a repair that never
+	// resolves. The tenant is degraded either way; only the remedy differs,
+	// and here the remedy is re-embedding the records.
+	Unplaceable int
+	// Width is the width the tenant's vectors were measured to have, which is
+	// what an Unplaceable count is measured against. It is zero for a tenant
+	// with no non-empty canonical vector.
+	Width int
 	// Reindexed counts canonical vectors that had no node record and were
 	// inserted during the load. That is the ordinary repair after a crash
 	// between a commit and its asynchronous index write, and it is not a
@@ -153,6 +167,11 @@ type loadResult struct {
 // no node record covered, in key order, and the node records it could not read.
 // [Index.load] finishes it in one transaction; [Index.Rebuild] finishes it in
 // committed batches, which is what makes a rebuild resumable.
+//
+// Every id in pending has an insertable vector in vectors. A row the arena
+// cannot hold is counted corrupt and removed from both, because it is not work
+// left undone — no later insert can succeed on it — and a caller that trusted
+// the pairing would dereference a vector that is not there.
 type pendingWork struct {
 	pending    []id.ID
 	vectors    map[id.ID]*vector.Vector
@@ -218,12 +237,21 @@ func (x *Index) load(ctx context.Context, t tenant.ID) (*graph, loadResult, erro
 // The tenant is still reported degraded, because the links that pointed *into*
 // the unreadable node are gone and the graph's quality is no longer the one the
 // parameters describe.
+//
+// A canonical vector the arena cannot hold — empty, or of another width than the
+// tenant's — is the one kind of corruption neither an insert nor a rebuild
+// repairs, so it is left out of the graph and out of work rather than
+// re-inserted, and counted as Unplaceable rather than Corrupt. Both the placed
+// and the pending path check it, because a tenant can be damaged on either side
+// of the join and neither may cost more than the one record. The width they
+// check against is the tenant's majority width, decided once, up front.
 func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork) (*graph, loadResult, error) {
 	const op = "hnsw.load"
 	var res loadResult
 
 	vectors := make(map[id.ID]*vector.Vector)
 	order := make([]id.ID, 0, 64)
+	widths := make(map[int]int)
 	modelID := ""
 	if err := x.store.ScanVectors(ctx, t, func(rid id.ID, v *vector.Vector) error {
 		if v.ModelID != "" {
@@ -235,6 +263,13 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 					"tenant %s holds vectors from two models, %q and %q: they are not one space and cannot be indexed together",
 					t, modelID, v.ModelID))
 			}
+		}
+		// An empty vector is unplaceable whatever the rest of the tenant looks
+		// like, so it is left out of the tally rather than allowed to win it:
+		// a width of zero is not a width, and electing it would put the loops
+		// below back to letting the first non-empty row decide.
+		if len(v.Values) > 0 {
+			widths[len(v.Values)]++
 		}
 		vectors[rid] = v.Clone()
 		order = append(order, rid)
@@ -249,6 +284,17 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 	}
 
 	g := newGraph(x.params, x.metric)
+
+	// The arena holds one width, so the tenant has one, and it is settled here
+	// — before a slot is taken — rather than by whichever vector happens to be
+	// placed first. It is the width most of the tenant's vectors have, because
+	// one corrupt row must never be the row that decides: when the first in
+	// key order settled it, a single mislaid record sorting before the rest
+	// made every good row the mismatch, so the tenant kept that one vector and
+	// answered every query asked at its real width with an error. An empty
+	// tenant has no width, and then there is nothing to check against.
+	g.dim = modeWidth(widths)
+	res.Width = g.dim
 
 	stored, maxNum, unreadable, err := x.readNodes(ctx, t, &res)
 	if err != nil {
@@ -271,15 +317,29 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 			// describe, so the tenant is degraded and wants a rebuild.
 			res.Corrupt++
 		}
-		n := &node{id: sn.id, vec: v.Values, norm: distance.Norm(v.Values), level: sn.level}
+		if len(v.Values) == 0 || len(v.Values) != g.dim {
+			// An empty vector, or one of another width than the tenant's.
+			// Neither is reachable from one embedder through a vector row the
+			// encoder accepted — the model guard above settles the second — so
+			// it means a corrupt or hand-edited store, and the node is left
+			// out. Placing it instead would leave a graph whose nodes are not
+			// all one width, which answers *every* search with an error rather
+			// than this one record with none.
+			res.Unplaceable++
+			delete(vectors, sn.id)
+			continue
+		}
+		n := &node{id: sn.id, slot: g.allocSlot(v.Values), norm: distance.Norm(v.Values), level: sn.level}
 		n.links = sn.links
 		n.back = make([][]uint32, sn.level+1)
+		// The stored lists enter the running count here, in the loop that
+		// places them; the filter below and addBack adjust it from there.
+		for _, l := range n.links {
+			g.linkEntries += int64(len(l))
+		}
 		g.nodes[sn.num] = n
 		g.byID[sn.id] = sn.num
 		g.live++
-		if g.dim == 0 {
-			g.dim = len(v.Values)
-		}
 	}
 
 	// Drop links to node numbers that are not present, then derive the reverse
@@ -295,7 +355,7 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 					out = append(out, m)
 				}
 			}
-			n.links[l] = out
+			g.setList(&n.links[l], out)
 		}
 	}
 	for num, n := range g.nodes {
@@ -320,11 +380,47 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 	work.vectors = vectors
 	work.unreadable = unreadable
 	for _, rid := range order {
-		if _, ok := g.byID[rid]; !ok {
-			work.pending = append(work.pending, rid)
+		if _, placed := g.byID[rid]; placed {
+			continue
 		}
+		v, kept := vectors[rid]
+		if !kept {
+			// A vector the arena cannot hold is not work left undone: it is a
+			// record the tenant is degraded by, it was counted and deleted
+			// above, and naming it here would hand the caller an id with no
+			// vector behind it.
+			continue
+		}
+		// A pending vector can be of the wrong width just as a placed one can,
+		// and it is checked here rather than at the insert because g.insert
+		// answers a mismatch with an error, which would fail a whole tenant's
+		// load — or a whole rebuild — over one row. Dropping it from both
+		// vectors and pending means [Index.load] and [Index.Rebuild] see only
+		// work they can insert. The width is the tenant's own, fixed above, so
+		// a rebuild — which has no node records to place and reaches every row
+		// through here — judges the pending vectors by the same measure a load
+		// judges the placed ones by.
+		if len(v.Values) == 0 || len(v.Values) != g.dim {
+			res.Unplaceable++
+			delete(vectors, rid)
+			continue
+		}
+		work.pending = append(work.pending, rid)
 	}
 	return g, res, nil
+}
+
+// modeWidth returns the width most of a tenant's vectors have, breaking a tie
+// towards the narrower one so that two servers reading the same corpus agree.
+// Zero means there was no non-empty vector to measure.
+func modeWidth(counts map[int]int) int {
+	best, bestCount := 0, 0
+	for w, n := range counts {
+		if n > bestCount || (n == bestCount && w < best) {
+			best, bestCount = w, n
+		}
+	}
+	return best
 }
 
 // readNodes decodes every node record of a tenant, counting the ones it cannot.

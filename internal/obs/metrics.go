@@ -38,6 +38,8 @@ type Metrics struct {
 	API        APIMetrics
 	Storage    StorageMetrics
 	Search     SearchMetrics
+	RowCache   RowCacheMetrics
+	Vector     VectorMetrics
 	Jobs       JobMetrics
 	Lifecycle  LifecycleMetrics
 	Discovery  DiscoveryMetrics
@@ -85,6 +87,52 @@ type SearchMetrics struct {
 	// is the number that says whether widen_max_factor or max_page_depth is
 	// binding for real traffic.
 	TruncatedTotal *prometheus.CounterVec
+}
+
+// RowCacheMetrics covers the shared cache of decoded attribute rows every
+// filtered search and listing settles its candidates from.
+//
+// Hits and misses carry a tenant label, because the thing an operator wants to
+// know is which tenant is getting the saving: a tenant's share of the cache is
+// retired whole whenever one of its memories is written, so a write-heavy tenant
+// reads as nearly all misses and that is the cache working as designed, not
+// failing. The entries gauge carries a component label instead — the bound is on
+// the process, and dividing it between tenants would invent an attribution.
+type RowCacheMetrics struct {
+	// HitsTotal counts candidate rows answered from the cache.
+	HitsTotal *prometheus.CounterVec
+	// MissesTotal counts candidate rows read from the reader's own snapshot.
+	// Against the hits it is the hit rate; against search_candidates_considered
+	// it says how much of a query the cache is able to serve at all.
+	MissesTotal *prometheus.CounterVec
+	// Entries is how many decoded rows are held, against search.row_cache_entries.
+	Entries *prometheus.GaugeVec
+}
+
+// VectorMetrics covers the queue that keeps vector indexing off the request
+// path. A create commits its canonical vector and enqueues the node-record
+// work, so these three say how far behind that work is running.
+//
+// The depth gauge carries a shard label rather than a tenant one, and it is the
+// one place in this file that does: the queue's bound is per worker, and a
+// tenant is sharded onto exactly one of them so that its operations stay
+// ordered. Depth is therefore a fact about a worker, and labelling it by tenant
+// would report the same number under every tenant that shares the worker.
+type VectorMetrics struct {
+	// QueueDepth is how many accepted operations one worker still holds,
+	// waiting or being applied. It reaching the configured bound is what
+	// turns a create into a wait.
+	QueueDepth *prometheus.GaugeVec
+	// ApplyLag measures enqueue to applied. It is the visibility window: a
+	// memory becomes vector-searchable this long after its create returned.
+	ApplyLag *prometheus.HistogramVec
+	// FailuresTotal counts operations that did not reach the index, by kind:
+	// `apply` for one the index refused, `enqueue` for one a cancelled caller
+	// or a stopped queue never accepted, `shutdown` for one accepted and then
+	// abandoned when the drain ran out of time. None fails the write — the
+	// canonical vector is committed and the next materialisation inserts the
+	// node record — so this is the only place a loss is visible.
+	FailuresTotal *prometheus.CounterVec
 }
 
 // JobMetrics covers spec §50's background job list.
@@ -163,6 +211,7 @@ const (
 	labelKeyspace  = "op"
 	labelComponent = "component"
 	labelResult    = "result"
+	labelShard     = "shard"
 	labelMode      = "mode"
 	labelKind      = "kind"
 	labelOutcome   = "outcome"
@@ -221,6 +270,26 @@ func NewMetrics() *Metrics {
 			TruncatedTotal: counter("search_truncated_total",
 				"Searches that reported truncated: true, by search_type.", labelTenant, labelMode),
 		},
+		RowCache: RowCacheMetrics{
+			HitsTotal: counter("row_cache_hits_total",
+				"Candidate attribute rows answered from the decoded-row cache.", labelTenant),
+			MissesTotal: counter("row_cache_misses_total",
+				"Candidate attribute rows read from the request's own snapshot.", labelTenant),
+			Entries: gauge("row_cache_entries",
+				"Decoded attribute rows held, against search.row_cache_entries.", labelComponent),
+		},
+		Vector: VectorMetrics{
+			QueueDepth: gauge("vector_index_queue_depth",
+				"Index operations one worker has waiting, by shard.", labelShard),
+			// The lag is sub-millisecond when the queue is keeping up and
+			// seconds when it is not, which is the shared latency range.
+			ApplyLag: histogram("vector_index_apply_lag_seconds",
+				"Time from a vector index operation being enqueued to it being applied.",
+				latencyBuckets, labelTenant),
+			FailuresTotal: counter("vector_index_failures_total",
+				"Vector index operations that did not reach the index, by kind (apply, enqueue, shutdown).",
+				labelTenant, labelKind),
+		},
 		Jobs: JobMetrics{
 			Pending: gauge("jobs_pending",
 				"Jobs waiting to run.", labelTenant, labelKind),
@@ -278,6 +347,8 @@ func NewMetrics() *Metrics {
 		m.Storage.WritesTotal, m.Storage.ReadsTotal, m.Storage.ScanDuration,
 		m.engine, // SizeBytes, CompactionsTotal and CacheAccessesTotal, sampled at scrape time
 		m.Search.Duration, m.Search.CandidatesConsidered, m.Search.TruncatedTotal,
+		m.RowCache.HitsTotal, m.RowCache.MissesTotal, m.RowCache.Entries,
+		m.Vector.QueueDepth, m.Vector.ApplyLag, m.Vector.FailuresTotal,
 		m.Jobs.Pending, m.Jobs.Running, m.Jobs.FailuresTotal,
 		m.Jobs.RetriesTotal, m.Jobs.ProcessingDuration,
 		m.Lifecycle.TransitionsTotal, m.Lifecycle.SweepDuration,

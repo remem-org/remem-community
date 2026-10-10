@@ -70,7 +70,7 @@ func Open(kv storage.KV, cfg Config) (vector.Index, error) {
 
 	switch cfg.Kind {
 	case "flat":
-		return flat.New(vector.NewStore(kv), metric), nil
+		return flat.New(vector.NewStore(kv), metric, flat.Serving(cfg.ModelID)), nil
 	case "hnsw":
 		return hnsw.New(kv, hnsw.Options{
 			Metric: metric,

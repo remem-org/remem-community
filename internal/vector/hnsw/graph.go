@@ -3,6 +3,7 @@ package hnsw
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
@@ -14,11 +15,15 @@ import (
 // The vector is held in memory and never written to a node record. It came
 // from the canonical row and it goes back there — see the package comment.
 type node struct {
-	id  id.ID
-	vec []float32
-	// norm is vec's length, computed once when the node is made. A node's
-	// vector never changes in place — a replacement is a removal and an insert
-	// — so it cannot go stale.
+	id id.ID
+	// slot is where this node's vector sits in the graph's arena, not a slice
+	// of its own. See [graph.chunks]: one allocation per node was both a
+	// pointer to chase on every distance call and the largest single source of
+	// allocations a rebuild made.
+	slot uint32
+	// norm is the vector's length, computed once when the node is made. A
+	// node's vector never changes in place — a replacement is a removal and an
+	// insert — so it cannot go stale.
 	norm  float64
 	level int
 	// links[l] are the neighbours at layer l. No order is maintained: the
@@ -63,6 +68,47 @@ type graph struct {
 	free []uint32
 
 	live int
+
+	// linkEntries is the total length of every links and back list of every
+	// live node, and arenaFloats the capacity of every arena chunk in float32s.
+	// They are what [graph.residentBytes] reads, so that charging a write to the
+	// residency budget costs three loads rather than a walk of every node —
+	// finding 14 E7 measured that walk at 29% of a writes-only server's CPU.
+	//
+	// linkEntries changes only through [graph.setList], [graph.appendList] and
+	// [graph.dropFromList], and TestOnlyTheHelpersChangeAListsLength holds every
+	// other site in this file and persist.go to that.
+	linkEntries int64
+	arenaFloats int64
+
+	// chunks is the vector arena: every resident vector, chunkSlots of them to
+	// a chunk, each chunk one contiguous []float32 of chunkSlots*dim.
+	//
+	// A node used to own a []float32. That is one allocation and one pointer
+	// per node, and the pointer is dereferenced on every distance computation —
+	// a search at ef 64 over ten thousand nodes does thousands of them, each
+	// landing on a line that has nothing to do with the last. Here the vectors
+	// of nodes inserted near each other in time share cache lines, and the
+	// graph holds one allocation per four thousand records instead of one per
+	// record.
+	//
+	// Chunked rather than one slice, because a single arena would copy every
+	// vector it holds each time it grew: a quarter-million-record rebuild would
+	// spend its time memmoving a gigabyte. A chunk grows within itself, so a
+	// copy is bounded by one chunk and the rest of the arena never moves.
+	chunks [][]float32
+	// nextSlot is the next slot never yet handed out.
+	nextSlot uint32
+	// freeSlots holds the slots of removed nodes, for the same reason free
+	// holds their node numbers: a graph that churned a million records must not
+	// keep a million vectors resident for the thousand it still has.
+	freeSlots []uint32
+
+	// walks pools the per-walk working sets — see [scratch]. It lives on the
+	// graph rather than on the package so that a tenant evicted from residency
+	// takes its buffers with it, and so that the pool's size follows the number
+	// of walks actually running on this graph.
+	walks sync.Pool
 }
 
 func newGraph(p Params, m distance.Metric) *graph {
@@ -85,7 +131,8 @@ func (g *graph) bound(l int) int {
 // dist compares a query against a node, and treats a width mismatch as what it
 // is: a vector from another model reached the graph.
 func (g *graph) dist(q []float32, qn float64, n uint32) (float32, error) {
-	return g.between(q, qn, g.nodes[n].vec, g.nodes[n].norm)
+	nd := g.nodes[n]
+	return g.between(q, qn, g.vecAt(nd.slot), nd.norm)
 }
 
 // between is the distance from a to b under the index's metric, given both
@@ -156,8 +203,11 @@ func (g *graph) insert(rid id.ID, v []float32) ([]uint32, error) {
 	if g.entryLevel < top {
 		top = g.entryLevel
 	}
+	// One working set for every layer of this insert's walk.
+	s := g.takeScratch()
+	defer g.putScratch(s)
 	for l := top; l >= 0; l-- {
-		found, err := g.searchLayer(v, vn, []uint32{ep}, g.params.EfConstruction, l, n)
+		found, err := g.searchLayer(v, vn, []uint32{ep}, g.params.EfConstruction, l, n, s)
 		if err != nil {
 			return nil, err
 		}
@@ -165,7 +215,7 @@ func (g *graph) insert(rid id.ID, v []float32) ([]uint32, error) {
 		if err != nil {
 			return nil, err
 		}
-		g.nodes[n].links[l] = chosen
+		g.setList(&g.nodes[n].links[l], chosen)
 		for _, m := range chosen {
 			g.addBack(m, n, l)
 		}
@@ -201,7 +251,7 @@ func (g *graph) insert(rid id.ID, v []float32) ([]uint32, error) {
 // counted upwards would leave the key space sparse after a churn of deletes,
 // and a rebuild would be the only way to get it back.
 func (g *graph) alloc(rid id.ID, v []float32) uint32 {
-	n := &node{id: rid, vec: v, norm: distance.Norm(v), level: levelOf(rid, g.params.M)}
+	n := &node{id: rid, slot: g.allocSlot(v), norm: distance.Norm(v), level: levelOf(rid, g.params.M)}
 	n.links = make([][]uint32, n.level+1)
 	n.back = make([][]uint32, n.level+1)
 
@@ -232,7 +282,7 @@ func (g *graph) link(m, n uint32, l int) (bool, error) {
 			return false, nil
 		}
 	}
-	mn.links[l] = append(mn.links[l], n)
+	g.appendList(&mn.links[l], n)
 	g.addBack(n, m, l)
 
 	// A list may overflow its bound by half before it is pruned back to the
@@ -250,16 +300,17 @@ func (g *graph) link(m, n uint32, l int) (bool, error) {
 		return true, nil
 	}
 
+	mv := g.vecAt(mn.slot)
 	cands := make([]candidate, 0, len(mn.links[l]))
 	for _, e := range mn.links[l] {
-		d, err := g.dist(mn.vec, mn.norm, e)
+		d, err := g.dist(mv, mn.norm, e)
 		if err != nil {
 			return false, err
 		}
 		cands = append(cands, candidate{node: e, dist: d})
 	}
 	sortCandidates(cands)
-	pruned, err := g.selectNeighbours(mn.vec, cands, bound)
+	pruned, err := g.selectNeighbours(mv, cands, bound)
 	if err != nil {
 		return false, err
 	}
@@ -285,7 +336,7 @@ func (g *graph) link(m, n uint32, l int) (bool, error) {
 		}
 		g.dropBack(e, m, l)
 	}
-	mn.links[l] = pruned
+	g.setList(&mn.links[l], pruned)
 	return true, nil
 }
 
@@ -296,7 +347,7 @@ func (g *graph) addBack(to, from uint32, l int) {
 		return
 	}
 	if !contains(n.back[l], from) {
-		n.back[l] = append(n.back[l], from)
+		g.appendList(&n.back[l], from)
 	}
 }
 
@@ -306,7 +357,25 @@ func (g *graph) dropBack(to, from uint32, l int) {
 	if n == nil || l >= len(n.back) {
 		return
 	}
-	n.back[l] = without(n.back[l], from)
+	g.dropFromList(&n.back[l], from)
+}
+
+// setList replaces a node's links or back list, adjusting the running count by
+// the change in its length.
+func (g *graph) setList(list *[]uint32, to []uint32) {
+	g.linkEntries += int64(len(to) - len(*list))
+	*list = to
+}
+
+// appendList adds one entry to a node's links or back list.
+func (g *graph) appendList(list *[]uint32, e uint32) {
+	*list = append(*list, e)
+	g.linkEntries++
+}
+
+// dropFromList removes every occurrence of v from a node's links or back list.
+func (g *graph) dropFromList(list *[]uint32, v uint32) {
+	g.setList(list, without(*list, v))
 }
 
 func contains(s []uint32, v uint32) bool {
@@ -354,7 +423,7 @@ func (g *graph) remove(n uint32) []uint32 {
 			if mn == nil || l >= len(mn.links) {
 				continue
 			}
-			mn.links[l] = without(mn.links[l], n)
+			g.dropFromList(&mn.links[l], n)
 			dirty[m] = true
 			for _, repl := range victim.links[l] {
 				if repl == m || g.nodes[repl] == nil {
@@ -378,9 +447,19 @@ func (g *graph) remove(n uint32) []uint32 {
 		}
 	}
 
+	// The victim's own lists leave the count with it. They are subtracted as
+	// they stand now, after the relinking above, so whatever that did to them
+	// is already accounted for.
+	for l := range victim.links {
+		g.linkEntries -= int64(len(victim.links[l]))
+	}
+	for l := range victim.back {
+		g.linkEntries -= int64(len(victim.back[l]))
+	}
 	delete(g.byID, victim.id)
 	g.nodes[n] = nil
 	g.free = append(g.free, n)
+	g.freeSlot(victim.slot)
 	g.live--
 
 	if g.entry == n {
@@ -435,7 +514,7 @@ func (g *graph) selectNeighbours(base []float32, candidates []candidate, bound i
 		keep := true
 		for _, s := range chosen {
 			cn, sn := g.nodes[c.node], g.nodes[s]
-			d, err := g.between(cn.vec, cn.norm, sn.vec, sn.norm)
+			d, err := g.between(g.vecAt(cn.slot), cn.norm, g.vecAt(sn.slot), sn.norm)
 			if err != nil {
 				return nil, err
 			}
@@ -460,8 +539,23 @@ func (g *graph) selectNeighbours(base []float32, candidates []candidate, bound i
 // residency cache enforces. It is an estimate and says so: Go gives no exact
 // answer, and a budget enforced against a number nobody can compute would be a
 // setting that does nothing.
+//
+// It is O(1) in the number of nodes: it reads the running counts the mutation
+// sites keep, and equals [graph.recountResidentBytes] exactly.
 func (g *graph) residentBytes() int64 {
-	const perNodeOverhead = 96 // struct, slice headers, map entry
+	return int64(g.live)*perNodeOverhead + (g.arenaFloats+g.linkEntries)*4
+}
+
+// perNodeOverhead is the node struct, the two link slice headers, the pointer
+// in g.nodes and the byID entry. It was 96 while a node also carried a vector's
+// slice header and its own allocation; the vectors are now counted once, as the
+// arena they actually sit in.
+const perNodeOverhead = 72
+
+// recountResidentBytes computes [graph.residentBytes] by walking every node.
+// It is O(N) and production code never calls it: it is the oracle the running
+// counts are tested against.
+func (g *graph) recountResidentBytes() int64 {
 	var links int64
 	for _, n := range g.nodes {
 		if n == nil {
@@ -474,5 +568,5 @@ func (g *graph) residentBytes() int64 {
 			links += int64(len(l)) * 4
 		}
 	}
-	return int64(g.live)*(perNodeOverhead+int64(g.dim)*4) + links
+	return int64(g.live)*perNodeOverhead + g.arenaBytes() + links
 }

@@ -310,6 +310,18 @@ func (im *importer) checkVectorPlan() error {
 	const op = "snapshot.Import"
 
 	foreign := im.header.GetSourceImpl() != "go"
+	if embedding.CallerSupplied(im.dst.Embedder) && (foreign || im.opts.Vectors == VectorsReEmbed) {
+		// Checked before the policy, because it answers every policy the same
+		// way: a destination whose vectors come from the caller has no model,
+		// so it cannot re-embed anything, and a foreign snapshot's vectors are
+		// all in another space.
+		return errs.E(errs.Invalid, op, fmt.Errorf(
+			"this destination is configured with embedding.provider = external (%s), so it can take a "+
+				"snapshot's vectors only verbatim and cannot re-embed; a snapshot written by %q, or an "+
+				"import asking to re-embed, has vectors it cannot use. Re-embed into a data directory "+
+				"that computes its own, or export again from a server using %s",
+			im.dst.Embedder.ModelID(), im.header.GetSourceImpl(), im.dst.Embedder.ModelID()))
+	}
 	switch im.opts.Vectors {
 	case VectorsVerbatim:
 		if foreign {

@@ -108,10 +108,62 @@ its value count is corruption rather than merely shorter.
 
 ### There is no fallback embedder
 
-A build without the ONNX tag fails to start. The alternative is a server that
-starts, produces meaningless vectors, and stamps the real model's name on every
-one of them; a durable corpus filled that way cannot be told from a good one
-afterwards.
+A server whose `embedding.provider` is `onnx`, the default, and which was built
+without the ONNX tag fails to start. The alternative is a server that starts,
+produces meaningless vectors, and stamps the real model's name on every one of
+them; a durable corpus filled that way cannot be told from a good one afterwards.
+
+### Bring your own embeddings: `embedding.provider = "external"`
+
+A deployment that already embeds its text — with a hosted model, a larger one,
+or one tuned to its domain — can give Remem the vectors instead of the text to
+embed. `embedding.provider = "external"` declares that every vector comes from
+the caller, `embedding.external_model_id` names the model they come from, and
+`vector.dimension` is that model's width, up to 4096. Such a server loads no
+model and needs no ONNX build.
+
+What changes is only where the vector comes from. A create, a batch create and
+an update that changes content carry `embedding`; a semantic or hybrid search
+and a recall carry `query_vector`. Everything after that is the path every
+memory takes: the same transaction writes the record, its canonical vector, its
+attribute row and its postings; the approximate index is maintained the same
+way; discovery runs over the stored vectors. The mode is server-wide rather than
+per request because one corpus holds vectors from one model.
+
+What is authoritative, and what protects it:
+
+- **The caller's vector is canonical, exactly as supplied.** It is checked —
+  the declared width, finite components, and under `cosine` a non-zero norm,
+  since a zero vector has no direction — and never rescaled. The cosine metric
+  normalises as it compares, so a vector need not be unit length to rank
+  correctly. Under `l2` or `dot` its magnitude is part of what the caller meant,
+  and the `score` recovered from an `l2` distance assumes unit vectors and is
+  not calibrated for vectors that are not.
+- **The declared model id is stamped on every vector**, which is what makes the
+  identity rule above hold in this mode too. It may not be `all-MiniLM-L6-v2`:
+  vectors this server did not compute would otherwise claim to be comparable
+  with ones it did. A data directory written under one model and served under
+  another — ONNX to external, or one external model to the next — is refused on
+  its first semantic search, naming both, by the exact index as by the
+  approximate one. The exact index gained that check with this mode: while the
+  model was a fixed constant it could never meet a corpus from another one.
+- **The server never computes a vector in this mode.** Its embedder is a
+  declaration that refuses to embed, so a path that reached it by mistake fails
+  by name rather than inventing one.
+- **A snapshot moves between two external servers only verbatim.** An import
+  into an external data directory takes a Go snapshot's vectors as they stand
+  when their model and width are the directory's own, and refuses anything
+  else — a foreign snapshot, a request to re-embed, another model's vectors —
+  before a database is created. The header does not name a model, so
+  `remem-admin import` reads the file once to find out. `verify` holds a
+  caller's vector to the norm it had in the file rather than to one.
+
+An update that rewrites content to the identical string is not a change in
+either mode, so the vector sent with it is not applied: the vector describes the
+content, and to change one, change the other.
+
+MCP cannot serve the parts of this mode that need a vector, because a model has
+no vector to send; see `delivery.md`.
 
 ## Scoring: two numbers, deliberately
 

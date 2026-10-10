@@ -294,6 +294,31 @@ a feature to port. It is refused *by name* rather than ignored, which costs
 nothing because `decodeArgs` already disallows unknown fields — a model that
 guessed at it learns that it guessed.
 
+### On a server that takes its vectors from the caller
+
+With `embedding.provider = "external"` (`retrieval.md`) every vector comes from
+the caller, and no MCP tool has a vector argument: a model has text, not
+coordinates in someone else's embedding space. So `store_memory`,
+`store_memories`, an `update_memory` that changes content, and a `search_memories`
+or `recall` that is semantic or hybrid are refused before they run, as tool
+errors that say this server takes its vectors from the caller and the tool has no
+way to send one. Keyword search, listing, fetching, related memories, history and
+updates that leave content alone keep working.
+
+The refusal is answered here rather than relayed from the memory service, whose
+own message asks for `embedding` or `query_vector`. Relayed to a model, that
+reads as a missing argument, and a model told to supply an argument it cannot
+find will guess at one. Told that the tool cannot do this on this server, it can
+fall back to keyword search or tell its user.
+
+Over HTTP the two fields are `embedding` on `POST /api/v1/memories`, on each item
+of `POST /api/v1/memories:batch` and on a `PATCH` that changes `content`, and
+`query_vector` on `POST /api/v1/memories/search` and `/recall`. A semantic search
+may carry `query_vector` alone; a hybrid one needs the query text too, for its
+keyword half. Each is refused by name, with a 422, on a server of the other kind
+— a vector sent to a server that computes its own would be silently ignored or
+silently mixed, and neither is an answer.
+
 ### Five things Rust's MCP surface has, deliberately absent
 
 Recorded with reasons rather than left as silent absences, because an absent

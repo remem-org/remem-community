@@ -106,6 +106,11 @@ type CreateMemoryRequest struct {
 	// TTLSeconds is how long the memory lives. Absent means it never expires,
 	// which is what every built-in policy defaults to.
 	TTLSeconds *uint64 `json:"ttl_seconds,omitempty"`
+
+	// Embedding is the caller's vector for content, for a server configured
+	// with embedding.provider = "external". Such a server requires it; a
+	// server that computes its own embeddings refuses it by name.
+	Embedding []float32 `json:"embedding,omitempty"`
 }
 
 func (c CreateMemoryRequest) toReq() memory.CreateReq {
@@ -117,6 +122,7 @@ func (c CreateMemoryRequest) toReq() memory.CreateReq {
 		Importance: c.Importance,
 		Valence:    c.Valence,
 		Arousal:    c.Arousal,
+		Embedding:  c.Embedding,
 	}
 	if c.TTLSeconds != nil {
 		req.TTL = time.Duration(*c.TTLSeconds) * time.Second
@@ -148,12 +154,18 @@ type UpdateMemoryRequest struct {
 	Arousal    *float32 `json:"arousal,omitempty"`
 
 	TTLSeconds *uint64 `json:"ttl_seconds,omitempty"`
+
+	// Embedding is the vector for the new content, on a server whose vectors
+	// come from the caller. It travels with content: required beside it there,
+	// refused without it, and refused by a server that computes its own.
+	Embedding []float32 `json:"embedding,omitempty"`
 }
 
 func (u UpdateMemoryRequest) toReq(rid id.ID) memory.UpdateReq {
 	req := memory.UpdateReq{
 		ID: rid, Content: u.Content, Tags: u.Tags, Source: u.Source,
 		Policy: u.Policy, Importance: u.Importance, Valence: u.Valence, Arousal: u.Arousal,
+		Embedding: u.Embedding,
 	}
 	if u.TTLSeconds != nil {
 		ttl := time.Duration(*u.TTLSeconds) * time.Second

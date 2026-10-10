@@ -31,6 +31,8 @@ const coverageKey = "coverage-operator-key-00000000"
 var notRecordedByAnOrdinaryWorkload = map[string]string{
 	"remem_migration_failures_total": "it needs a migration step to fail, which is a broken store rather " +
 		"than a workload; schema's runner tests drive the failure path",
+	"remem_vector_index_failures_total": "it needs the index to refuse an operation, which is a broken " +
+		"store rather than a workload; indexqueue's own tests drive the failure path",
 }
 
 // TestEveryDeclaredMetricIsRecorded is the metric equivalent of
@@ -53,6 +55,14 @@ func TestEveryDeclaredMetricIsRecorded(t *testing.T) {
 	// Every search over three or more matches reaches this bound and reports
 	// truncated, which is how remem_search_truncated_total gets a sample.
 	cfg.Search.MaxPageDepth = 2
+	// The approximate index rather than the default exact one, because it is
+	// the one with a derived structure to maintain and therefore the only one
+	// whose maintenance goes through the index queue. Allowlisting the three
+	// queue families instead would have excused them from the rule this test
+	// exists to enforce. The queue is off by default, so it is turned on here
+	// for the same reason.
+	cfg.Vector.Index = "hnsw"
+	cfg.Vector.AsyncIndexing = true
 	cfg.Lifecycle.SweepInterval = 500 * time.Millisecond
 	cfg.Jobs.PollInterval = 50 * time.Millisecond
 

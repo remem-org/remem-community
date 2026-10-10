@@ -103,6 +103,26 @@ type Maintainer interface {
 	Removed(ctx context.Context, t tenant.ID, rid id.ID) error
 }
 
+// Settler is an index that applies writes off the request path and can be asked
+// to catch up. Settle returns once every write for the tenant that was accepted
+// before the call has been applied.
+//
+// A synchronous index does not implement it, and the absence is the whole
+// answer: an index that has applied a write by the time [Maintainer.Indexed]
+// returns is never behind, so a caller that finds no Settler is already as
+// current as it can be and waits for nothing.
+//
+// It exists for a reader that cannot live with "eventually". Most readers cannot
+// be hurt by the window — a user whose search misses a memory written a
+// millisecond ago searches again — but internal/discovery is handed each memory
+// exactly once, and a search over an index that has not yet applied the
+// relevant inserts finds no candidates, writes no edges and reports success. The
+// relationship is then never found, and nothing anywhere records that it was
+// owed.
+type Settler interface {
+	Settle(ctx context.Context, t tenant.ID) error
+}
+
 // RebuildOptions is what a caller may tell [Index.Rebuild] beyond its source.
 type RebuildOptions struct {
 	// Cursor is the progress a previous, interrupted rebuild of this tenant
@@ -212,4 +232,24 @@ type Index interface {
 	// It must be cheap enough to call on every search: Stats is not, because
 	// counting an exact index's vectors means scanning them.
 	Health(ctx context.Context, t tenant.ID) (Health, error)
+}
+
+// Granular is implemented by an index whose search effort comes in steps rather
+// than one candidate at a time.
+//
+// HNSW is such an index: a walk runs at ef = max(ef_search, k), so a query that
+// asks for fewer candidates than ef_search pays for exactly the same traversal
+// and is handed less of what that traversal found. A caller widening a budget
+// under a filter therefore rounds the budget up to the granularity: those extra
+// candidates are already computed and discarding them is what makes a selective
+// filter restart the walk instead of filling its page from the first one.
+//
+// It is optional because `flat` has no steps — it scans every vector, so every k
+// costs the same and the smallest honest answer is 1, which is what a caller
+// assumes of an index that does not implement this.
+type Granular interface {
+	// SearchGranularity is the smallest number of candidates a search costs no
+	// less than. It is a property of the index's configuration rather than of a
+	// tenant or a query, so it takes no arguments and may be read once.
+	SearchGranularity() int
 }

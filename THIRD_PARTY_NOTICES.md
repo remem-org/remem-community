@@ -22,7 +22,7 @@ copyleft: every licence below is BSD, MIT, ISC or Apache-2.0.
 
 ## 1. Go modules compiled into the Remem binaries
 
-33 modules are linked in.
+34 modules are linked in.
 
 | Module | Version | Licence | Files |
 |---|---|---|---|
@@ -51,6 +51,7 @@ copyleft: every licence below is BSD, MIT, ISC or Apache-2.0.
 | `github.com/prometheus/client_golang` | v1.23.0 | Apache-2.0, Notice (Apache-2.0 §4(d)), BSD-3-Clause | `LICENSE`, `NOTICE`, `internal/github.com/golang/gddo/LICENSE` |
 | `github.com/prometheus/client_model` | v0.6.2 | Apache-2.0, Notice (Apache-2.0 §4(d)) | `LICENSE`, `NOTICE` |
 | `github.com/prometheus/common` | v0.65.0 | Apache-2.0, Notice (Apache-2.0 §4(d)) | `LICENSE`, `NOTICE` |
+| `github.com/prometheus/procfs` | v0.16.1 | Apache-2.0, Notice (Apache-2.0 §4(d)) | `LICENSE`, `NOTICE` |
 | `github.com/RaduBerinde/axisds` | v0.1.0 | Apache-2.0 | `LICENSE` |
 | `github.com/RaduBerinde/btreemap` | v0.0.0-20250419174037-3d62b7205d54 | Apache-2.0 | `LICENSE` |
 | `github.com/rogpeppe/go-internal` | v1.10.0 | BSD-3-Clause | `LICENSE` |
@@ -277,6 +278,7 @@ Applies to:
 - `github.com/prometheus/client_golang` v1.23.0 — `LICENSE`
 - `github.com/prometheus/client_model` v0.6.2 — `LICENSE`
 - `github.com/prometheus/common` v0.65.0 — `LICENSE`
+- `github.com/prometheus/procfs` v0.16.1 — `LICENSE`
 - `github.com/RaduBerinde/axisds` v0.1.0 — `LICENSE`
 - `github.com/RaduBerinde/btreemap` v0.0.0-20250419174037-3d62b7205d54 — `LICENSE`
 
@@ -1947,7 +1949,23 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-### 3.26 BSD-3-Clause
+### 3.26 Notice (Apache-2.0 §4(d))
+
+Applies to:
+
+- `github.com/prometheus/procfs` v0.16.1 — `NOTICE`
+
+```text
+procfs provides functions to retrieve system, kernel and process
+metrics from the pseudo-filesystem proc.
+
+Copyright 2014-2015 The Prometheus Authors
+
+This product includes software developed at
+SoundCloud Ltd. (http://soundcloud.com/).
+```
+
+### 3.27 BSD-3-Clause
 
 Applies to:
 
@@ -1984,7 +2002,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 3.27 MIT
+### 3.28 MIT
 
 Applies to:
 
@@ -2012,7 +2030,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 3.28 Patent grant
+### 3.29 Patent grant
 
 Applies to:
 
@@ -2046,7 +2064,7 @@ rights granted to you under this License for this implementation of Go
 shall terminate as of the date such litigation is filed.
 ```
 
-### 3.29 BSD-3-Clause
+### 3.30 BSD-3-Clause
 
 Applies to:
 

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/record"
@@ -165,6 +166,17 @@ func (im *importer) settleVectors(ctx context.Context, page []*pendingRecord) er
 		case !all && !p.hasVector:
 			im.report.Stats.MissingVectors++
 			continue
+		}
+		if p.hasVector && embedding.CallerSupplied(im.dst.Embedder) {
+			// Usable only verbatim, and this one is another model's. There is
+			// nothing to recompute it with, and keeping it would put two spaces
+			// in one ranking.
+			return errs.E(errs.Invalid, op, fmt.Errorf(
+				"record %s carries a vector from %q (%d dimensions), and this destination takes vectors "+
+					"from %q (%d dimensions) as supplied and cannot re-embed; import it into a data "+
+					"directory configured for %q",
+				p.rec.ID, p.vector.ModelID, p.vector.Dim,
+				im.dst.Embedder.ModelID(), im.dst.Embedder.Dim(), p.vector.ModelID))
 		}
 		if !p.hasVector {
 			im.report.Stats.MissingVectors++

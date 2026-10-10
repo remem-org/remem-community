@@ -92,8 +92,10 @@ func New(cfg config.Config, opt ...Option) (*Server, error) {
 	// public listener.
 	ownListener := cfg.Metrics.Enabled && cfg.Metrics.Addr != ""
 	rd := remhttp.Deps{
-		Memories:    d.memories,
-		Tenants:     d.tenants,
+		Memories: d.memories,
+		// The cached directory, because the request path checks that its tenant
+		// exists on every call. See deps.requestTenants.
+		Tenants:     d.requestTenants,
 		Resolver:    tenant.Resolver{Capability: capability, Default: tenant.ID(cfg.Tenant.Default)},
 		Capability:  capability,
 		Auth:        d.keyring,

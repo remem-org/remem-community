@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/remem-org/remem-go/internal/tenant"
@@ -29,11 +30,38 @@ type resident struct {
 	degraded   string
 	rebuilding bool
 
-	// bytes is what this graph was last measured at, and pin counts the
-	// operations currently using it. Both are guarded by Index.mu, not by mu:
-	// eviction reads them while the graph itself is busy.
+	// measured numbers each measurement of g, and is guarded by mu: a
+	// measurement is taken while the write that changed the graph still holds
+	// it. See [resident.measure].
+	measured uint64
+
+	// bytes is what this graph was last charged at, charged is the measurement
+	// that charge came from, and pin counts the operations currently using it.
+	// All three are guarded by Index.mu, not by mu: eviction reads them while
+	// the graph itself is busy.
+	bytes   int64
+	charged uint64
+	pin     int
+}
+
+// size is one measurement of a resident graph: what it costs, and where that
+// measurement falls in the order of the graph's writes.
+type size struct {
 	bytes int64
-	pin   int
+	seq   uint64
+}
+
+// measure takes the graph's size. The caller holds mu for writing — the lock
+// the write that changed the graph already holds — so measuring costs no lock
+// of its own and nothing waits behind it. It is O(1): the graph keeps its size
+// as running counts.
+func (r *resident) measure() size {
+	r.measured++
+	var b int64
+	if r.g != nil {
+		b = r.g.residentBytes()
+	}
+	return size{bytes: b, seq: r.measured}
 }
 
 // acquire returns the tenant's resident graph, materialising it if it is not
@@ -72,21 +100,21 @@ func (x *Index) acquire(ctx context.Context, t tenant.ID) (*resident, error) {
 		x.release(r)
 		return nil, err
 	}
+	reason := degradedReason(res)
 	r.g = g
 	r.loaded = true
-	if res.Corrupt > 0 {
-		r.degraded = degradedReason
-	}
+	r.degraded = reason
+	sz := r.measure()
 	r.mu.Unlock()
+	x.charge(r, sz)
 
-	x.mu.Lock()
-	x.bytes -= r.bytes
-	r.bytes = g.residentBytes()
-	x.bytes += r.bytes
-	x.mu.Unlock()
-
+	// Only the repairable damage asks for a repair. A vector the arena cannot
+	// hold leaves the tenant degraded and nothing else: a rebuild would rewrite
+	// the same row at the same width and find it unplaceable again, so asking
+	// for one here would queue a job on every materialisation for ever, at
+	// whatever rate the server throttles rebuilds to, and never resolve.
 	if res.Corrupt > 0 && x.rebuilds != nil {
-		x.rebuilds.ScheduleRebuild(t, degradedReason)
+		x.rebuilds.ScheduleRebuild(t, reason)
 	}
 	x.evict()
 	return r, nil
@@ -100,20 +128,27 @@ func (x *Index) release(r *resident) {
 	x.mu.Unlock()
 }
 
-// resize re-measures a graph after it changed, so the budget tracks reality
+// charge moves the budget to a graph's measured size, so it tracks reality
 // rather than whatever the tenant cost when it was first loaded.
-func (x *Index) resize(r *resident) {
-	r.mu.RLock()
-	var size int64
-	if r.g != nil {
-		size = r.g.residentBytes()
-	}
-	r.mu.RUnlock()
-
+//
+// It takes only the index-wide lock. The measurement was taken under the
+// graph's write lock by the write that changed it; re-taking the graph's lock
+// here to measure afterwards was the read lock finding 14 E7 profiled writers
+// waiting behind.
+//
+// Two writes to one tenant measure in the order they held the graph, and may
+// charge in either order. A measurement older than the one already charged is
+// therefore dropped: applying it would set the budget back to a graph that no
+// longer exists.
+func (x *Index) charge(r *resident, sz size) {
 	x.mu.Lock()
-	x.bytes += size - r.bytes
-	r.bytes = size
-	x.mu.Unlock()
+	defer x.mu.Unlock()
+	if sz.seq <= r.charged {
+		return
+	}
+	x.bytes += sz.bytes - r.bytes
+	r.bytes = sz.bytes
+	r.charged = sz.seq
 }
 
 // touch marks a tenant as most recently used.
@@ -190,13 +225,49 @@ func (x *Index) Resident() (tenants int, bytes int64) {
 	return len(x.tenants), x.bytes
 }
 
-// degradedReason is the sentence an operator sees when a materialisation found
+// degradedReason is what [vector.Health] reports for a tenant one
+// materialisation found something wrong with, and it is empty — the tenant is
+// not degraded — when it found nothing.
+//
+// It distinguishes the two kinds of damage because the operator's next move
+// differs. Unreadable node records have already been repaired and a rebuild
+// finishes the job; a vector the arena cannot hold has not been and cannot be,
+// and the sentence has to say so, or an operator reads "rebuild" and runs one
+// that changes nothing. Both at once is a real state and reads as both.
+func degradedReason(res loadResult) string {
+	switch {
+	case res.Corrupt > 0 && res.Unplaceable > 0:
+		return repairedReason + "; and separately, " + unplaceableReason(res.Unplaceable, res.Width)
+	case res.Corrupt > 0:
+		return repairedReason
+	case res.Unplaceable > 0:
+		return unplaceableReason(res.Unplaceable, res.Width)
+	}
+	return ""
+}
+
+// repairedReason is the sentence an operator sees when a materialisation found
 // node records it could not read. It says what was done as well as what is
 // wrong, because "index corrupt" alone reads as data loss and none has
 // occurred: the canonical vectors are intact and the graph was repaired from
 // them.
-const degradedReason = "the vector index had unreadable node records and was repaired from the canonical vectors; " +
+const repairedReason = "the vector index had unreadable node records and was repaired from the canonical vectors; " +
 	"its structure is not the one the configured parameters describe until it is rebuilt"
+
+// unplaceableReason is the sentence for canonical vectors the arena cannot
+// hold. It names the count and the tenant's width because those are what an
+// operator needs to find the rows, and it says plainly that a rebuild is not
+// the remedy: the vectors themselves are the wrong shape, so only re-embedding
+// the records they belong to brings them back into the index.
+func unplaceableReason(n, width int) string {
+	if width == 0 {
+		return fmt.Sprintf("all %d of this tenant's canonical vectors are empty, so there is nothing to index; "+
+			"a rebuild cannot fix this and the records must be re-embedded", n)
+	}
+	return fmt.Sprintf("%d of this tenant's canonical vectors are empty or of another width than the tenant's %d "+
+		"and cannot be searched until they are re-embedded; a rebuild cannot fix this, "+
+		"because the vector arena holds one width and these rows are not of it", n, width)
+}
 
 // Budget is the byte budget the resident set is held to. It is exposed so the
 // residency test asserts against the number actually in force rather than the

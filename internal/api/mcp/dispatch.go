@@ -12,6 +12,9 @@ import (
 
 // callTool runs one tool and renders its answer.
 func (h *Handler) callTool(ctx context.Context, name string, raw json.RawMessage) (any, error) {
+	if err := h.refuseEmbedding(name, raw); err != nil {
+		return nil, err
+	}
 	switch name {
 	case ToolStoreMemory:
 		var a storeMemoryArgs
@@ -326,4 +329,42 @@ func decodeArgs(raw json.RawMessage, dst any) error {
 			fmt.Errorf("the tool arguments could not be read: %w", err))
 	}
 	return nil
+}
+
+// refuseEmbedding answers, before anything runs, a tool call that would need a
+// vector on a server whose vectors come from the caller.
+//
+// The memory service would refuse it too, but by demanding `embedding` or
+// `query_vector` — fields no tool here has. A model told to supply an argument
+// it cannot find will guess at one; told that the tool cannot do this on this
+// server, it can use keyword search instead or say so to its user.
+func (h *Handler) refuseEmbedding(name string, raw json.RawMessage) error {
+	if !h.Memories.CallerSuppliedVectors() {
+		return nil
+	}
+	var needs bool
+	switch name {
+	case ToolStoreMemory, ToolStoreMemories:
+		needs = true
+	case ToolUpdateMemory:
+		var a struct {
+			Content *string `json:"content"`
+		}
+		needs = json.Unmarshal(raw, &a) == nil && a.Content != nil
+	case ToolSearchMemories, ToolRecall:
+		var a struct {
+			SearchType string `json:"search_type"`
+		}
+		if json.Unmarshal(raw, &a) == nil {
+			t := memory.SearchType(a.SearchType)
+			needs = t == memory.SearchSemantic || t == memory.SearchHybrid
+		}
+	}
+	if !needs {
+		return nil
+	}
+	return errs.E(errs.Invalid, "mcp."+name, fmt.Errorf(
+		"%s cannot run here: this server is configured with embedding.provider = external, so every vector comes from the caller, and this tool has no vector argument. "+
+			"Keyword search, listing, fetching and updates that leave content alone still work; storing or searching by meaning needs the HTTP API with a vector",
+		name))
 }

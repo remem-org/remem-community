@@ -66,6 +66,7 @@ type Index struct {
 var (
 	_ vector.Index      = (*Index)(nil)
 	_ vector.Maintainer = (*Index)(nil)
+	_ vector.Granular   = (*Index)(nil)
 )
 
 // New returns an index over kv.
@@ -133,23 +134,39 @@ func (x *Index) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32
 	defer x.release(r)
 
 	r.mu.Lock()
-	dirty, err := r.g.insert(rid, append([]float32(nil), v...))
+	// No defensive copy: allocSlot copies the vector into the graph's arena,
+	// so the caller's slice is never retained.
+	dirty, err := r.g.insert(rid, v)
 	if err != nil {
+		// A failed insert may still have changed the graph — a replacement
+		// removes the old node first — and the budget bounds memory, not
+		// success.
+		sz := r.measure()
 		r.mu.Unlock()
+		x.charge(r, sz)
 		return errs.E(errs.KindOf(err), op, err)
 	}
-	tx := txn.New(x.kv)
+	// Unsynced, unlike the record batch this follows. A node record is derived,
+	// and what a crash must not lose is the canonical vector, which the main
+	// batch already committed durably. Losing these neighbour lists costs the
+	// next materialisation an insert — it reconciles a canonical vector with no
+	// node record — and costs no memory. Paying a second fsync on the write
+	// path to avoid that work is the wrong trade.
+	tx := txn.New(x.kv, txn.Sync(false))
 	staged := x.stage(tx, t, r.g, dirty)
+	sz := r.measure()
 	r.mu.Unlock()
 	defer tx.Close()
 
+	// Charged whether or not the node records commit: the graph in memory
+	// changed either way, and memory is what the budget bounds.
+	x.charge(r, sz)
 	if staged == 0 {
 		return nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	x.resize(r)
 	x.evict()
 	return nil
 }
@@ -191,16 +208,15 @@ func (x *Index) Removed(ctx context.Context, t tenant.ID, rid id.ID) error {
 		return nil // the post-condition already holds
 	}
 	dirty := append(r.g.remove(num), num)
-	tx := txn.New(x.kv)
+	tx := txn.New(x.kv, txn.Sync(false))
 	x.stage(tx, t, r.g, dirty)
+	sz := r.measure()
 	r.mu.Unlock()
 	defer tx.Close()
 
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	x.resize(r)
-	return nil
+	// Charged before the commit, for the reason Indexed gives.
+	x.charge(r, sz)
+	return tx.Commit(ctx)
 }
 
 // Search returns up to k nearest vectors, nearest first.
@@ -237,12 +253,16 @@ func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, fil
 	if ef < k {
 		ef = k
 	}
+	// One result slice for the whole widening loop: a retry starts the page
+	// again from the first candidate, so it wants the same k slots emptied, not
+	// another k allocated.
+	hits := make([]vector.Hit, 0, k)
 	for {
 		found, err := r.g.nearest(q, ef)
 		if err != nil {
 			return nil, errs.E(errs.KindOf(err), op, err)
 		}
-		hits := make([]vector.Hit, 0, k)
+		hits = hits[:0]
 		for _, c := range found {
 			n := r.g.nodes[c.node]
 			if n == nil || !filter.Allows(n.id) {
@@ -261,6 +281,13 @@ func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, fil
 		ef *= 2
 	}
 }
+
+// SearchGranularity is ef_search: the walk runs at max(ef_search, k), so a
+// search for fewer candidates than this costs the same and returns less.
+//
+// It is what [vector.Granular] documents, and the number a filtered query's
+// widening budget rounds up to.
+func (x *Index) SearchGranularity() int { return x.params.EfSearch }
 
 // Stats describes the tenant's index.
 func (x *Index) Stats(ctx context.Context, t tenant.ID) (vector.Stats, error) {

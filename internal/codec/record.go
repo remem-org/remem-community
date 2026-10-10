@@ -9,6 +9,26 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// RecordBody validates a stored value's envelope and returns the encoded body
+// inside it, without decoding that body.
+//
+// It exists for a reader that walks the wire format itself instead of going
+// through the generated message — see record.decodeBodyProjected. Such a
+// reader still has to be stopped by a value from the wrong key space or from a
+// newer binary, and the envelope is the only thing that can stop it; this
+// returns the body only once [checkHeader] has passed, so there is one place
+// that decides what a record value looks like rather than two.
+//
+// The returned slice aliases b. It is a view into the caller's buffer, not a
+// copy, which is the whole point: the alternative is the copy this avoids.
+func RecordBody(b []byte) ([]byte, error) {
+	const op = "codec.RecordBody"
+	if err := checkHeader(b, op); err != nil {
+		return nil, err
+	}
+	return b[HeaderLen:], nil
+}
+
 // MarshalRecord frames a record body for storage.
 //
 // The header and the body are written into one slice sized for both, so a

@@ -219,7 +219,11 @@ func (d *deps) rebuildGraph(ctx context.Context, j *jobs.Job, cp jobs.Checkpoint
 // tenant with no rows: an entry is replaced in the transaction that writes its
 // successor.
 func (d *deps) rebuildAttrs(ctx context.Context, j *jobs.Job, cp jobs.Checkpointer) error {
-	written, err := attr.RebuildRows(ctx, d.kv, j.Tenant, j.Namespace)
+	// Through the same row cache the write path and the readers share: a rebuild
+	// writes rows, so a rebuild that did not invalidate would leave every reader
+	// holding exactly the rows it was run to replace.
+	written, err := attr.RebuildRows(ctx, d.kv, j.Tenant, j.Namespace,
+		attr.WithRowCache(d.rowCache))
 	cp.Changed(uint64(written))
 	return err
 }

@@ -137,18 +137,43 @@ func (r *Registry) Get(ctx context.Context, sid id.ID) (Session, error) {
 
 // Touch records that a session was used, extending its life.
 func (r *Registry) Touch(ctx context.Context, sid id.ID) error {
-	const op = "session.Touch"
-
 	s, err := r.Get(ctx, sid)
 	if err != nil {
 		return err
+	}
+	return r.TouchSession(ctx, s)
+}
+
+// TouchSession records that an already-fetched session was used, extending its
+// life.
+//
+// It is [Touch] without the read, and it exists because the read is already
+// paid for on the path that matters: every MCP request fetches its session to
+// authenticate, so a Touch that fetches it again doubles the reads on every
+// call an agent makes. Touch is this method after a Get, so there is one write
+// path rather than two that can drift.
+//
+// The session value is not a capability. The tenant in ctx decides what may be
+// written, and an expired session stays expired, so that a caller holding a
+// stale value cannot write across a tenant boundary or revive what the sweep
+// is about to reclaim. Both refusals read as absent, which is what Get already
+// says about either.
+func (r *Registry) TouchSession(ctx context.Context, s Session) error {
+	const op = "session.TouchSession"
+
+	t, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
+	if s.Tenant != t || r.expired(s) {
+		return errs.E(errs.NotFound, op, fmt.Errorf("no session %s", s.ID))
 	}
 	s.LastSeenAt = r.clk.Now().UTC()
 	value, err := marshal(s, op)
 	if err != nil {
 		return err
 	}
-	return r.kv.Set(ctx, Key(s.Tenant, sid), value)
+	return r.kv.Set(ctx, Key(s.Tenant, s.ID), value)
 }
 
 // Delete ends a session. Deleting an absent one is not an error.

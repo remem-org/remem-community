@@ -3,11 +3,21 @@ package distance_test
 import (
 	"math/rand"
 	"testing"
+
+	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
 // Candidate dot-product loops at the production width, to choose between them
 // by measurement. An HNSW insert spends over 90% of its time in the dot
 // product (Phase 13 profile), so its loop is the write path's biggest lever.
+//
+// The loops below are the candidates, and they stay as they were written: they
+// are the control, measured in the same run as whatever kernel the package
+// currently selects. BenchmarkDot384Kernel in dot_internal_test.go measures
+// that kernel, and BenchmarkCosineWithNorms384 below measures the whole call
+// the index makes, which is the dot plus a divide and a subtract in double
+// precision — the number to compare against an insert's cost, not the dot
+// alone.
 
 var dotA, dotB = func() ([]float32, []float32) {
 	rng := rand.New(rand.NewSource(3))
@@ -75,6 +85,15 @@ func BenchmarkDot384Float64Unrolled(b *testing.B) {
 func BenchmarkDot384Float32Unrolled(b *testing.B) {
 	for range b.N {
 		sinkF32 = dotF32Unrolled(dotA, dotB)
+	}
+}
+
+// BenchmarkCosineWithNorms384 is the call the index actually makes, thousands of
+// times per insert and per search walk, with both norms already known.
+func BenchmarkCosineWithNorms384(b *testing.B) {
+	na, nb := distance.Norm(dotA), distance.Norm(dotB)
+	for range b.N {
+		sinkF32 = distance.CosineWithNorms(dotA, dotB, na, nb)
 	}
 }
 

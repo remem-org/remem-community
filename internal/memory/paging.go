@@ -6,8 +6,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
 	"github.com/remem-org/remem-go/internal/errs"
+	"github.com/remem-org/remem-go/internal/keys"
 	"github.com/remem-org/remem-go/internal/query"
 	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/tenant"
@@ -20,10 +22,21 @@ type pagingBinding struct {
 	tenant         tenant.ID
 	slot           uint16
 	desc, archived bool
-	// fingerprint identifies a ranked session's query. It is zero for a
-	// listing session, whose identity is the ordering above, so the two kinds
-	// can never collide on one binding.
-	fingerprint [32]byte
+	// ranked says which kind of session this binding names: a ranked one,
+	// holding a materialised ranking, or a listing, whose identity is the
+	// ordering above. The two kinds can never collide on one binding because
+	// this field is part of it, and it is what selects the ranked idle TTL
+	// rather than the listing's independent five-minute window.
+	ranked bool
+	// fingerprint identifies a ranked session's query. It is unset for a
+	// listing session.
+	//
+	// Sixty-four bits, not a digest: it is compared only with fingerprints
+	// drawn from the same process seed (see queryFingerprintSeed), and the cost
+	// of the collision it leaves on the table is that one caller resumes their
+	// own earlier ranking in their own tenant. At the hundred and twenty-eight
+	// sessions this registry holds, that is a one-in-a-quadrillion event.
+	fingerprint uint64
 }
 type pagingSession struct {
 	id       [16]byte
@@ -32,6 +45,13 @@ type pagingSession struct {
 	expires  time.Time
 	readers  int
 	retired  bool
+	// rowGen is the tenant's attribute-row generation as it stood *before* this
+	// session's snapshot was taken, and it is what lets every page of the session
+	// read rows from the shared cache. Taking it first is the whole of the
+	// ordering argument: a write landing between the two leaves the session
+	// holding a generation that has moved on, and its reads go to its own
+	// snapshot. See attr.RowCache.
+	rowGen uint64
 	// lastUse orders sessions for reclaiming: the registry's use counter at the
 	// session's most recent open, continuation or release. A counter rather than
 	// a time, because two uses in one clock reading must still order.
@@ -57,17 +77,21 @@ type pagingRegistry struct {
 	kv        storage.KV
 	clk       clock.Clock
 	rankedTTL time.Duration
-	sessions  map[[16]byte]*pagingSession
-	closed    bool
-	active    int
-	pinned    int
-	useSeq    uint64
-	stop      chan struct{}
-	done      chan struct{}
+	// rows is the shared cache of decoded attribute rows, or nil. The registry
+	// holds it because opening a session is the one place that can read its
+	// generation before the snapshot, which is what makes it safe.
+	rows     *attr.RowCache
+	sessions map[[16]byte]*pagingSession
+	closed   bool
+	active   int
+	pinned   int
+	useSeq   uint64
+	stop     chan struct{}
+	done     chan struct{}
 }
 
-func newPagingRegistry(kv storage.KV, clk clock.Clock, rankedTTL time.Duration) *pagingRegistry {
-	p := &pagingRegistry{kv: kv, clk: clk, rankedTTL: rankedTTL, sessions: make(map[[16]byte]*pagingSession), stop: make(chan struct{}), done: make(chan struct{})}
+func newPagingRegistry(kv storage.KV, clk clock.Clock, rankedTTL time.Duration, rows *attr.RowCache) *pagingRegistry {
+	p := &pagingRegistry{kv: kv, clk: clk, rankedTTL: rankedTTL, rows: rows, sessions: make(map[[16]byte]*pagingSession), stop: make(chan struct{}), done: make(chan struct{})}
 	p.cond = sync.NewCond(&p.mu)
 	ticker := clk.NewTicker(time.Second)
 	go func() {
@@ -101,7 +125,7 @@ func (p *pagingRegistry) expireLocked() {
 	for _, s := range p.sessions {
 		// Ranked TTL bounds client inactivity, not ranking or hydration work.
 		// Listing retains its existing independent expiry semantics.
-		if s.binding.fingerprint != ([32]byte{}) && s.readers > 0 {
+		if s.binding.ranked && s.readers > 0 {
 			continue
 		}
 		if !p.clk.Now().Before(s.expires) {
@@ -138,13 +162,14 @@ func sessionOf(cursor *query.Cursor) *[16]byte {
 
 // acquireRanked resumes or opens a session holding a materialised ranking.
 //
-// Its query fingerprint identifies both the ranking and the ranked idle TTL;
-// listing sessions keep their independent five-minute window.
+// Its query fingerprint identifies the ranking and its binding takes the ranked
+// idle TTL; listing sessions keep their independent five-minute window.
 //
 // The caller names itself in op and noun. Search and related share this
 // registry, and when both refusals said "start the search again" a caller
 // paging related memories was sent to look at the wrong surface.
 func (p *pagingRegistry) acquireRanked(b pagingBinding, session *[16]byte, op, noun string) (*pagingSession, error) {
+	b.ranked = true
 	return p.acquireSession(b, session, op, noun)
 }
 
@@ -153,7 +178,7 @@ func (p *pagingRegistry) acquireSession(binding pagingBinding, session *[16]byte
 	defer p.mu.Unlock()
 	p.expireLocked()
 	ttl := pagingTTL
-	if binding.fingerprint != ([32]byte{}) {
+	if binding.ranked {
 		ttl = p.rankedTTL
 	}
 	bad := func(msg string) (*pagingSession, error) {
@@ -203,6 +228,11 @@ func (p *pagingRegistry) acquireSession(binding pagingBinding, session *[16]byte
 				break
 			}
 		}
+		// The generation strictly before the snapshot. A write that commits in
+		// between moves the generation on, so this session finds it stale and reads
+		// every row from its own snapshot — which is the conservative answer, and
+		// the reason the two lines are in this order rather than the other.
+		s.rowGen = p.rows.Generation(binding.tenant)
 		s.snapshot = p.kv.NewSnapshot()
 		p.sessions[s.id] = s
 		p.pinned++
@@ -211,6 +241,46 @@ func (p *pagingRegistry) acquireSession(binding pagingBinding, session *[16]byte
 	p.active++
 	return s, nil
 }
+
+// rowReader is what one page reads everything through, and the handle that
+// finishes with it.
+//
+// It is two things stacked. One iterator over the tenant's keys answers every
+// point read this request makes — every attribute row the walk settles and every
+// body the page returns — where a Get each builds and tears down an iterator of
+// its own; and in front of the rows, the shared cache, pinned to the generation
+// this session took before its snapshot. It is this request's alone: continuation
+// pages of one session read concurrently, and an iterator has one position.
+//
+// With no cache it returns the iterator itself, and the page is byte for byte the
+// request it was before this: `search.row_cache_entries = 0` costs nothing for the
+// seam being there, not one allocation and not one indirection.
+//
+// The handle is a value, so returning it allocates nothing. Defer its finish after
+// releasing the session, so the iterator closes before the snapshot it reads.
+func (s *Service) rowReader(session *pagingSession, t tenant.ID) (attr.Reader, pageReader) {
+	lower, upper := keys.TenantRange(t)
+	seek := storage.NewSeekReader(session.snapshot, lower, upper)
+	if s.rows == nil {
+		return seek, pageReader{seek: seek}
+	}
+	rows := attr.NewCachedReader(seek, s.rows, s.slots, t, session.rowGen)
+	return rows, pageReader{seek: seek, rows: rows}
+}
+
+// pageReader owns what one page's reader has to give back: the iterator, and the
+// tally the cached reader kept.
+type pageReader struct {
+	seek *storage.SeekReader
+	// rows is nil when the page read through the iterator alone.
+	rows *attr.CachedReader
+}
+
+func (p pageReader) finish() {
+	p.rows.Report()
+	_ = p.seek.Close()
+}
+
 func (p *pagingRegistry) release(s *pagingSession, finish bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -221,7 +291,7 @@ func (p *pagingRegistry) release(s *pagingSession, finish bool) {
 	p.active--
 	p.useSeq++
 	s.lastUse = p.useSeq
-	if !s.retired && s.readers == 0 && s.binding.fingerprint != ([32]byte{}) {
+	if !s.retired && s.readers == 0 && s.binding.ranked {
 		// The idle window starts after the last in-flight page finishes.
 		s.expires = p.clk.Now().Add(p.rankedTTL)
 	}

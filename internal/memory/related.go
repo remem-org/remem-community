@@ -494,7 +494,8 @@ func (s *Service) Related(ctx context.Context, req RelatedReq) (RelatedResult, e
 	}
 	finished := false
 	defer func() { s.paging.release(session, finished) }()
-	snap := session.snapshot
+	reader, page := s.rowReader(session, t)
+	defer page.finish()
 
 	if cursorSession == nil {
 		// Only the creator runs the walk; its token is not published until
@@ -502,7 +503,7 @@ func (s *Service) Related(ctx context.Context, req RelatedReq) (RelatedResult, e
 		finished = true
 		// Check the anchor in the same snapshot as the walk and bodies. An
 		// archived anchor is valid; a missing one is not an empty neighbourhood.
-		if _, err := s.repo.GetBodyFrom(ctx, snap, anchor); err != nil {
+		if _, err := s.repo.GetBodyFrom(ctx, reader, anchor); err != nil {
 			return RelatedResult{}, err
 		}
 		deep := *q
@@ -511,7 +512,7 @@ func (s *Service) Related(ctx context.Context, req RelatedReq) (RelatedResult, e
 		if err != nil {
 			return RelatedResult{}, err
 		}
-		res, err := s.executor.Run(ctx, snap, &deep, plan)
+		res, err := s.executor.Run(ctx, reader, &deep, plan)
 		if err != nil {
 			return RelatedResult{}, err
 		}
@@ -533,7 +534,7 @@ func (s *Service) Related(ctx context.Context, req RelatedReq) (RelatedResult, e
 	for end < len(session.ranked) && len(out.Results) < limit {
 		hit := session.ranked[end]
 		end++
-		rec, err := s.repo.GetBodyFrom(ctx, snap, hit.ID)
+		rec, err := s.repo.GetBodyFrom(ctx, reader, hit.ID)
 		if err != nil {
 			if errs.Is(err, errs.NotFound) {
 				// An edge pointing at a record that is gone. Traversal reads no

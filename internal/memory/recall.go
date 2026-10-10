@@ -58,6 +58,10 @@ type RecallReq struct {
 
 	// Tags narrow the candidates, as they do everywhere else.
 	Tags []string
+
+	// QueryVector is SearchReq.QueryVector for a recall: required for a server
+	// whose vectors come from the caller, refused by one that computes its own.
+	QueryVector []float32
 }
 
 // Recalled is what fits, and what did not.
@@ -104,7 +108,7 @@ func (s *Service) Recall(ctx context.Context, req RecallReq) (Recalled, error) {
 		return Recalled{}, errs.E(errs.Invalid, op, fmt.Errorf(
 			"a recall needs a token budget greater than zero; a recall without one is a search"))
 	}
-	if strings.TrimSpace(req.Context) == "" && len(req.Tags) == 0 {
+	if strings.TrimSpace(req.Context) == "" && len(req.Tags) == 0 && req.QueryVector == nil {
 		return Recalled{}, errs.E(errs.Invalid, op, fmt.Errorf(
 			"a recall needs a context or a tag to choose memories by"))
 	}
@@ -125,10 +129,11 @@ func (s *Service) Recall(ctx context.Context, req RecallReq) (Recalled, error) {
 	}
 
 	found, err := s.search(ctx, SearchReq{
-		Query: req.Context,
-		Type:  req.Type,
-		Tags:  req.Tags,
-		Limit: limit,
+		Query:       req.Context,
+		Type:        req.Type,
+		Tags:        req.Tags,
+		Limit:       limit,
+		QueryVector: req.QueryVector,
 	}, false)
 	if err != nil {
 		return Recalled{}, err

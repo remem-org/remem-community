@@ -16,13 +16,19 @@ const (
 	// enough that the padding wasted on short texts costs more than the batch
 	// saves.
 	DefaultBatchSize = 32
-	// DefaultFillWindow is how long a partly-filled batch waits for company.
-	// Five milliseconds is short enough to be invisible in a request that is
-	// already doing a model run, and long enough to collect the burst an agent
-	// fleet produces when several sessions write at once.
+	// DefaultFillWindow is how long a partly-filled batch waits for company,
+	// and how recently another item must have arrived for a batch to wait at
+	// all: a request that arrives alone, with nothing queued behind it and no
+	// neighbour this recent, is dispatched at once. Five milliseconds is short
+	// enough to be invisible in a request that is already doing a model run,
+	// and long enough to collect the burst an agent fleet produces when
+	// several sessions write at once.
 	DefaultFillWindow = 5 * time.Millisecond
-	// DefaultWorkers bounds concurrent model runs. ONNX Runtime parallelises
-	// inside one run, so more Go-level concurrency mostly buys contention.
+	// DefaultWorkers bounds how many batches wait on the model at once. The
+	// model runs one inference at a time, so this is a queue depth and not a
+	// degree of parallelism: the parallelism lives inside one run, in ONNX
+	// Runtime's own thread count, and more Go-level concurrency here mostly
+	// buys contention.
 	DefaultWorkers = 2
 	// DefaultCacheSize is how many vectors are remembered. Agents re-embed the
 	// same query text constantly — the same question asked twice is the normal
@@ -48,6 +54,11 @@ type Service struct {
 
 	reqs    chan *item
 	workers chan struct{}
+
+	// lastArrival is when the collector last took an item off reqs; its zero
+	// value is long enough ago to count as idle. It is touched only by the
+	// collector goroutine, so it needs no lock.
+	lastArrival time.Time
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -99,6 +110,9 @@ func NewService(inner Embedder, cfg ServiceConfig) *Service {
 func (s *Service) Dim() int        { return s.inner.Dim() }
 func (s *Service) ModelID() string { return s.inner.ModelID() }
 
+// callerSupplied forwards the mode question to the wrapped embedder.
+func (s *Service) callerSupplied() bool { return CallerSupplied(s.inner) }
+
 // CacheStats reports hits, misses and the number of vectors held.
 func (s *Service) CacheStats() (hits, misses uint64, size int) { return s.cache.stats() }
 
@@ -119,6 +133,11 @@ const ShutdownGrace = 5 * time.Second
 // reports the failure instead of hanging: a leaked goroutine in a process that
 // is exiting is a smaller problem than a process that will not exit.
 func (s *Service) Close() error {
+	// A server whose vectors come from the caller builds no service, and its
+	// shutdown and error paths close it like any other dependency.
+	if s == nil {
+		return nil
+	}
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.closed)
@@ -196,6 +215,10 @@ func (s *Service) Embed(ctx context.Context, texts []string) ([][]float32, error
 type item struct {
 	text string
 	done chan itemResult
+	// more says that the same request has further texts still to send, so the
+	// collector does not mistake the first text of a twenty-text request for
+	// a request that arrived alone.
+	more bool
 }
 
 type itemResult struct {
@@ -209,7 +232,11 @@ func (s *Service) submit(ctx context.Context, texts []string, wanted []int, out 
 
 	items := make([]*item, len(wanted))
 	for n, i := range wanted {
-		items[n] = &item{text: texts[i], done: make(chan itemResult, 1)}
+		items[n] = &item{
+			text: texts[i],
+			done: make(chan itemResult, 1),
+			more: n < len(wanted)-1,
+		}
 	}
 
 	for _, it := range items {
@@ -249,16 +276,43 @@ var errClosedService = errors.New("the embedding service is shutting down")
 // comes first. The window is started by the first item of a batch rather than
 // reset by each arrival, so a steady stream of requests cannot starve the
 // batch that is already waiting.
+//
+// Waiting is conditional, because the window is a bet that company is coming
+// and a lone request loses it: the whole window is then added to the latency
+// of a single search or create for nothing. So the collector first takes
+// whatever is already queued without blocking, and waits only when that found
+// company or when another item arrived within the last window — the evidence
+// that traffic is bursty right now. An isolated request goes straight to the
+// model.
 func (s *Service) collect() {
 	defer s.wg.Done()
 
 	for {
-		var pending []*item
+		var (
+			pending []*item
+			bursty  bool
+		)
 		select {
 		case it := <-s.reqs:
-			pending = append(pending, it)
+			bursty = time.Since(s.lastArrival) < s.fillWindow
+			pending = s.take(pending, it)
 		case <-s.closed:
 			return
+		}
+
+	drain:
+		for len(pending) < s.batchSize {
+			select {
+			case it := <-s.reqs:
+				pending = s.take(pending, it)
+			default:
+				break drain
+			}
+		}
+
+		if len(pending) == 1 && !pending[0].more && !bursty {
+			s.dispatch(pending)
+			continue
 		}
 
 		timer := time.NewTimer(s.fillWindow)
@@ -266,7 +320,7 @@ func (s *Service) collect() {
 		for len(pending) < s.batchSize {
 			select {
 			case it := <-s.reqs:
-				pending = append(pending, it)
+				pending = s.take(pending, it)
 			case <-timer.C:
 				break fill
 			case <-s.closed:
@@ -276,6 +330,12 @@ func (s *Service) collect() {
 		timer.Stop()
 		s.dispatch(pending)
 	}
+}
+
+// take adds it to the batch and notes when it arrived.
+func (s *Service) take(pending []*item, it *item) []*item {
+	s.lastArrival = time.Now()
+	return append(pending, it)
 }
 
 // dispatch runs one batch, bounded by the worker semaphore.

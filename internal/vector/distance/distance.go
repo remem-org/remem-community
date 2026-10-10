@@ -11,9 +11,13 @@
 // on the way in. It is not available for dot product, and this package says so
 // rather than returning a plausible number — see [CosineFromOK].
 //
-// The kernels are plain loops. Spec §55 forbids premature vector optimisation,
-// and Go's compiler auto-vectorises this shape well; a hand-unrolled version
-// would be harder to read and no faster until it is measured to be.
+// Most kernels here are plain loops, because spec §55 forbids vector
+// optimisation that has not been measured. The dot product is the exception and
+// it earned it: profiled over a whole server it was half of an HNSW insert and
+// the inner loop of every search walk, at 158ns for 384 dimensions. It has an
+// architecture kernel — dot_arm64.s, with dot_generic.go for everything else
+// and for the `purego` tag — and [CosineWithNorms] records both what that
+// bought and what it costs in the last bits of a distance.
 package distance
 
 import (
@@ -129,7 +133,7 @@ func Norm(v []float32) float64 {
 // in a last bit and reorder a tie between an index and the flat oracle
 // (TestCosineWithNormsMatchesCosineDistance).
 //
-// # Why the dot product is single precision and unrolled
+// # Why the dot product is single precision, unrolled, and in assembly on arm64
 //
 // Profiled in Phase 13, over 90% of an HNSW insert was this dot product, and an
 // insert holds its tenant's graph lock, so its cost capped concurrent writes.
@@ -143,6 +147,23 @@ func Norm(v []float32) float64 {
 // so HNSW, the flat oracle, semantic and hybrid search all still agree with each
 // other exactly. Vectors themselves are float32 on disk and in memory, so no
 // stored value moves.
+//
+// §55's condition was "until it is measured to be" faster, and the server-wide
+// profile behind the server speed plan measured it: the scalar loop was
+// still half of an insert. [dot32] is therefore a NEON kernel on arm64 and that
+// same scalar loop everywhere else. Measured on an M1 Pro at 384 dimensions,
+// this function went from 161.6ns to 45.2ns, and an HNSW insert and search
+// each fell by more than 40%.
+//
+// The price is a second kind of last-bit difference, this one between
+// architectures rather than between precisions. Both kernels stay inside the
+// bound dot_internal_test.go states, and because the whole system calls this
+// one function, every index on one machine still agrees with every other one
+// there exactly. Reproducibility *across* architectures was never on offer —
+// float32 arithmetic in a different order is a different sum, and the Go
+// compiler already contracted this loop's multiply-add on arm64 and not on
+// amd64 — so what holds everywhere is the bound, not the bits. hnsw's search
+// digest records the measured effect on actual answers.
 func CosineWithNorms(a, b []float32, na, nb float64) float32 {
 	if na == 0 || nb == 0 {
 		// A zero vector has no direction. Reporting maximum distance is the
@@ -151,23 +172,6 @@ func CosineWithNorms(a, b []float32, na, nb float64) float32 {
 		return 1
 	}
 	return float32(1 - float64(dot32(a, b))/(na*nb))
-}
-
-// dot32 is the dot product in single precision, four accumulators wide.
-func dot32(a, b []float32) float32 {
-	b = b[:len(a)]
-	var s0, s1, s2, s3 float32
-	i := 0
-	for ; i+4 <= len(a); i += 4 {
-		s0 += a[i] * b[i]
-		s1 += a[i+1] * b[i+1]
-		s2 += a[i+2] * b[i+2]
-		s3 += a[i+3] * b[i+3]
-	}
-	for ; i < len(a); i++ {
-		s0 += a[i] * b[i]
-	}
-	return s0 + s1 + s2 + s3
 }
 
 // CosineFromOK recovers the cosine similarity from a distance, and reports

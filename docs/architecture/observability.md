@@ -16,7 +16,7 @@ never inputs to it, and nothing reads them back to decide anything.
 
 ## The metric set
 
-Twenty-eight families, each with the prefix `remem_`. `Metrics.DeclaredNames()`
+Thirty-four families, each with the prefix `remem_`. `Metrics.DeclaredNames()`
 lists them from the registered collectors themselves, rather than from a second
 list that could drift.
 
@@ -26,6 +26,8 @@ list that could drift.
 | Storage | `storage_writes_total`, `storage_reads_total`, `storage_scan_duration_seconds` | tenant, keyspace |
 | Storage engine | `storage_size_bytes`, `storage_compactions_total`, `storage_cache_accesses_total` | component (and result, for the cache) |
 | Search | `search_duration_seconds`, `search_candidates_considered`, `search_truncated_total` | tenant, mode |
+| Row cache | `row_cache_hits_total`, `row_cache_misses_total`, `row_cache_entries` | tenant on the two counters; component on the gauge, whose bound is the process's |
+| Vector index queue | `vector_index_queue_depth`, `vector_index_apply_lag_seconds`, `vector_index_failures_total` | shard on the depth gauge; tenant on the lag, and kind beside it on the failures |
 | Jobs | `jobs_pending`, `jobs_running`, `jobs_failures_total`, `jobs_retries_total`, `jobs_processing_duration_seconds` | tenant, kind |
 | Lifecycle | `lifecycle_transitions_total`, `lifecycle_sweep_duration_seconds`, `lifecycle_due_backlog` | tenant (and kind, for transitions) |
 | Discovery | `discovery_subjects_total`, `discovery_edges_created_total`, `discovery_candidates_considered`, `discovery_run_duration_seconds` | tenant (and outcome, for subjects) |
@@ -34,10 +36,17 @@ list that could drift.
 ## Labelling rules
 
 **A series carries a tenant when it describes one tenant's work**, and not
-otherwise. Requests, storage operations, searches, jobs, lifecycle and discovery
-are each done on a tenant's behalf, so each carries its tenant. That is also why
-a scrape lists every tenant served, and why `/metrics` needs a credential not
-bound to one (`delivery.md`).
+otherwise. Requests, storage operations, searches, row-cache reads, jobs,
+lifecycle and discovery are each done on a tenant's behalf, so each carries its
+tenant. That is also why a scrape lists every tenant served, and why `/metrics`
+needs a credential not bound to one (`delivery.md`).
+
+**Why the row cache's entries gauge carries no tenant.** `search.row_cache_entries`
+bounds the process, and the cache is shared; splitting the number it holds between
+tenants would be an attribution nobody measured. Its hits and misses do carry a
+tenant, because which tenant is getting the saving is the question an operator
+asks — and a write-heavy tenant reading as nearly all misses is the cache working
+as designed, not failing (`query.md`).
 
 **Why engine facts carry no tenant.** Disk size, compactions and block-cache
 hits describe the one Pebble store every tenant shares. There is no honest way

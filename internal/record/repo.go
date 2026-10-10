@@ -40,6 +40,14 @@ type Repo interface {
 	// returns a record to a user. A result never carries an embedding, so
 	// reading one is a point read per result for nothing. from is read like a
 	// snapshot; a storage.SeekReader over one answers it faster.
+	//
+	// The record it returns is *projected*: it carries the fields a response
+	// shows and not the ones only a writing path needs — no schema version, no
+	// record type, no sweep schedule or decay clocks, no retained unknown
+	// fields and no optimistic-concurrency token. Writing it back would stamp
+	// it with the current schema version and lose every field this binary does
+	// not understand, so Put refuses it outright. A caller that may write what
+	// it read wants Get or GetFrom.
 	GetBodyFrom(ctx context.Context, from BodyReader, rid id.ID) (*Record, error)
 
 	// Put stages a record and its vectors into tx. Nothing is visible until
@@ -296,12 +304,28 @@ func (r *repo) GetBodyFrom(ctx context.Context, from BodyReader, rid id.ID) (*Re
 	if err != nil {
 		return nil, err
 	}
-	return readBody(ctx, from, t, tenant.DefaultNamespace, rid, op)
+	ns := tenant.DefaultNamespace
+	body, err := readBodyBytes(ctx, from, t, ns, rid, op)
+	if err != nil {
+		return nil, err
+	}
+	// The projected decoder, not decodeBody: see decodeBodyProjected for what
+	// it leaves out and why a record it returns must not be written back.
+	return decodeBodyProjected(t, ns, rid, body, op)
 }
 
-// readBody reads and decodes a record body, reporting an absent one as
-// errs.NotFound naming the record.
+// readBody reads a record body and decodes it in full fidelity.
 func readBody(ctx context.Context, from BodyReader, t tenant.ID, ns tenant.Namespace, rid id.ID, op string) (*Record, error) {
+	body, err := readBodyBytes(ctx, from, t, ns, rid, op)
+	if err != nil {
+		return nil, err
+	}
+	return decodeBody(t, ns, rid, body, op)
+}
+
+// readBodyBytes reads a record body's stored bytes, reporting an absent one as
+// errs.NotFound naming the record.
+func readBodyBytes(ctx context.Context, from BodyReader, t tenant.ID, ns tenant.Namespace, rid id.ID, op string) ([]byte, error) {
 	body, err := from.Get(ctx, BodyKey(t, ns, rid))
 	if err != nil {
 		if errs.Is(err, errs.NotFound) {
@@ -309,7 +333,7 @@ func readBody(ctx context.Context, from BodyReader, t tenant.ID, ns tenant.Names
 		}
 		return nil, err
 	}
-	return decodeBody(t, ns, rid, body, op)
+	return body, nil
 }
 
 func (r *repo) Put(ctx context.Context, tx txn.Tx, rec *Record) error {
@@ -469,6 +493,14 @@ func validate(t tenant.ID, rec *Record, op string) error {
 	switch {
 	case rec == nil:
 		return bad("record is nil")
+	case rec.projected:
+		// Before the field checks, because every one of those would otherwise
+		// report a symptom of this: a projected record has no type, so "a
+		// record must have a type" is what a caller would see, and it names
+		// neither the cause nor the fix.
+		return bad("this record was read with GetBodyFrom, which decodes only the fields a " +
+			"response shows; writing it back would discard its schema version and every " +
+			"field this binary does not understand. Read it with Get or GetFrom to write it")
 	case rec.ID.IsZero():
 		return bad("a record must have an id")
 	case rec.Tenant != "" && rec.Tenant != t:

@@ -70,6 +70,11 @@ type Discoverer struct {
 	deps     Deps
 	strategy Strategy
 	edges    *graph.Store
+	// settler is the index when it applies its writes off the request path, and
+	// nil when it applies them inline and is therefore never behind. Asserted
+	// once in [NewDiscoverer] rather than per subject: which index is configured
+	// is settled at composition and does not change under a run.
+	settler vector.Settler
 }
 
 // NewDiscoverer builds the handler.
@@ -93,7 +98,8 @@ func NewDiscoverer(d Deps) (*Discoverer, error) {
 	if s == nil {
 		s = NewSimilarity(d.Threshold, d.TopK)
 	}
-	return &Discoverer{deps: d, strategy: s, edges: graph.NewStore(d.KV)}, nil
+	settler, _ := d.Index.(vector.Settler)
+	return &Discoverer{deps: d, strategy: s, edges: graph.NewStore(d.KV), settler: settler}, nil
 }
 
 func (d *Discoverer) topK() int {
@@ -184,6 +190,49 @@ func (d *Discoverer) Handle(ctx context.Context, j *jobs.Job, cp jobs.Checkpoint
 	sc := Scope{Tenant: j.Tenant, Namespace: j.Namespace}
 	ctx = tenant.NewContext(ctx, j.Tenant)
 	started := d.deps.Clock.Now()
+
+	// The index must have caught up with this tenant's writes before any of
+	// them is searched. internal/vector/indexqueue applies inserts on
+	// background workers, which widened the window between a memory's commit
+	// and its vector becoming searchable from microseconds to the queue's lag.
+	// Every other reader of the index tolerates that window because it reads
+	// again; discovery is handed each memory exactly once, and a search over an
+	// index that has not yet applied the pair's inserts finds no candidates,
+	// writes no edges and reports success — two memories that qualify, never
+	// linked, with nothing anywhere saying they were owed a link. Waiting is
+	// cheap and correct here, because this is a background job and not a
+	// request.
+	//
+	// Once per job, and not once per subject. The list is fixed by the time the
+	// loop starts and every subject's write committed before this job could be
+	// leased, so a single barrier covers all of them; per subject, a backfill
+	// job of up to [MaxSubjects] memories sat out a write-heavy tenant's shard
+	// backlog a hundred times over to learn the same thing it learnt the first
+	// time.
+	//
+	// A settle that fails fails the job, which the framework retries. That is
+	// the right outcome: a search over an index known to be behind produces a
+	// silent nothing, where a retry produces the answer a moment later. No
+	// subject has been touched yet, so there is no position to checkpoint —
+	// what the retry is handed is the payload it would have been handed anyway.
+	//
+	// What the barrier covers is everything the queue had *accepted* before the
+	// settle. What it does not cover is a write that has committed but has not
+	// yet been offered to the queue: internal/memory calls Indexed after the
+	// transaction commits and drops its error, and an enqueue onto a full shard
+	// blocks inside that call until there is room, so a job leased while the
+	// write path is still in there settles a queue that has never been told
+	// about the insert. The width of that window is therefore microseconds when
+	// the tenant's shard has room and the whole back-pressure wait when it does
+	// not — and an enqueue that gives up under a context deadline loses the
+	// pair outright, until the next materialisation repairs the index. Closing
+	// it would mean the enqueue happening before the job row becomes visible,
+	// which is a change to how a write is composed and is not made here.
+	if d.settler != nil {
+		if err := d.settler.Settle(ctx, sc.Tenant); err != nil {
+			return err
+		}
+	}
 
 	var run Run
 	for i, rid := range subjects {

@@ -98,7 +98,9 @@ func (h *Handler) post(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	if err := h.Sessions.Touch(ctx, sess.ID); err != nil && !errs.Is(err, errs.NotFound) {
+	// TouchSession rather than Touch: requireSession has just read the row, and
+	// a Touch that reads it again doubles the session reads on every call.
+	if err := h.Sessions.TouchSession(ctx, sess); err != nil && !errs.Is(err, errs.NotFound) {
 		remhttp.WriteError(w, r, err)
 		return
 	}
@@ -268,11 +270,27 @@ func (h *Handler) runTool(ctx context.Context, req Request, params CallToolParam
 		})
 	}
 
+	return toolResult(req.ID, out)
+}
+
+// toolResult renders a tool's answer as the one piece of text content MCP asks a
+// tool result to carry.
+//
+// The answer is encoded here and escaped a second time by the envelope encoder
+// in writeRPC. That is not a redundancy to remove: MCP requires the content to
+// be a JSON *string*, so a structured answer has to be a string of JSON inside
+// the envelope, and something has to escape it. Both cheaper encodings were
+// measured at 10 and 200 memories — see BenchmarkToolResultEncode and its
+// variants, and item 11 of the server speed plan. A pooled buffer for this
+// marshal halves the bytes allocated and buys no time at a realistic page size;
+// pre-escaping the text into a json.RawMessage is 60% slower, because it adds a
+// copy of the escaped form rather than removing one.
+func toolResult(id json.RawMessage, out any) Response {
 	body, err := json.Marshal(out)
 	if err != nil {
-		return failure(req.ID, CodeInternalError, "the tool's answer could not be encoded")
+		return failure(id, CodeInternalError, "the tool's answer could not be encoded")
 	}
-	return result(req.ID, CallToolResult{Content: textContent(string(body))})
+	return result(id, CallToolResult{Content: textContent(string(body))})
 }
 
 // toolErrorText is what the model is shown when a tool fails.

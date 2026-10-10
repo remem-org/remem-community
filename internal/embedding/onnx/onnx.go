@@ -37,7 +37,8 @@ type Config struct {
 	// MaxSequenceTokens truncates longer input. Zero takes the model default.
 	MaxSequenceTokens int
 	// IntraOpThreads bounds ONNX Runtime's own parallelism. Zero leaves the
-	// runtime's default, which is one thread per core — too many when several
-	// batches run at once.
+	// runtime's default, which counts the host's cores and ignores a container
+	// CPU quota; the server never passes zero, it resolves the count first
+	// (embedding.IntraOpThreads).
 	IntraOpThreads int
 }

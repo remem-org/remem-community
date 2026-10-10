@@ -26,6 +26,9 @@ type RecallRequest struct {
 	AlreadyHave []string `json:"already_have,omitempty"`
 
 	Tags []string `json:"tags,omitempty"`
+
+	// QueryVector is SearchRequest.QueryVector for a recall.
+	QueryVector []float32 `json:"query_vector,omitempty"`
 }
 
 // RecallResponse is what fits, and what did not.
@@ -58,6 +61,7 @@ func (d Deps) recallMemories(w http.ResponseWriter, r *http.Request) {
 		Type:        memory.SearchType(body.SearchType),
 		TokenBudget: body.TokenBudget,
 		Tags:        body.Tags,
+		QueryVector: body.QueryVector,
 	}
 	for _, raw := range body.AlreadyHave {
 		rid, err := id.Parse(raw)

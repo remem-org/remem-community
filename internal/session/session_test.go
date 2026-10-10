@@ -9,6 +9,7 @@ import (
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/session"
+	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
 )
@@ -217,5 +218,80 @@ func TestAnUnreadableSessionRowIsAbsentRatherThanCorrupt(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("the sweep removed %d unreadable rows, want 1", n)
+	}
+}
+
+// countingKV counts reads, so that a test can assert a code path does not take
+// one. It is for single-goroutine use.
+type countingKV struct {
+	storage.KV
+	gets int
+}
+
+func (c *countingKV) Get(ctx context.Context, key []byte) ([]byte, error) {
+	c.gets++
+	return c.KV.Get(ctx, key)
+}
+
+// TouchSession exists for the per-request path: internal/api/mcp has already
+// read the session row to authenticate the request, so reading it again to
+// extend it doubles the reads every MCP call takes, for nothing.
+func TestTouchSessionExtendsASessionWithoutReadingItAgain(t *testing.T) {
+	kv := &countingKV{KV: memkv.New()}
+	t.Cleanup(func() { _ = kv.Close() })
+	clk := clock.NewFake(clock.FakeStart)
+	r := session.New(kv, clk, time.Hour)
+
+	s, err := r.Create(acme(), session.Session{Principal: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(50 * time.Minute)
+
+	reads := kv.gets
+	if err := r.TouchSession(acme(), s); err != nil {
+		t.Fatal(err)
+	}
+	if kv.gets != reads {
+		t.Fatalf("TouchSession took %d KV reads, want 0", kv.gets-reads)
+	}
+
+	clk.Advance(50 * time.Minute)
+	got, err := r.Get(acme(), s.ID)
+	if err != nil {
+		t.Fatalf("a session used 50 minutes ago expired: %v", err)
+	}
+	if want := clock.FakeStart.Add(50 * time.Minute); !got.LastSeenAt.Equal(want) {
+		t.Fatalf("LastSeenAt = %v, want %v", got.LastSeenAt, want)
+	}
+}
+
+// A session value is not a capability. The tenant in ctx decides what may be
+// written, so a value naming another tenant reads as absent — the disposition
+// a session id leaked across tenants already has (see Get, above).
+func TestTouchSessionRefusesASessionFromAnotherTenant(t *testing.T) {
+	r, _, _ := newRegistry(t)
+	s, err := r.Create(acme(), session.Session{Principal: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	globex := tenant.NewContext(context.Background(), "globex")
+	if err := r.TouchSession(globex, s); !errs.Is(err, errs.NotFound) {
+		t.Fatalf("got %v, want NotFound", err)
+	}
+}
+
+// Touch will not extend an expired session, because its Get reports one
+// absent. TouchSession has to agree: they are one write path, and a caller
+// holding a stale value must not revive what the sweep is about to reclaim.
+func TestTouchSessionWillNotReviveAnExpiredSession(t *testing.T) {
+	r, clk, _ := newRegistry(t)
+	s, err := r.Create(acme(), session.Session{Principal: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(2 * time.Hour)
+	if err := r.TouchSession(acme(), s); !errs.Is(err, errs.NotFound) {
+		t.Fatalf("got %v, want NotFound", err)
 	}
 }

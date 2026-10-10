@@ -2,19 +2,18 @@ package memory
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash/maphash"
 	"math"
 	"strings"
 	"time"
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/codec"
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
-	"github.com/remem-org/remem-go/internal/keys"
 	"github.com/remem-org/remem-go/internal/query"
-	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/tenant"
 )
 
@@ -65,8 +64,12 @@ func (s *Service) search(ctx context.Context, req SearchReq, retainContinuation 
 			"a search must say how to look: %s. %q is not one of them",
 			strings.Join(SearchTypes(), ", "), req.Type))
 	}
-	if strings.TrimSpace(req.Query) == "" && len(req.Tags) == 0 {
+	if strings.TrimSpace(req.Query) == "" && len(req.Tags) == 0 && req.QueryVector == nil {
 		return SearchResult{}, errs.E(errs.Invalid, op, fmt.Errorf("a search needs a query or a tag"))
+	}
+	supplied, err := s.suppliedQueryVector(req, op)
+	if err != nil {
+		return SearchResult{}, err
 	}
 	if err := boundedQuery(op, "query", req.Query, req.Tags); err != nil {
 		return SearchResult{}, err
@@ -107,11 +110,15 @@ func (s *Service) search(ctx context.Context, req SearchReq, retainContinuation 
 	if req.Type == SearchSemantic || req.Type == SearchHybrid {
 		// The one place a search costs a model run. A keyword search skips it
 		// entirely, which is most of why the mode is worth having.
-		qs, err := s.embedder.Embed(ctx, []string{req.Query})
-		if err != nil {
-			return SearchResult{}, err
+		if supplied != nil {
+			q.Vector = supplied
+		} else {
+			qs, err := s.embedder.Embed(ctx, []string{req.Query})
+			if err != nil {
+				return SearchResult{}, err
+			}
+			q.Vector = qs[0]
 		}
-		q.Vector = qs[0]
 	}
 	if req.Type == SearchKeyword || req.Type == SearchHybrid {
 		q.Keyword = true
@@ -136,14 +143,8 @@ func (s *Service) search(ctx context.Context, req SearchReq, retainContinuation 
 	}
 	finished := false
 	defer func() { s.paging.release(session, finished) }()
-	// One iterator over the tenant's keys answers this request's point reads,
-	// every candidate's attribute row and every result's body, where a Get each
-	// builds and tears down an iterator of its own. It is this request's alone:
-	// continuations of one session read concurrently, and an iterator has one
-	// position. Deferred after the release, so it closes before the snapshot.
-	lower, upper := keys.TenantRange(t)
-	reader := storage.NewSeekReader(session.snapshot, lower, upper)
-	defer func() { _ = reader.Close() }()
+	reader, page := s.rowReader(session, t)
+	defer page.finish()
 	var examined int
 
 	if cursorSession == nil {
@@ -272,36 +273,106 @@ func timeValueOrNil(t *time.Time) *attr.Value {
 	})
 }
 
+// queryFingerprintSeed seeds every query fingerprint in this process.
+//
+// A maphash is not collision-resistant against someone who knows the seed, and
+// that is enough here, because a fingerprint never leaves the process that drew
+// this seed. It is held in a paging session's binding, in memory, for as long as
+// that session lives; it is never written into a page token, never persisted,
+// and never shown to a caller, and a session does not survive a restart (see
+// pagingRegistry). What makes a cursor unguessable is its session id, 128
+// random bits; the fingerprint's job is only to stop a caller replaying a cursor
+// they legitimately hold against a different question.
+//
+// One seed per process rather than one per Service: a fingerprint is only ever
+// compared with another in the same pagingRegistry, and a registry belongs to
+// one Service, so per-Service seeding would buy nothing.
+var queryFingerprintSeed = maphash.MakeSeed()
+
 // searchFingerprint binds all query semantics and the materialised evidence,
-// but deliberately excludes page size and position. Quoted strings have an
-// unambiguous boundary even when user content contains NULs; float bits retain
-// the exact embedding and graph threshold rather than a rounded display value.
-func (s *Service) searchFingerprint(q *query.Query, includeArchived bool) [32]byte {
-	h := sha256.New()
-	fmt.Fprintf(h, "v1 tenant=%q namespace=%q text=%q keyword=%t explain=%t archived=%t order=%d desc=%t\n",
-		q.Tenant, q.Namespace, q.Text, q.Keyword, q.Explain, includeArchived, q.OrderBy, q.Desc)
+// but deliberately excludes page size and position. Every variable-length field
+// is length-prefixed, so content cannot move across a field boundary and hash
+// the same — a NUL in a tag, a tag spelled like the next field; float bits
+// retain the exact embedding and graph threshold rather than a rounded display
+// value.
+func (s *Service) searchFingerprint(q *query.Query, includeArchived bool) uint64 {
+	var h maphash.Hash
+	h.SetSeed(queryFingerprintSeed)
+	fpString(&h, string(q.Tenant))
+	fpString(&h, string(q.Namespace))
+	fpString(&h, q.Text)
+	fpFlags(&h, q.Keyword, q.Explain, includeArchived, q.Desc)
+	fpUint(&h, uint64(q.OrderBy))
+	fpUint(&h, uint64(len(q.Tags)))
 	for _, tag := range q.Tags {
-		fmt.Fprintf(h, "tag=%q\n", tag)
+		fpString(&h, tag)
 	}
+	fpUint(&h, uint64(len(q.Preds)))
 	for _, p := range q.Preds {
-		fmt.Fprintf(h, "pred=%q\n", p.String())
+		// A predicate's rendering is the whole of its identity from out here:
+		// attr.Pred exposes no fields, only String.
+		fpString(&h, p.String())
 	}
-	fmt.Fprintf(h, "related=%v depth=%d direction=%q strength=%08x\n",
-		q.RelatedTo, q.RelatedDepth, q.RelatedDirection, math.Float32bits(q.RelatedMinStrength))
+	if q.RelatedTo == nil {
+		fpUint(&h, 0)
+	} else {
+		fpUint(&h, 1)
+		_, _ = h.Write(q.RelatedTo[:])
+	}
+	fpUint(&h, uint64(q.RelatedDepth))
+	fpUint(&h, uint64(q.RelatedDirection))
+	fpUint(&h, uint64(math.Float32bits(q.RelatedMinStrength)))
+	fpUint(&h, uint64(len(q.RelatedTypes)))
 	for _, typ := range q.RelatedTypes {
-		fmt.Fprintf(h, "type=%q\n", typ)
+		fpUint(&h, uint64(typ))
 	}
-	fmt.Fprintf(h, "vector=%d\n", len(q.Vector))
-	// One buffer rather than a binary.Write per component: the bytes are the
-	// same, and binary.Write allocates on every call — 384 times a search.
-	vec := make([]byte, 4*len(q.Vector))
-	for i, v := range q.Vector {
-		binary.LittleEndian.PutUint32(vec[4*i:], math.Float32bits(v))
+	fpUint(&h, uint64(len(q.Vector)))
+	fpFloat32s(&h, q.Vector)
+	return h.Sum64()
+}
+
+// fpFlags writes the query's booleans as one positional bitmask.
+func fpFlags(h *maphash.Hash, vs ...bool) {
+	var mask uint64
+	for i, v := range vs {
+		if v {
+			mask |= 1 << uint(i)
+		}
 	}
-	_, _ = h.Write(vec)
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
+	fpUint(h, mask)
+}
+
+// fpUint writes a fixed width, so that no two different values of one field can
+// agree on a prefix and leave the rest to the next field.
+func fpUint(h *maphash.Hash, v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	_, _ = h.Write(b[:])
+}
+
+func fpString(h *maphash.Hash, s string) {
+	fpUint(h, uint64(len(s)))
+	_, _ = h.WriteString(s)
+}
+
+// fpFloat32s writes a vector a chunk at a time. maphash buffers 128 bytes and
+// flushes, so writing each component on its own calls Write 384 times a search;
+// one buffer for the whole vector is a 1.5 KiB heap allocation. A fixed stack
+// chunk is neither, and measured fastest of the three at 384 dimensions: 506 ns
+// against 650 for the single buffer and 2230 for per-component writes.
+func fpFloat32s(h *maphash.Hash, vs []float32) {
+	var chunk [64]byte
+	n := 0
+	for _, v := range vs {
+		binary.LittleEndian.PutUint32(chunk[n:], math.Float32bits(v))
+		if n += 4; n == len(chunk) {
+			_, _ = h.Write(chunk[:])
+			n = 0
+		}
+	}
+	if n > 0 {
+		_, _ = h.Write(chunk[:n])
+	}
 }
 
 func encodeSearchCursor(t tenant.ID, session [16]byte, offset int) string {
@@ -351,4 +422,31 @@ func sourcesOf(hit query.Hit) []SourceScore {
 		})
 	}
 	return out
+}
+
+// suppliedQueryVector settles a search's query_vector against where this
+// server's vectors come from. It returns the checked vector for a semantic or
+// hybrid search on a server that takes the caller's, and nil otherwise.
+func (s *Service) suppliedQueryVector(req SearchReq, op string) ([]float32, error) {
+	if !embedding.CallerSupplied(s.embedder) {
+		if req.QueryVector != nil {
+			return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+				"query_vector was supplied, but this server computes its own embeddings from the query; send the query alone"))
+		}
+		return nil, nil
+	}
+	switch req.Type {
+	case SearchKeyword:
+		if req.QueryVector != nil {
+			return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+				"query_vector was supplied to a keyword search, which uses no vector; use semantic or hybrid to rank by it"))
+		}
+		return nil, nil
+	case SearchHybrid:
+		if strings.TrimSpace(req.Query) == "" {
+			return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+				"a hybrid search needs query text for its keyword half as well as query_vector; use semantic to search by the vector alone"))
+		}
+	}
+	return s.suppliedVector("query_vector", req.QueryVector, op, "")
 }
