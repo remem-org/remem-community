@@ -223,8 +223,10 @@ func (f fixedIndex) Search(_ context.Context, _ tenant.ID, _ []float32, k int, f
 	}
 	return out, nil
 }
-func (f fixedIndex) Insert(context.Context, tenant.ID, id.ID, []float32) error { return nil }
-func (f fixedIndex) Delete(context.Context, tenant.ID, id.ID) error            { return nil }
+func (f fixedIndex) Insert(context.Context, tenant.ID, id.ID, []vector.Entry) error {
+	return nil
+}
+func (f fixedIndex) Delete(context.Context, tenant.ID, id.ID) error { return nil }
 func (f fixedIndex) Rebuild(context.Context, tenant.ID, vector.Source, ...vector.RebuildOption) error {
 	return nil
 }

@@ -23,7 +23,7 @@ func TestOpenBuildsBothIndexes(t *testing.T) {
 				t.Fatalf("opening %q: %v", kind, err)
 			}
 			rid := id.New()
-			if err := idx.Insert(ctx, "acme", rid, []float32{1, 0, 0, 0}); err != nil {
+			if err := idx.Insert(ctx, "acme", rid, vector.Single([]float32{1, 0, 0, 0})); err != nil {
 				t.Fatal(err)
 			}
 			hits, err := idx.Search(ctx, "acme", []float32{1, 0, 0, 0}, 1, nil)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/clock"
 	"github.com/remem-org/remem-go/internal/config"
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/server"
 )
@@ -90,7 +91,7 @@ func refusesAnotherModelsCorpus(t *testing.T, kind string) {
 	if rr.Code == http.StatusOK {
 		t.Fatalf("a corpus embedded by another model was searched: %s", rr.Body)
 	}
-	for _, w := range []string{"all-MiniLM-L6-v2", "cohere-embed-english-v3.0"} {
+	for _, w := range []string{embedding.Model, "cohere-embed-english-v3.0"} {
 		if !strings.Contains(rr.Body.String(), w) {
 			t.Errorf("the refusal does not name %q: %s", w, rr.Body)
 		}

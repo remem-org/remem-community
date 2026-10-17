@@ -67,7 +67,7 @@ func openEmbedder(cfg config.Config) (embedding.Embedder, error) {
 	return onnx.Open(onnx.Config{
 		ModelPath:         cfg.Embedding.ModelPath,
 		SharedLibraryPath: cfg.Embedding.ONNXLibraryPath,
-		MaxSequenceTokens: cfg.Embedding.MaxSequenceTokens,
+		BatchSize:         cfg.Embedding.BatchSize,
 		IntraOpThreads:    threads,
 	})
 }

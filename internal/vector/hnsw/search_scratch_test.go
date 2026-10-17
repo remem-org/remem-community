@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
@@ -66,7 +67,7 @@ func TestGraphSearchCorrectAfterGrowingPastAPooledScratch(t *testing.T) {
 	vecs := make([][]float32, grown)
 	for i := range small {
 		vecs[i] = rng.unit(16)
-		if _, err := g.insert(id.New(), vecs[i]); err != nil {
+		if _, err := g.insert(vector.Key{ID: id.New()}, vecs[i]); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -82,7 +83,7 @@ func TestGraphSearchCorrectAfterGrowingPastAPooledScratch(t *testing.T) {
 
 	for i := small; i < grown; i++ {
 		vecs[i] = rng.unit(16)
-		if _, err := g.insert(id.New(), vecs[i]); err != nil {
+		if _, err := g.insert(vector.Key{ID: id.New()}, vecs[i]); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}

@@ -162,21 +162,75 @@ acknowledgement whether or not it has been placed.
 
 ## The membership rule
 
-**A memory is in the index if and only if its canonical vector row exists.**
+**A memory is in the index if and only if its canonical vector row exists. Its
+entries are its passage rows when it has any, and otherwise its canonical vector,
+as passage 0.**
 
-Everything else in this document follows from that sentence.
+Everything else in this document follows from those two sentences.
 
-A node record holds a record id, a layer number and neighbour lists. It does not
-hold the embedding. The embedding lives once, in the canonical row, and is read
-into memory when a tenant is materialised.
+The first says *whether*: a hard delete removes the canonical vector in the
+record's own transaction, and from that moment no entry of the memory exists,
+whatever passage rows or node records are left behind. The second says *which*.
+A memory whose content fits one passage is indexed by its canonical vector, as it
+always was. A longer memory is indexed by its passages, each embedded with the
+rest of its segment in view (`docs/architecture/retrieval.md`), and its canonical
+vector — the document vector, a mean over its first segment — is not an entry:
+indexing it would let a vague whole-memory match outrank the passage that holds
+the answer, and it is the mean its passages already cover.
+
+An index entry is a `vector.Key{ID, Passage}`. A memory's entries are always
+numbered `0…n-1` with no gaps, because its passage set is only ever replaced
+whole, so "every entry of this memory" is found by asking for passage 0, 1, …
+until one is missing: a node graph needs no per-memory index of its own.
+`vector.Store` owns the rule. `ScanEntries` merges the canonical and passage key
+spaces under it, both of which sort by record id, and every index reads through
+it; `StagePassages` is the one writer of passage rows, which the record indexer
+calls.
+
+A node record holds a record id, a passage number, a layer number and neighbour
+lists. It does not hold the embedding. The embedding lives once, in the canonical
+row or the passage row, and is read into memory when a tenant is materialised.
+A node for passage 0 is written in node format 1, byte for byte as before
+passages existed; a node for any later passage is format 2, which adds the
+passage number. A passage-0 entry keeps the layer it always had, because the
+layer is hashed from the record id alone for passage 0 and from the id and the
+passage number otherwise.
+
+## A search returns memories
+
+`Search` returns up to `k` distinct memories, each at the distance of its
+nearest entry, and names that entry. `k` counts memories however many passages
+one of them has.
+
+`flat` keeps the nearest entry per memory over its scan, and is the definition of
+the grouped answer. HNSW groups inside the bottom-layer walk: its result set
+holds one candidate per memory, the nearest of its passages seen so far, while
+exploration still follows every passage's links, and the stopping rule compares
+against the worst of `ef` distinct memories. So `ef` bounds memories, and a
+memory with a thousand passages near the query cannot fill the walk's result set
+with itself.
+
+Grouping in the index rather than the query executor is the design's choice, and
+`TestAThousandPassageMemoryCannotCrowdAFilteredPage` holds why: in the executor,
+one rejected thousand-passage memory spends a limit-10 search's whole widening
+budget on itself and returns an empty page marked truncated. Rank fusion is the
+other reason: it adds a contribution for every time a memory appears in a
+source's list, so a memory listed once per passage would outweigh an equally
+relevant shorter one (`TestHybridSearchFusesAMultiPassageMemoryOncePerSource`).
 
 Two consequences, and they are the reason for the rule rather than side effects
 of it.
 
-**Storage.** For a corpus of 250,000 memories the embeddings are about 400 MB.
-Node records are about 75 MB. Duplicating the embeddings into the index would
-have made it about 450 MB — the index roughly six times larger and the
-customer's total storage close to double, on the largest data the system holds.
+**Storage.** At 1,024 float32 dimensions a vector is 4 KiB, and a memory costs
+one vector for its canonical row plus one per passage when it has more than one:
+about one per 256 tokens of content. A 1,737-memory agent-browsing corpus of
+about 7.3 million tokens is about 29,000 passages, or 120 MB of
+passage vectors beside 7 MB of canonical ones. (Phase 7 measured the model of
+its time: 400 MB of 384-wide embeddings for 250,000 one-vector memories, and
+about 75 MB of node records.) Node records hold no vectors, so duplicating the
+embeddings into the index would roughly double the customer's storage on the
+largest data the system holds. Storing the vectors as the int8 values they
+already are would cut all of this by four, losslessly, and is a separate change.
 
 **Deletion is exact, including through a crash.** Rust Remem kept its deleted
 set in a memory-mapped entry that every checkpoint erased. After a restart each
@@ -536,6 +590,36 @@ search hard is how many points it has to tell apart once it has found the right
 region, not how many regions there are. The test now gates at the 10,000-vector
 test's density, 500 a topic. The twenty-topic figures stay here as the measured
 cost of a corpus that crowds one subject, and are not gated.
+
+## Recall at 1,024 dimensions, with passages (passage-vectors)
+
+The model became `pplx-embed-context-v1-0.6b`, so the recall tests moved to its
+width (`recallDim` is `embedding.Dim`); every figure above this section was taken
+at 384. Measured on one host, recall@10, at the defaults `M=16,
+ef_construction=200`:
+
+| Corpus | ef=16 | ef=64 | ef=512 |
+|---|---|---|---|
+| Clustered, 10,000 vectors, 500 a topic | 0.892 | 0.999 | — |
+| Uniform on the unit sphere, 10,000 vectors | — | 0.424 | 0.974 |
+| Clustered, 250,000 vectors, 500 a topic | — | 1.000 | — |
+| **Passages:** 5,000 memories, 100 a topic, 1–32 passages each (82,792 entries) | 0.956 | 1.000 | — |
+
+The width barely moves the clustered figures (0.887 and 0.997 at 384; 0.990 at a
+quarter million) and worsens
+the uniform worst case, as more dimensions should: a uniform cloud is harder the
+wider it is, and 0.974 at ef=512 still shows the graph reaching everything.
+
+The passage row is the one this change adds, and its recall counts **memories**:
+of the exact top ten memories, each ranked by its nearest passage, the fraction
+the grouped HNSW search also returned. Its corpus is shaped like contextual
+passages — a memory's passages cluster tightly around it, because each was
+embedded knowing the whole of it (the spike measured 0.94–0.99 cosine between a
+document's passages and its document vector) — and the passage count per memory
+runs from one to thirty-two, so long memories crowd the space the way real ones
+do. It is gated at 0.95 at ef=64 (`TestPassageRecallAtScale`, behind the `recall`
+tag), with a 300-memory version in the everyday suite
+(`TestPassageRecallAgainstFlat`: 0.990 and 1.000).
 
 ## Two completion criteria bought down in Phase 7; one met in Phase 13
 

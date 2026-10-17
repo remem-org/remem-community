@@ -3,6 +3,7 @@ package http
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -163,6 +164,8 @@ func adminSubject(r *http.Request, metrics string) string {
 		return "admin.jobs"
 	case strings.Contains(r.URL.Path, "/policies"):
 		return "tenants.policies"
+	case strings.Contains(r.URL.Path, "/users"):
+		return "tenants.users"
 	default:
 		return "tenants"
 	}
@@ -180,6 +183,8 @@ func adminAction(r *http.Request, metrics string) string {
 		return "administering background jobs"
 	case strings.Contains(r.URL.Path, "/policies"):
 		return "reading or changing a tenant's retention policies"
+	case strings.Contains(r.URL.Path, "/users"):
+		return "administering users and tokens"
 	default:
 		return "administering tenants"
 	}
@@ -212,6 +217,40 @@ func metricsScope(r *http.Request) func(string) bool {
 // credential is not, on its own, authorisation for a tenant created tomorrow.
 // A credential with no explicit set is the operator credential, and sees every
 // tenant — which is a decision a configuration file made, not one inferred here.
+// pathTenant resolves the tenant a /tenants/{id}/... route names, refusing one
+// the credential may not act in.
+//
+// These routes take their tenant from the path rather than from the resolver,
+// so the resolver's authorisation check never sees it. A cross-tenant
+// credential narrowed to an explicit set must still be held to that set here:
+// without this, a key authorised for acme could rewrite another tenant's
+// retention, or create a user there and mint itself a token for it. The path
+// tenant is then checked against the request's directory, which is the
+// edition's confined one, so a single-tenant build refuses any tenant but its
+// own before anything is read.
+func (d Deps) pathTenant(w http.ResponseWriter, r *http.Request, op string) (tenant.ID, bool) {
+	t, err := tenant.Parse(r.PathValue("id"))
+	if err != nil {
+		WriteError(w, r, err)
+		return "", false
+	}
+	if scope, narrowed := authorizedTenants(r); narrowed && !scope[t] {
+		names := make([]string, 0, len(scope))
+		for id := range scope {
+			names = append(names, string(id))
+		}
+		slices.Sort(names)
+		WriteError(w, r, errs.E(errs.Forbidden, op, fmt.Errorf(
+			"this credential is authorized for %s, and not for %q", strings.Join(names, ", "), t)))
+		return "", false
+	}
+	if _, err := d.Tenants.Get(r.Context(), t); err != nil {
+		WriteError(w, r, err)
+		return "", false
+	}
+	return t, true
+}
+
 func authorizedTenants(r *http.Request) (map[tenant.ID]bool, bool) {
 	p, ok := auth.FromContext(r.Context())
 	if !ok || len(p.Authorized) == 0 {

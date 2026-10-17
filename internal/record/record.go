@@ -184,6 +184,13 @@ type Record struct {
 	SchemaVersion uint32
 	// Vectors are the record's canonical embeddings, keyed by what they embed.
 	Vectors map[string]*Vector
+	// Passages are the passage vectors a content write computed, staged by the
+	// passage indexer and never encoded into the body. Nil means the content
+	// did not change, and the stored passage rows are left alone: sweeps,
+	// recall folds, policy and tag changes and archiving all write records
+	// without touching content. Non-nil replaces them, and an empty set means
+	// the content fits one passage and has none.
+	Passages *PassageSet
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -213,6 +220,7 @@ func (r *Record) Clone() *Record {
 			out.Vectors[k] = v.Clone()
 		}
 	}
+	out.Passages = r.Passages.Clone()
 	return &out
 }
 
@@ -227,5 +235,5 @@ func BodyKey(t tenant.ID, ns tenant.Namespace, rid id.ID) []byte {
 
 // VectorKey is the storage key of a record's canonical content vector.
 func VectorKey(t tenant.ID, ns tenant.Namespace, rid id.ID) []byte {
-	return vector.Key(t, ns, rid)
+	return vector.CanonicalKey(t, ns, rid)
 }

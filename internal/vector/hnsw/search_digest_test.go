@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
@@ -187,17 +188,17 @@ func walkTrace(t *testing.T, metric distance.Metric) ([][]candidate, *graph) {
 	ids := make([]id.ID, corpus)
 	for i := range ids {
 		ids[i] = digestID(uint64(i) + 1)
-		if _, err := g.insert(ids[i], rng.unit(24)); err != nil {
+		if _, err := g.insert(vector.Key{ID: ids[i]}, rng.unit(24)); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
 	// Removals and re-inserts, so the repair path and node-number reuse are in
 	// the digest too and not just a freshly built graph.
 	for i := range churn {
-		g.remove(g.byID[ids[i]])
+		g.remove(g.byID[vector.Key{ID: ids[i]}])
 	}
 	for i := range churn {
-		if _, err := g.insert(digestID(uint64(1000000+i)), rng.unit(24)); err != nil {
+		if _, err := g.insert(vector.Key{ID: digestID(uint64(1000000 + i))}, rng.unit(24)); err != nil {
 			t.Fatalf("re-insert %d: %v", i, err)
 		}
 	}

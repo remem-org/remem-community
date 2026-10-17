@@ -76,6 +76,10 @@ func run(args []string) (int, error) {
 		return inspectCommand(args)
 	case "tenants":
 		return tenantsCommand(args)
+	case "users":
+		return usersCommand(args)
+	case "tokens":
+		return tokensCommand(args)
 	case "version":
 		fmt.Println("remem-admin", version.Binary)
 		fmt.Println(version.Current())
@@ -106,6 +110,12 @@ Usage:
   remem-admin inspect spaces --data-dir <path> [--tenant <id>]
   remem-admin inspect key --data-dir <path> <hex key>
   remem-admin tenants inventory --data-dir <path> [--implicit-tenant <id>]
+  remem-admin users create --data-dir <path> --name <name> [--tenant <id>]
+  remem-admin users rename|disable|enable --data-dir <path> --user <id> [--name <name>] [--tenant <id>]
+  remem-admin users list --data-dir <path> [--tenant <id>]
+  remem-admin tokens issue --data-dir <path> --user <id> [--expires <RFC 3339>] [--tenant <id>]
+  remem-admin tokens list --data-dir <path> --user <id> [--tenant <id>]
+  remem-admin tokens revoke --data-dir <path> --user <id> --token <id> [--tenant <id>]
   remem-admin version
 
 The data directory must not be in use: Pebble holds an exclusive lock, so stop
@@ -133,6 +143,12 @@ derived row naming a record that does not exist, a record with no attribute
 row, and every graph inconsistency — and exits 2 when it finds one. inspect
 spaces reports where the bytes are. inspect key decodes one key a finding named.
 None of them prints memory content.
+
+users and tokens administer who may call the server: one user per agent or
+person, each holding tokens. users create is how the first user is made, since a
+running server administers them only through the operator credential. tokens
+issue prints the token alone on stdout and never shows it again. A user is
+never deleted, because its history refers to it by id: disable it instead.
 
 tenants inventory lists the tenants a directory holds and exits 2 when it holds
 any beyond the one a single-tenant build serves. It is the step before upgrading

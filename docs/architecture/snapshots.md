@@ -27,6 +27,7 @@ rows and read back into them, and nothing ever queries it.
 | Out-edges | Canonical. Nothing else in the system reconstructs a relationship |
 | Tenants | Canonical. Losing the directory loses the answer to "which tenants exist" |
 | The lifecycle audit stream | Canonical, and the one row that outlives its own subject: a `hard_deleted` event is what answers "why did my memory disappear" |
+| Users (section 41, `go.users`) | Canonical identity. An event names a user as its actor by id (`user:<id>`), and a restore that dropped users would leave that history pointing at nobody |
 
 | Not in the file | Why |
 |---|---|
@@ -36,6 +37,8 @@ rows and read back into them, and nothing ever queries it.
 | HNSW node records | Derived from canonical vectors, and the only asynchronously maintained index |
 | Job rows | Canonical, and deliberately absent. A queue is a statement about work this deployment still owes, and restoring another deployment's outstanding work into a fresh store would re-run it |
 | `next_attention_at` | Derived from the record and the retention policy **in force at the destination**. See below |
+| Tokens, token digests and the token index | Credentials, and **never** in a snapshot. A snapshot is a portable file, copied and kept for years, and a digest in one is a leak waiting for whoever finds it. A restore keeps who everyone is; every token is issued again. `TestNoTokenMaterialIsInTheFile` scans an exported file's bytes for the secret, the id, the digest and the index key |
+| A user's name-index row | Derived from the user row, and rebuilt in the transaction that restores it |
 
 ## Two schemas, one framing
 
@@ -44,7 +47,7 @@ the frozen Rust repository, checksummed in both (`test/proto_checksum_test.go`
 and `crates/remem-server/tests/proto_checksum.rs`), and therefore fixed.
 
 It predates Go's graph (Phase 6) and its lifecycle (Phase 10), so there are five
-things Go stores that it has no field for:
+things Go stores that it has no field for (six, since users):
 
 - an edge's caller-supplied metadata, which the connections API accepts and
   returns;
@@ -63,6 +66,22 @@ writes and reads.
 Strip the companion sections from a Go snapshot and what remains is precisely a
 `snapshot.v1` file. `remem-admin export --shared-only` does exactly that, and
 prints what it cost rather than dropping it quietly.
+
+Users are section **41**, not 11. Sections 11 to 40 are reserved for maintained
+memory's companions (`docs/architecture/belief.md`), and a user is platform
+identity rather than belief. Like the audit stream, `go.users` annotates nothing,
+so it is not a companion in the sense below. A restored user keeps its id, name,
+state and times, under the import's conflict mode. The one exception is a name
+held by a *different* user: under any mode, that is skipped or refused, naming the
+holder, and never resolved by taking the name. A user is never deleted, and a name
+is unique. A binary from before users refuses a snapshot carrying section 41, as
+it refuses any section it does not know. **The users block is written first,
+straight after the tenants**, and that is what makes the refusal clean. An
+importer writes each block as it reads it. With users last, the previous release
+was run against such a file, imported every memory, and only then met section
+41. It left a store holding everything but its users, while printing "refused
+rather than partially imported". With users first, it refuses before writing any
+memory, vector, edge or event: only the tenant's directory row precedes it. `TestUsersAreWrittenBeforeAnyRecord` holds the order.
 
 **A companion block always immediately follows the block it annotates**, and the
 reader enforces it. That is what bounds an importer's memory to one page rather

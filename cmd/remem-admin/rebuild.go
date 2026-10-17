@@ -5,19 +5,26 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
+	"slices"
 	"time"
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
+	"github.com/remem-org/remem-go/internal/config"
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/graph"
 	"github.com/remem-org/remem-go/internal/keys"
 	"github.com/remem-org/remem-go/internal/record"
+	"github.com/remem-org/remem-go/internal/schema"
 	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/storage/pebble"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/text"
 	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/indexes"
+	"github.com/remem-org/remem-go/internal/version"
 )
 
 // rebuildIndexes are the derived indexes an operator can name, in the order
@@ -27,7 +34,7 @@ import (
 // stated as a command. The canonical rows — record bodies, canonical vectors,
 // out-edges — are not here and never will be: nothing rebuilds them, which is
 // what makes them canonical.
-var rebuildIndexes = []string{"vector", "text", "attr", "graph-in"}
+var rebuildIndexes = []string{"vector", "text", "attr", "graph-in", "passages"}
 
 // spaceIndexName is the `--index` name that rebuilds a derived key space.
 //
@@ -45,6 +52,8 @@ func spaceIndexName(s keys.Space) (string, bool) {
 		return "attr", true
 	case keys.SpaceEdgeIn:
 		return "graph-in", true
+	case keys.SpacePassage:
+		return "passages", true
 	}
 	return "", false
 }
@@ -65,9 +74,15 @@ func rebuildCommand(args []string) (int, error) {
 	fs := flag.NewFlagSet("rebuild", flag.ContinueOnError)
 	dataDir := fs.String("data-dir", "", "the Remem data directory to rebuild")
 	which := fs.String("index", "",
-		"which derived index to rebuild: vector, text, attr, graph-in, or all")
+		"which derived index to rebuild: vector, text, attr, graph-in, passages, or all")
 	only := fs.String("tenant", "", "rebuild one tenant rather than every tenant")
 	metric := fs.String("metric", "cosine", "the distance metric the server is configured with")
+	modelPath := fs.String("model-path", os.Getenv("REMEM_EMBEDDING_MODEL_PATH"),
+		"with --index passages or all: the pplx-embed-context-v1-0.6b directory")
+	onnxPath := fs.String("onnx-library-path", os.Getenv("REMEM_EMBEDDING_ONNX_LIBRARY_PATH"),
+		"the ONNX Runtime shared library")
+	provider := fs.String("embedding-provider", envOr("REMEM_EMBEDDING_PROVIDER", config.ProviderONNX),
+		"onnx, or external for a data directory whose server takes vectors from its callers")
 	if err := fs.Parse(args); err != nil {
 		return 0, err
 	}
@@ -77,6 +92,27 @@ func rebuildCommand(args []string) (int, error) {
 	wanted, err := chooseIndexes(*which)
 	if err != nil {
 		return 0, err
+	}
+	// Passages are the one rebuild that runs the model, so the model is opened
+	// before the database: a build without it is refused by name and leaves
+	// nothing behind. An external-mode directory has no passages and needs no
+	// model; its rebuild clears any stray rows.
+	var embedder embedding.Embedder
+	if slices.Contains(wanted, "passages") {
+		if *provider == config.ProviderExternal {
+			embedder = embedding.NewExternal("external", config.EmbeddingDimension)
+		} else {
+			embedder, err = openModel(*modelPath, *onnxPath,
+				"rebuilding the passage index recomputes every memory's passage embeddings",
+				"rebuild --index passages needs --model-path (or REMEM_EMBEDDING_MODEL_PATH): "+
+					"passage rows are recomputed from each memory's content by the model")
+			if err != nil {
+				return 0, err
+			}
+		}
+		if c, ok := embedder.(io.Closer); ok {
+			defer func() { _ = c.Close() }()
+		}
 	}
 
 	kv, err := openReadWriteExisting(*dataDir)
@@ -89,13 +125,27 @@ func rebuildCommand(args []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	only = &scoped
-
 	ctx := context.Background()
+	upgraded := false
+	if embedder != nil {
+		format, err := schema.Open(ctx, kv, version.Current())
+		if err != nil {
+			return 0, err
+		}
+		upgraded = format.Subsystems["passage_index"].Current < version.PassageIndex
+		if err := upgradePassageFormat(ctx, kv, dir, *dataDir, *only, embedder); err != nil {
+			return 0, err
+		}
+	}
+	only = &scoped
 	run := func(t tenant.ID) error {
 		for _, name := range wanted {
+			if upgraded && name == "passages" {
+				fmt.Printf("tenant %s: passages built by the passage_index migration\n", t)
+				continue
+			}
 			started := time.Now()
-			n, err := rebuildOne(ctx, kv, name, t, *metric)
+			n, err := rebuildOne(ctx, kv, name, t, *metric, embedder)
 			if err != nil {
 				return fmt.Errorf("rebuilding %s for tenant %s: %w", name, t, err)
 			}
@@ -144,7 +194,7 @@ func chooseIndexes(which string) ([]string, error) {
 // reimplementing a rebuild here. A second implementation of a derived index is
 // a second thing that can disagree with the canonical rows.
 func rebuildOne(ctx context.Context, kv storage.KV, name string, t tenant.ID,
-	metric string,
+	metric string, embedder embedding.Embedder,
 ) (int, error) {
 	ns := tenant.DefaultNamespace
 	switch name {
@@ -178,6 +228,11 @@ func rebuildOne(ctx context.Context, kv storage.KV, name string, t tenant.ID,
 
 	case "graph-in":
 		return graph.RebuildIn(ctx, kv, graph.Scope{Tenant: t, Namespace: ns})
+
+	case "passages":
+		// Not resumable here, as no remem-admin rebuild is: an interrupted run
+		// starts again. The passages.rebuild job is the resumable form.
+		return record.RebuildPassages(ctx, kv, t, ns, embedder, nil, nil)
 
 	default:
 		return 0, fmt.Errorf("%q is not a derived index", name)

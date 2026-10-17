@@ -15,7 +15,8 @@ of the two policies is in force decides what that order even is.
 |---|---|---|
 | Which tenant a request belongs to | the credential it presented | a header is a request, honoured only for a credential authorised to make it |
 | Which tenants exist | the directory rows under `/tenants/*` | nothing infers a tenant from the presence of its data |
-| Whether a caller is who they say | `auth.Keyring`, over the configured credentials | no subsystem re-checks; they read the resolved scope from the context |
+| Whether a caller is who they say | `auth.Keyring` over the configured credentials, and `internal/users` over stored user tokens, composed into one verifier by the server | no subsystem re-checks; they read the resolved scope from the context |
+| Which user acted | the principal's user id, recorded as an event's actor | a user's name is a label; nothing durable refers to a user by name |
 | The scope of any read or write | the tenant in the `context.Context` | no function below the API layer takes a tenant as a parameter |
 
 ## Two tenant policies, chosen at composition
@@ -248,6 +249,72 @@ short-circuit on the first match, so response time reveals neither how many
 credentials exist nor how far down the list one sits. Secrets are held as their
 SHA-256, so a heap dump of a running server does not hand over every API key.
 
+## Users and tokens
+
+A **user** is who a request is, inside its tenant: one per agent or person,
+each holding its own tokens. Users exist because a configured credential could
+not say: a tenant-bound key's identity was its tenant's name, so every agent of
+a tenant arrived as the same caller, and nothing durable recorded who did
+anything. Users are in the shared core, and **every edition has them**. What
+distinguishes the editions is how many tenants they serve, not who may call
+them.
+
+This does not make a user a level of the keyspace, for the reason the section
+above gives. A memory belongs to its tenant. A user is who acted on it, and is
+recorded as an event's actor (`user:<id>`) — never as its owner.
+
+**A user belongs to exactly one tenant, and its id is for ever.** The id is
+assigned at creation, survives a rename, and is never reused. A user is
+**never deleted**: audit events refer to it by id, and later evidence groups
+(`docs/architecture/belief.md`, Invariant 8) are defined by it, so deleting one
+would leave history naming somebody who no longer exists. Disabling a user
+refuses all of its tokens, and is reversible.
+
+**A name is unique within the tenant after NFKC and full case folding**, and an
+invisible formatting character is refused. `/history` shows names, and two users
+who display as one person would let one pass for the other. Cross-script
+confusables (Latin `a`, Cyrillic `а`) are not caught: names are created by the
+operator, never by the caller they name.
+
+**A token is `rmm_<id>_<secret>`, shown once and stored as a digest.** The
+secret is 256 random bits, so plain SHA-256 is the right digest, not a slow
+password hash. A user may hold several tokens at once, and rotation is
+issuing the new one, moving the caller, and revoking the old. Revocation is
+permanent. The encoding is checked canonical on the way in: a 32-byte secret's
+last base32 character carries four ignored bits, and without the check sixteen
+strings would be the same token.
+
+**Authentication runs before tenancy, and that is what the one untenanted row is
+for.** Every user row is tenant-first (Invariant 1). But a request's tenant is
+decided by its credential, so a token must be found before any tenant is known.
+`/tokens/<token id>` in the system space names the token's tenant, and nothing
+else. It reveals nothing without the token row it points to, and it is the only
+fact about a user that sits outside `TenantRange`.
+
+**Verification is three point reads and keeps no cache.** It reads the index,
+the token row (comparing digests in constant time), then the user row. A
+revocation or a disable committed before a request is therefore seen by that
+request. That is easy to state now, and stays true when Phase 14 puts several
+nodes in front of one store, where an invalidated cache would need an argument
+of its own. Every refusal is the same `Unauthorized`, so a caller probing tokens
+learns nothing about which part was wrong. A storage failure is reported as
+itself, because telling a caller its token is wrong when the store is down sends
+it to fix the wrong thing.
+
+**Only the operator credential administers users**, through
+`/api/v1/tenants/{id}/users` on a running server and `remem-admin users` /
+`remem-admin tokens` on a stopped one. A user token administers nothing,
+including its own user and tokens. The first user of a deployment is therefore
+made by the operator, and an agent never hands itself credentials.
+
+**Configured keys still authenticate, and carry no user.** Every
+`server.api_keys` entry acting in a tenant is one shared, unattributed caller,
+recorded as `api` exactly as before users existed. That is the safe direction
+for evidence: merging two real callers loses corroboration, but splitting one
+caller in two would manufacture it. The server announces the deprecation once at
+start-up, and a configured secret beginning `rmm_` is refused, because it would
+be verified as a user token and could never authenticate.
+
 ## Provisioning
 
 `tenant.Ensure` is a function over the interface rather than a fifth method: it
@@ -270,6 +337,9 @@ moment nobody chose.
 | A header from an unauthorised principal | `Forbidden` | the credential is valid; the request is not |
 | A tenant directory row that will not decode | `Corruption` | reporting it absent would let a request proceed against a tenant whose metadata could not be read — its schema version included |
 | Administering tenants without a cross-tenant credential | `Forbidden`, not `NotFound` | unlike a memory, the existence of the endpoint is not a secret, and hiding it makes a misconfigured key look like a routing bug |
+| A token refused for any reason: unknown, wrong secret, revoked, expired, its user disabled, malformed | one identical `Unauthorized` | a refusal that said which would tell a caller probing tokens how close it was |
+| Administering users with a user token or a tenant-bound key | `Forbidden`, naming user administration | an agent never administers identities, its own included |
+| A user or token row that will not decode, or a token index naming a token its tenant does not hold | `Corruption` | reading it as absent would hand its name to the next caller, or refuse a valid token as if it were wrong |
 
 ## The seam for per-tenant schema versions
 
@@ -309,6 +379,19 @@ creates, and treats a lost race as success and re-reads the winner's row. Two
 requests provisioning a fresh tenant at once is the ordinary case for a new
 deployment, not an error either should see.
 
+**Users and tokens are canonical; the name index is derived.** They live in the
+tenant's user space (`0x30`), a user row and a token row each, plus one row per
+folded name that maps it to its holder. The name row is what makes uniqueness a
+conditional write: two writers claiming one name contend on one key, the loser
+re-runs, and is told the name is taken. That refusal is returned from the
+transaction body as a plain value and made a `Conflict` outside it, because
+`txn.Do` retries a `Conflict` and this one never resolves. A snapshot carries
+users and never tokens. The name rows are rebuilt from the user rows on import.
+
+**Issuing a token is one transaction over two spaces**: the token row in the
+tenant, the index row in the system space, both expected absent. A token that
+exists is always findable, and an index row always has a token behind it.
+
 **Sessions are canonical but disposable.** A session row lives under its
 tenant's key prefix, expires, and is swept by the server through
 `tenant.ForEach`. Losing one costs a client a new `initialize`, and nothing else.
@@ -316,7 +399,8 @@ tenant's key prefix, expires, and is swept by the server through
 ## What this phase deliberately does not decide
 
 - **Roles and permissions.** A principal is either bound to a tenant or
-  authorised across tenants. There is no read-only credential, no per-tool
+  authorised across tenants, and a user is always bound. Users brought identity,
+  not authority: there is still no role a user can hold. There is no read-only credential, no per-tool
   permission and no delegation, because nothing yet needs one and a permission
   model built before its first requirement is a permission model that does not
   fit it.

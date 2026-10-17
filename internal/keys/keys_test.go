@@ -317,6 +317,10 @@ func TestBuildersAllocateOnce(t *testing.T) {
 		"AttrIndex": func() { _ = keys.AttrIndex(acme, ns, 1, []byte("v"), rid) },
 		"Text":      func() { _ = keys.Text(acme, ns, "term", rid) },
 		"Job":       func() { _ = keys.Job(acme, ns, keys.JobPending, 1, rid) },
+		"User":      func() { _ = keys.User(acme, ns, rid) },
+		"UserToken": func() { _ = keys.UserToken(acme, ns, rid) },
+		"UserName":  func() { _ = keys.UserName(acme, ns, "planner") },
+		"TokenIdx":  func() { _ = keys.TokenIndex(rid) },
 	}
 	for name, fn := range cases {
 		if n := testing.AllocsPerRun(100, fn); n > 1 {
@@ -397,6 +401,8 @@ func TestSpaceNamesAreStable(t *testing.T) {
 		keys.SpaceEdgeOut: "edge_out", keys.SpaceEdgeIn: "edge_in", keys.SpaceAttrRow: "attr_row",
 		keys.SpaceAttrIndex: "attr_index", keys.SpaceText: "text", keys.SpaceVectorIndex: "vector_index",
 		keys.SpaceJob: "job", keys.SpaceEvent: "event", keys.SpaceSession: "session",
+		keys.SpaceJobPause: "job_pause", keys.SpaceJobRun: "job_run", keys.SpacePassage: "passage",
+		keys.SpaceUser: "user",
 	}
 	for s, name := range want {
 		if got := s.String(); got != name {

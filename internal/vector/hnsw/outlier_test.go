@@ -6,6 +6,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/hnsw"
 )
 
@@ -31,11 +32,11 @@ func TestAnOutlierAmongDuplicatesStaysReachable(t *testing.T) {
 
 			outlier := id.New()
 			q := []float32{1, 0, 0, 0}
-			if err := idx.Insert(ctx, "acme", outlier, q); err != nil {
+			if err := idx.Insert(ctx, "acme", outlier, vector.Single(q)); err != nil {
 				t.Fatal(err)
 			}
 			for range duplicates {
-				if err := idx.Insert(ctx, "acme", id.New(), []float32{0, 1, 0, 0}); err != nil {
+				if err := idx.Insert(ctx, "acme", id.New(), vector.Single([]float32{0, 1, 0, 0})); err != nil {
 					t.Fatal(err)
 				}
 			}

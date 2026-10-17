@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
@@ -20,7 +21,7 @@ func TestGraphFindsNearestNeighbours(t *testing.T) {
 	for i := range n {
 		ids[i] = id.New()
 		vecs[i] = rng.unit(16)
-		if _, err := g.insert(ids[i], vecs[i]); err != nil {
+		if _, err := g.insert(vector.Key{ID: ids[i]}, vecs[i]); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -65,12 +66,12 @@ func TestGraphRemoveLeavesNoDanglingLinks(t *testing.T) {
 	ids := make([]id.ID, 200)
 	for i := range ids {
 		ids[i] = id.New()
-		if _, err := g.insert(ids[i], rng.unit(8)); err != nil {
+		if _, err := g.insert(vector.Key{ID: ids[i]}, rng.unit(8)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, rid := range ids[:100] {
-		g.remove(g.byID[rid])
+		g.remove(g.byID[vector.Key{ID: rid}])
 	}
 	if g.live != 100 {
 		t.Fatalf("graph holds %d live nodes after 100 removals, want 100", g.live)
@@ -103,9 +104,9 @@ func TestGraphRemoveLeavesNoDanglingLinks(t *testing.T) {
 // incrementally built one.
 func TestLevelsAreDerivedFromTheRecordID(t *testing.T) {
 	rid := id.New()
-	first := levelOf(rid, 16)
+	first := levelOf(vector.Key{ID: rid}, 16)
 	for range 100 {
-		if got := levelOf(rid, 16); got != first {
+		if got := levelOf(vector.Key{ID: rid}, 16); got != first {
 			t.Fatalf("levelOf is not a function of the id: %d then %d", first, got)
 		}
 	}
@@ -114,7 +115,7 @@ func TestLevelsAreDerivedFromTheRecordID(t *testing.T) {
 	// zero should hold the overwhelming majority.
 	counts := map[int]int{}
 	for range 100000 {
-		counts[levelOf(id.New(), 16)]++
+		counts[levelOf(vector.Key{ID: id.New()}, 16)]++
 	}
 	if got := float64(counts[0]) / 100000; got < 0.92 || got > 0.96 {
 		t.Fatalf("%.3f of nodes landed on layer zero, want about 1-1/16", got)

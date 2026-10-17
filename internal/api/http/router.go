@@ -52,6 +52,9 @@ type Deps struct {
 	// retention overrides" rather than 404, so "not built" and "wrong URL" stay
 	// distinguishable.
 	Policies PolicyStore
+	// Users is the store of users and their tokens, administered under
+	// /tenants/{id}/users. Nil answers those routes by name.
+	Users UserStore
 	// PolicyCache is the scheduler's cached view of those overrides. This is
 	// the one surface that changes one, so it is the one that drops the cache.
 	PolicyCache interface{ Invalidate(tenant.ID) }
@@ -168,6 +171,20 @@ func NewRouter(d Deps) http.Handler {
 		// over from the last request is a mistake with no undo.
 		{"GET " + APIPrefix + "/tenants/{id}/policies", "list_policies", d.listPolicies, false},
 		{"PATCH " + APIPrefix + "/tenants/{id}/policies", "patch_policies", d.patchPolicies, false},
+
+		// Users and their tokens belong to a tenant, so the tenant is in the
+		// path for the reason it is for policies. Only a credential not bound to
+		// a tenant administers them; a user token cannot, including its own.
+		// DELETE on a user is registered so it can refuse by name: a user is
+		// never deleted.
+		{"GET " + APIPrefix + "/tenants/{id}/users", "list_users", d.listUsers, false},
+		{"POST " + APIPrefix + "/tenants/{id}/users", "create_user", d.createUser, false},
+		{"GET " + APIPrefix + "/tenants/{id}/users/{user}", "get_user", d.getUser, false},
+		{"PATCH " + APIPrefix + "/tenants/{id}/users/{user}", "update_user", d.patchUser, false},
+		{"DELETE " + APIPrefix + "/tenants/{id}/users/{user}", "delete_user", d.deleteUser, false},
+		{"GET " + APIPrefix + "/tenants/{id}/users/{user}/tokens", "list_tokens", d.listTokens, false},
+		{"POST " + APIPrefix + "/tenants/{id}/users/{user}/tokens", "issue_token", d.issueToken, false},
+		{"DELETE " + APIPrefix + "/tenants/{id}/users/{user}/tokens/{token}", "revoke_token", d.revokeToken, false},
 
 		// Administration. Every one of these needs a credential that is not
 		// bound to one tenant, and acts on the tenant the request resolved to

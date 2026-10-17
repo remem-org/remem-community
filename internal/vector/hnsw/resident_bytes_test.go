@@ -64,20 +64,20 @@ func TestResidentBytesMatchesARecountAfterEveryOperation(t *testing.T) {
 			switch op := rapid.IntRange(0, 9).Draw(rt, "op"); {
 			case op < 6 || len(live) == 0:
 				rid := newID()
-				if _, err := g.insert(rid, vec()); err != nil {
+				if _, err := g.insert(vector.Key{ID: rid}, vec()); err != nil {
 					rt.Fatalf("insert: %v", err)
 				}
 				live = append(live, rid)
 				check(fmt.Sprintf("insert %d", i))
 			case op < 8:
 				rid := live[rapid.IntRange(0, len(live)-1).Draw(rt, "replace")]
-				if _, err := g.insert(rid, vec()); err != nil {
+				if _, err := g.insert(vector.Key{ID: rid}, vec()); err != nil {
 					rt.Fatalf("replace: %v", err)
 				}
 				check(fmt.Sprintf("replacement %d", i))
 			default:
 				k := rapid.IntRange(0, len(live)-1).Draw(rt, "remove")
-				g.remove(g.byID[live[k]])
+				g.remove(g.byID[vector.Key{ID: live[k]}])
 				live = append(live[:k], live[k+1:]...)
 				check(fmt.Sprintf("removal %d", i))
 			}
@@ -101,7 +101,7 @@ func BenchmarkResidentBytes(b *testing.B) {
 		for i := range nodes {
 			var rid id.ID
 			binary.BigEndian.PutUint64(rid[8:16], uint64(i)+1)
-			if _, err := g.insert(rid, r.unit(16)); err != nil {
+			if _, err := g.insert(vector.Key{ID: rid}, r.unit(16)); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -132,7 +132,7 @@ func TestAMaterialisedOrRebuiltGraphIsChargedItsRecount(t *testing.T) {
 	t.Cleanup(func() { _ = kv.Close() })
 	first := resumeIndex(t, kv)
 	for i := range ids {
-		if err := first.Insert(ctx, tid, ids[i], vecs[i]); err != nil {
+		if err := first.Insert(ctx, tid, ids[i], vector.Single(vecs[i])); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -189,7 +189,7 @@ func TestAFailedNodeRecordCommitIsStillCharged(t *testing.T) {
 	kv := memkv.New()
 	x := resumeIndex(t, kv)
 	for i := range 100 {
-		if err := x.Insert(ctx, tid, ids[i], vecs[i]); err != nil {
+		if err := x.Insert(ctx, tid, ids[i], vector.Single(vecs[i])); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -212,7 +212,7 @@ func TestAFailedNodeRecordCommitIsStillCharged(t *testing.T) {
 
 	_, before := x.Resident()
 	for i := 100; i < 200; i++ {
-		if err := x.Indexed(ctx, tid, ids[i], vecs[i]); err == nil {
+		if err := x.Indexed(ctx, tid, ids[i], vector.Single(vecs[i])); err == nil {
 			t.Fatal("a node-record commit against a closed store succeeded")
 		}
 	}

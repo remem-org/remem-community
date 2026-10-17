@@ -34,13 +34,23 @@ differential harness is named; `test/differential/COVERAGE.md` has the runs.
 | §8 CLEANUP_AGE_DAYS | `30` days | reproduced | `TestLifecycleConstantsAreRustsNumbers`, `TestBuiltinsMatchTheRustConstants` |
 | §8 FLASHBULB_AROUSAL_THRESHOLD | `arousal >= 0.8` | reproduced | `TestLifecycleConstantsAreRustsNumbers`, `TestFlashbulbPromotionOverridesTheRequestedPolicy`; compared live by the lifecycle surface |
 | §8 FLASHBULB_PROTECTION_MS | thirty days | reproduced | `TestLifecycleConstantsAreRustsNumbers`, `TestFlashbulbPromotionOverridesTheRequestedPolicy` |
-| §8 auto_discovery_threshold | `0.7` | reproduced | `TestDiscoveryDefaultsAreRustsNumbers`. The number is Rust's; the quantity compared against it is Go's cosine, not Rust's `1/(1+d)`, which is §II.10 row 17 |
+| §8 auto_discovery_threshold | `0.7` | diverged | §II.10 row 17. The quantity is Go's cosine, not Rust's `1/(1+d)`, and since `passage-vectors` the number is Go's too: `0.6`, the middle of the gap between paraphrases (0.670 and above) and topic-mates (0.518 and below) measured in `pplx-embed-context-v1-0.6b`'s space, where 0.7 would miss a paraphrase (`TestTheDiscoveryThresholdIsTheOneMeasuredForThisModel`). The meaning of `similar_to` was kept and the number moved to keep it |
 | §8 auto_discovery_top_k | `5` | reproduced | `TestDiscoveryDefaultsAreRustsNumbers` |
 | §8 rrf_k | `60` | reproduced | `TestFixedConstantsAreTheDefaults`, `TestFusionMatchesTheRustRanking` |
 | §8 widen_max_factor | `32` | reproduced | `TestFixedConstantsAreTheDefaults`, `TestTruncatedIsSetAtTheWideningBound` |
 | §8 list_max_factor | `128`, deliberately larger than the search bound | reproduced | `TestFixedConstantsAreTheDefaults`, `TestAListingWidensToItsOwnBound`, `TestAListingWidensFurtherThanASearch` — **changed in Phase 13**: Go shared the search's 32 until `4fb13c9` |
 | §8 DEFAULT_RUN_BUDGET | `10_000` | reproduced | `TestLifecycleConstantsAreRustsNumbers` |
 | §8 SWEEP_EFFORT_FACTOR | `8` | reproduced | `TestLifecycleConstantsAreRustsNumbers` |
+
+## The embedding model
+
+Not a baseline entry, because the baseline records behaviour and this is a
+model. A parity claim still has to account for it: no vector, score or
+similarity is comparable across the two implementations.
+
+| Behaviour | Status | Evidence |
+|---|---|---|
+| Rust embeds each memory once with all-MiniLM-L6-v2, CLS-pooled, 384 wide, from its first 128 tokens | diverged | §II.10 row 16. Phase 3 diverged on pooling alone. Since `passage-vectors`, Go runs a **different model**: `pplx-embed-context-v1-0.6b`, mean-pooled with the model's int8 output rule, 1,024 wide, every memory embedded whole as contextual passages. A Rust snapshot's vectors are recomputed on import (`TestAForeignSnapshotsVectorsAreReEmbedded`), and importing them verbatim is refused (`TestImportingForeignVectorsVerbatimIsRefusedByName`). The differential harness compares orderings and behaviour, never vectors or absolute scores |
 
 ## Found in Phase 13, beyond the baseline
 

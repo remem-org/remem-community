@@ -59,11 +59,28 @@ func TestInfrastructureDependenciesStayInTheirAdapters(t *testing.T) {
 func TestDomainDoesNotImportAPI(t *testing.T) {
 	domain := []string{"internal/record", "internal/memory", "internal/graph",
 		"internal/vector", "internal/query", "internal/lifecycle", "internal/attr",
-		"internal/text", "internal/jobs", "internal/events"}
+		"internal/text", "internal/jobs", "internal/events", "internal/users"}
 	for _, pkg := range domain {
 		for _, imp := range importsOf(t, pkg) {
 			if strings.HasPrefix(imp, modulePath+"internal/api") {
 				t.Errorf("%s imports %s — dependencies point inward (spec §6)", pkg, imp)
+			}
+		}
+	}
+}
+
+// internal/auth turns a credential into a principal and knows nothing about
+// where credentials are kept. Stored user tokens are verified by internal/users
+// and composed with the configured keyring in the composition root; an auth
+// that imported users, or storage directly, would make every package that
+// reads a principal depend on the key space.
+func TestAuthDoesNotImportStorage(t *testing.T) {
+	forbidden := []string{"internal/users", "internal/storage", "internal/txn", "internal/keys"}
+	for _, imp := range importsOf(t, "internal/auth") {
+		for _, f := range forbidden {
+			if imp == modulePath+f || strings.HasPrefix(imp, modulePath+f+"/") {
+				t.Errorf("internal/auth imports %s — stored credentials are verified by internal/users, "+
+					"which the composition root composes with the keyring", imp)
 			}
 		}
 	}

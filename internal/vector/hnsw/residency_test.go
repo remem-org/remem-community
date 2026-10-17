@@ -10,6 +10,7 @@ import (
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/hnsw"
 )
 
@@ -38,7 +39,7 @@ func TestResidencyEvictsUnderBudget(t *testing.T) {
 	for i := range tenants {
 		tn := tenant.ID(fmt.Sprintf("tenant-%02d", i))
 		for range perTenant {
-			if err := idx.Insert(ctx, tn, id.New(), rng.unit(dim)); err != nil {
+			if err := idx.Insert(ctx, tn, id.New(), vector.Single(rng.unit(dim))); err != nil {
 				t.Fatalf("%s: %v", tn, err)
 			}
 		}
@@ -46,7 +47,7 @@ func TestResidencyEvictsUnderBudget(t *testing.T) {
 		// correctly" is a fact rather than a recall estimate.
 		want := id.New()
 		q := rng.unit(dim)
-		if err := idx.Insert(ctx, tn, want, q); err != nil {
+		if err := idx.Insert(ctx, tn, want, vector.Single(q)); err != nil {
 			t.Fatalf("%s: %v", tn, err)
 		}
 		nearest[tn] = want
@@ -92,7 +93,7 @@ func TestConcurrentInsertAndSearch(t *testing.T) {
 	// Seeded so readers have something to walk from the first moment.
 	seed := newTestRNG(29)
 	for range 200 {
-		if err := idx.Insert(ctx, "acme", id.New(), seed.unit(8)); err != nil {
+		if err := idx.Insert(ctx, "acme", id.New(), vector.Single(seed.unit(8))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -114,7 +115,7 @@ func TestConcurrentInsertAndSearch(t *testing.T) {
 			defer wg.Done()
 			r := newTestRNG(uint64(100 + w))
 			for time.Now().Before(deadline) {
-				if err := idx.Insert(ctx, "acme", id.New(), r.unit(8)); err != nil {
+				if err := idx.Insert(ctx, "acme", id.New(), vector.Single(r.unit(8))); err != nil {
 					errCh <- err
 					return
 				}

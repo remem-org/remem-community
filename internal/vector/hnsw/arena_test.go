@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
@@ -27,10 +28,10 @@ func TestEverySlotKeepsItsOwnVectorAcrossGrowth(t *testing.T) {
 	for i := range count {
 		rid := digestID(uint64(i) + 1)
 		v := []float32{float32(i), float32(i) * 2, float32(i) * 3}
-		if _, err := g.insert(rid, v); err != nil {
+		if _, err := g.insert(vector.Key{ID: rid}, v); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
-		want[g.byID[rid]] = v
+		want[g.byID[vector.Key{ID: rid}]] = v
 	}
 	if len(g.chunks) < 2 {
 		t.Fatalf("%d vectors fit in %d chunk(s): the arena never chunked", count, len(g.chunks))
@@ -66,7 +67,7 @@ func TestARemovedSlotIsHandedOutAgain(t *testing.T) {
 	ids := make([]id.ID, corpus)
 	for i := range ids {
 		ids[i] = digestID(uint64(i) + 1)
-		if _, err := g.insert(ids[i], rng.unit(8)); err != nil {
+		if _, err := g.insert(vector.Key{ID: ids[i]}, rng.unit(8)); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -75,10 +76,10 @@ func TestARemovedSlotIsHandedOutAgain(t *testing.T) {
 		t.Fatalf("%d vectors took %d slots, want one each", corpus, grown)
 	}
 	for _, rid := range ids {
-		g.remove(g.byID[rid])
+		g.remove(g.byID[vector.Key{ID: rid}])
 	}
 	for i := range corpus {
-		if _, err := g.insert(digestID(uint64(1<<20+i)), rng.unit(8)); err != nil {
+		if _, err := g.insert(vector.Key{ID: digestID(uint64(1<<20 + i))}, rng.unit(8)); err != nil {
 			t.Fatalf("re-insert %d: %v", i, err)
 		}
 	}

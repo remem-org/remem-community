@@ -313,7 +313,22 @@ func New(kv storage.KV, repo record.Repo, index vector.Index, embedder embedding
 // relaying a demand for a field it does not have.
 func (s *Service) CallerSuppliedVectors() bool { return embedding.CallerSupplied(s.embedder) }
 
-// indexed tells a derived vector index that a canonical vector has committed.
+// indexEntries is a memory's entry set under the index-entry rule
+// (openspec/changes/passage-vectors, design decision 4): its passages when it
+// has any, and otherwise its canonical vector, as passage 0. A multi-passage
+// memory's canonical vector is its document vector and is no entry.
+func indexEntries(canonical []float32, passages *record.PassageSet) []vector.Entry {
+	if passages == nil || len(passages.Rows) == 0 {
+		return vector.Single(canonical)
+	}
+	out := make([]vector.Entry, len(passages.Rows))
+	for i, row := range passages.Rows {
+		out[i] = vector.Entry{Passage: uint32(i), Vector: row.Vector.Values}
+	}
+	return out
+}
+
+// indexed tells a derived vector index that a memory's rows have committed.
 //
 // It runs after the commit and its error is deliberately not returned. Plan
 // §II.4 makes the vector index the one asynchronously maintained index for
@@ -323,11 +338,11 @@ func (s *Service) CallerSuppliedVectors() bool { return embedding.CallerSupplied
 // tenant is next materialised — and the index marks itself degraded, so a
 // search that cannot see the memory says its answer may be incomplete rather
 // than implying the memory is not there.
-func (s *Service) indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32) {
+func (s *Service) indexed(ctx context.Context, t tenant.ID, rid id.ID, entries []vector.Entry) {
 	if s.maintain == nil {
 		return
 	}
-	_ = s.maintain.Indexed(ctx, t, rid, v)
+	_ = s.maintain.Indexed(ctx, t, rid, entries)
 }
 
 // removed tells a derived vector index that a canonical vector has been

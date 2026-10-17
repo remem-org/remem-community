@@ -9,6 +9,7 @@ import (
 	"github.com/remem-org/remem-go/internal/discovery"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/tenant"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/indexes"
 	"github.com/remem-org/remem-go/internal/vector/indexqueue"
 )
@@ -135,9 +136,9 @@ func (w *asyncWorld) storeTwoParaphrasesAndQueueTheirInserts(t *testing.T) (a, b
 	ctx := context.Background()
 	first := w.store(t, "acme", "first paraphrase", unit(0))
 	second := w.store(t, "acme", "second paraphrase", unit(0))
-	must(t, w.queue.Indexed(ctx, "acme", first.rid, unit(0)))
+	must(t, w.queue.Indexed(ctx, "acme", first.rid, vector.Single(unit(0))))
 	<-w.block.started
-	must(t, w.queue.Indexed(ctx, "acme", second.rid, unit(0)))
+	must(t, w.queue.Indexed(ctx, "acme", second.rid, vector.Single(unit(0))))
 	return first.rid, second.rid
 }
 
@@ -205,7 +206,7 @@ type blockingIndex struct {
 	gate    chan struct{}
 }
 
-func (x *blockingIndex) Indexed(ctx context.Context, tid tenant.ID, rid id.ID, v []float32) error {
+func (x *blockingIndex) Indexed(ctx context.Context, tid tenant.ID, rid id.ID, v []vector.Entry) error {
 	select {
 	case x.started <- struct{}{}:
 	default:

@@ -7,15 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/remem-org/remem-go/internal/clock"
 	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/embedding/onnx"
 	"github.com/remem-org/remem-go/internal/memory"
-	"github.com/remem-org/remem-go/internal/record"
-	"github.com/remem-org/remem-go/internal/storage/memkv"
-	"github.com/remem-org/remem-go/internal/vector"
-	"github.com/remem-org/remem-go/internal/vector/distance"
-	"github.com/remem-org/remem-go/internal/vector/flat"
 )
 
 // realEmbedder opens the actual model, skipping when it has not been fetched.
@@ -23,9 +17,9 @@ func realEmbedder(t *testing.T) embedding.Embedder {
 	t.Helper()
 	path := os.Getenv("REMEM_EMBEDDING_MODEL_PATH")
 	if path == "" {
-		path = filepath.Join("..", "..", ".models", "all-MiniLM-L6-v2")
+		path = filepath.Join("..", "..", ".models", "pplx-embed-context-v1-0.6b")
 	}
-	if _, err := os.Stat(filepath.Join(path, "model.onnx")); err != nil {
+	if _, err := os.Stat(filepath.Join(path, "onnx", "model.onnx")); err != nil {
 		t.Skipf("no model at %s; run scripts/fetch-model.sh", path)
 	}
 	e, err := onnx.Open(onnx.Config{
@@ -54,11 +48,11 @@ func realEmbedder(t *testing.T) embedding.Embedder {
 // suite fast and machine-independent while still asserting the thing a user
 // actually cares about, which is that a search understands a synonym.
 func TestSemanticSearchRanksByCosine(t *testing.T) {
-	kv := memkv.New()
-	t.Cleanup(func() { _ = kv.Close() })
-	svc := memory.New(kv, record.NewRepo(kv), flat.New(vector.NewStore(kv), distance.L2),
-		realEmbedder(t), clock.NewFake(clock.FakeStart), attr.MustTable(),
-		graph.NewService(kv, clock.NewFake(clock.FakeStart)), memory.Config{})
+	// newService wires the indexes the server does. This test once built its
+	// own repository without the attribute indexer, and search's archived
+	// filter, which reads the attribute row, then rejected every candidate: it
+	// returned nothing, and nobody saw, because nothing compiled this file.
+	svc := newService(t, withEmbedder(realEmbedder(t)))
 
 	ids := seed(t, svc, "cats are mammals", "dogs are mammals", "quantum chromodynamics")
 
@@ -88,11 +82,11 @@ func TestSemanticSearchRanksByCosine(t *testing.T) {
 // usable. Assert it end to end: an unrelated memory must score low enough that
 // a caller can reject it by number.
 func TestAnUnrelatedMemoryScoresLowEnoughToThreshold(t *testing.T) {
-	kv := memkv.New()
-	t.Cleanup(func() { _ = kv.Close() })
-	svc := memory.New(kv, record.NewRepo(kv), flat.New(vector.NewStore(kv), distance.L2),
-		realEmbedder(t), clock.NewFake(clock.FakeStart), attr.MustTable(),
-		graph.NewService(kv, clock.NewFake(clock.FakeStart)), memory.Config{})
+	// newService wires the indexes the server does. This test once built its
+	// own repository without the attribute indexer, and search's archived
+	// filter, which reads the attribute row, then rejected every candidate: it
+	// returned nothing, and nobody saw, because nothing compiled this file.
+	svc := newService(t, withEmbedder(realEmbedder(t)))
 
 	seed(t, svc, "the deployment pipeline runs on Tuesdays")
 

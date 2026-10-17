@@ -84,6 +84,20 @@ type SearchResult struct {
 	// the request asked to explain, because it is bytes every caller would
 	// otherwise pay for on every search.
 	Sources []SourceScore `json:"sources,omitempty"`
+
+	// Passage is the passage whose vector ranked this memory, on a semantic or
+	// hybrid result with vector evidence; absent on a keyword-only one, rather
+	// than null or empty. It says where the match was strongest, not that the
+	// answer lies inside it.
+	Passage *PassageSpan `json:"passage,omitempty"`
+}
+
+// PassageSpan is one passage of a memory's content: its number, 0 for the
+// first, and the UTF-8 byte range it covers, [start, end).
+type PassageSpan struct {
+	Index uint32 `json:"index"`
+	Start uint32 `json:"start"`
+	End   uint32 `json:"end"`
 }
 
 // SourceScore is one index's evidence for one memory.
@@ -98,6 +112,9 @@ type SourceScore struct {
 	Rank int `json:"rank"`
 	// Distance is the raw metric value for a vector contribution.
 	Distance float32 `json:"distance,omitempty"`
+	// Passage is the passage a vector contribution came from, and absent on
+	// any other source. A pointer, because passage 0 is an answer.
+	Passage *uint32 `json:"passage,omitempty"`
 }
 
 // searchMemories is POST rather than GET, and the reason is not REST
@@ -152,9 +169,26 @@ func (d Deps) searchMemories(w http.ResponseWriter, r *http.Request) {
 			Score:      r.Score,
 			FusedScore: r.FusedScore,
 			Sources:    toSourceScores(r.Sources),
+			Passage:    toPassageSpan(r.Passage),
 		}
 	}
 	writeJSON(w, r, http.StatusOK, out)
+}
+
+func toPassageSpan(p *memory.PassageMatch) *PassageSpan {
+	if p == nil {
+		return nil
+	}
+	return &PassageSpan{Index: p.Index, Start: p.Start, End: p.End}
+}
+
+// sourcePassage is the passage of a vector source, and nil for any other.
+func sourcePassage(s memory.SourceScore) *uint32 {
+	if s.Source != "vector" {
+		return nil
+	}
+	p := s.Passage
+	return &p
 }
 
 func toSourceScores(in []memory.SourceScore) []SourceScore {
@@ -163,7 +197,8 @@ func toSourceScores(in []memory.SourceScore) []SourceScore {
 	}
 	out := make([]SourceScore, len(in))
 	for i, s := range in {
-		out[i] = SourceScore{Source: s.Source, Score: s.Score, Rank: s.Rank, Distance: s.Distance}
+		out[i] = SourceScore{Source: s.Source, Score: s.Score, Rank: s.Rank, Distance: s.Distance,
+			Passage: sourcePassage(s)}
 	}
 	return out
 }

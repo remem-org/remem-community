@@ -368,6 +368,97 @@ func (x *Event) GetAfter() map[string]string {
 	return nil
 }
 
+// User is one user of a tenant (section 41, go.users).
+//
+// A user is canonical identity: audit events name it as their actor by id, and
+// a restore that dropped users would leave history pointing at nobody. A user
+// never carries a token. Tokens are credentials, and a snapshot is a portable
+// file, so every token is reissued after a restore rather than travelling in
+// one. The name index is not carried either; it is rebuilt from these rows.
+type User struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Tenant          string                 `protobuf:"bytes,1,opt,name=tenant,proto3" json:"tenant,omitempty"`
+	Id              []byte                 `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
+	Name            string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`   // as the operator wrote it
+	State           string                 `protobuf:"bytes,4,opt,name=state,proto3" json:"state,omitempty"` // "active" or "disabled"
+	CreatedAtUnixMs uint64                 `protobuf:"varint,5,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
+	UpdatedAtUnixMs uint64                 `protobuf:"varint,6,opt,name=updated_at_unix_ms,json=updatedAtUnixMs,proto3" json:"updated_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *User) Reset() {
+	*x = User{}
+	mi := &file_snapshotext_v1_snapshot_ext_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *User) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*User) ProtoMessage() {}
+
+func (x *User) ProtoReflect() protoreflect.Message {
+	mi := &file_snapshotext_v1_snapshot_ext_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use User.ProtoReflect.Descriptor instead.
+func (*User) Descriptor() ([]byte, []int) {
+	return file_snapshotext_v1_snapshot_ext_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *User) GetTenant() string {
+	if x != nil {
+		return x.Tenant
+	}
+	return ""
+}
+
+func (x *User) GetId() []byte {
+	if x != nil {
+		return x.Id
+	}
+	return nil
+}
+
+func (x *User) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *User) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *User) GetCreatedAtUnixMs() uint64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *User) GetUpdatedAtUnixMs() uint64 {
+	if x != nil {
+		return x.UpdatedAtUnixMs
+	}
+	return 0
+}
+
 var File_snapshotext_v1_snapshot_ext_proto protoreflect.FileDescriptor
 
 const file_snapshotext_v1_snapshot_ext_proto_rawDesc = "" +
@@ -408,7 +499,14 @@ const file_snapshotext_v1_snapshot_ext_proto_rawDesc = "" +
 	"\n" +
 	"AfterEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B7Z5github.com/remem-org/remem-go/internal/snapshot/pbextb\x06proto3"
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb2\x01\n" +
+	"\x04User\x12\x16\n" +
+	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\fR\x02id\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x14\n" +
+	"\x05state\x18\x04 \x01(\tR\x05state\x12+\n" +
+	"\x12created_at_unix_ms\x18\x05 \x01(\x04R\x0fcreatedAtUnixMs\x12+\n" +
+	"\x12updated_at_unix_ms\x18\x06 \x01(\x04R\x0fupdatedAtUnixMsB7Z5github.com/remem-org/remem-go/internal/snapshot/pbextb\x06proto3"
 
 var (
 	file_snapshotext_v1_snapshot_ext_proto_rawDescOnce sync.Once
@@ -422,20 +520,21 @@ func file_snapshotext_v1_snapshot_ext_proto_rawDescGZIP() []byte {
 	return file_snapshotext_v1_snapshot_ext_proto_rawDescData
 }
 
-var file_snapshotext_v1_snapshot_ext_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_snapshotext_v1_snapshot_ext_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_snapshotext_v1_snapshot_ext_proto_goTypes = []any{
 	(*RecordExt)(nil), // 0: snapshotext.v1.RecordExt
 	(*EdgeExt)(nil),   // 1: snapshotext.v1.EdgeExt
 	(*TenantExt)(nil), // 2: snapshotext.v1.TenantExt
 	(*Event)(nil),     // 3: snapshotext.v1.Event
-	nil,               // 4: snapshotext.v1.EdgeExt.MetaEntry
-	nil,               // 5: snapshotext.v1.Event.BeforeEntry
-	nil,               // 6: snapshotext.v1.Event.AfterEntry
+	(*User)(nil),      // 4: snapshotext.v1.User
+	nil,               // 5: snapshotext.v1.EdgeExt.MetaEntry
+	nil,               // 6: snapshotext.v1.Event.BeforeEntry
+	nil,               // 7: snapshotext.v1.Event.AfterEntry
 }
 var file_snapshotext_v1_snapshot_ext_proto_depIdxs = []int32{
-	4, // 0: snapshotext.v1.EdgeExt.meta:type_name -> snapshotext.v1.EdgeExt.MetaEntry
-	5, // 1: snapshotext.v1.Event.before:type_name -> snapshotext.v1.Event.BeforeEntry
-	6, // 2: snapshotext.v1.Event.after:type_name -> snapshotext.v1.Event.AfterEntry
+	5, // 0: snapshotext.v1.EdgeExt.meta:type_name -> snapshotext.v1.EdgeExt.MetaEntry
+	6, // 1: snapshotext.v1.Event.before:type_name -> snapshotext.v1.Event.BeforeEntry
+	7, // 2: snapshotext.v1.Event.after:type_name -> snapshotext.v1.Event.AfterEntry
 	3, // [3:3] is the sub-list for method output_type
 	3, // [3:3] is the sub-list for method input_type
 	3, // [3:3] is the sub-list for extension type_name
@@ -454,7 +553,7 @@ func file_snapshotext_v1_snapshot_ext_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_snapshotext_v1_snapshot_ext_proto_rawDesc), len(file_snapshotext_v1_snapshot_ext_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -448,11 +448,12 @@ func (h *listHarness) write(t *testing.T, content string, importance, health flo
 // so the index compares vectors of one width from one model.
 func (h *listHarness) embed(t *testing.T, content string) *vector.Vector {
 	t.Helper()
-	vs, err := h.embedder.Embed(context.Background(), []string{content})
+	docs, err := h.embedder.EmbedDocuments(context.Background(), []string{content})
 	if err != nil {
 		t.Fatalf("embedding a seed record: %v", err)
 	}
-	return &vector.Vector{ModelID: h.embedder.ModelID(), Dim: len(vs[0]), Values: vs[0]}
+	v := docs[0].Vector
+	return &vector.Vector{ModelID: h.embedder.ModelID(), Dim: len(v), Values: v}
 }
 
 // pageAll walks a listing to its end and returns the ids in order.

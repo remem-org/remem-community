@@ -93,10 +93,13 @@ provider = "onnx"
 external_model_id = ""
 # Fixed: vectors from another model are not comparable with the stored ones,
 # which is why every vector records the model that produced it.
-model = "all-MiniLM-L6-v2"
+model = "pplx-embed-context-v1-0.6b"
 model_path = ""
+# How many sequences one forward pass holds. A pass is also bounded by tokens, so
+# a full 4,096-token segment of a long memory always runs alone; batching pays
+# for queries and short memories. How content is cut into passages is not a
+# setting: it decides what is written to disk.
 batch_size = 32
-max_sequence_tokens = 256
 # ONNX Runtime's parallelism within one inference. Zero derives it from the
 # CPUs this process may use, which respects a container's CPU quota and an
 # explicit GOMAXPROCS; ONNX Runtime's own default counts the host's cores and
@@ -107,9 +110,9 @@ max_sequence_tokens = 256
 intra_op_threads = 0
 
 [vector]
-# 384 is all-MiniLM-L6-v2's output width. Changing one without the other is
-# refused at startup.
-dimension = 384
+# 1024 is pplx-embed-context-v1-0.6b's output width. Changing one without the
+# other is refused at startup.
+dimension = 1024
 # "flat" is exact; "hnsw" is approximate and arrives in Phase 7.
 index = "flat"
 metric = "cosine"
@@ -118,8 +121,8 @@ hnsw_ef_construction = 200
 hnsw_ef_search = 64
 # Index maintenance off the request path. A create commits its canonical vector
 # and queues the index work, so the response no longer waits for a graph insert
-# and a second commit — about a millisecond at 384 dimensions, and the tenant's
-# graph write lock with it.
+# and a second commit — about a millisecond at 384 dimensions under the previous
+# model, and the tenant's graph write lock with it.
 #
 # Off by default, because the trade-off is visible to every caller: a new memory
 # becomes vector-searchable only *after* the queue applies it, so a search

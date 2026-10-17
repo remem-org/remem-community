@@ -7,6 +7,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/storage/pebble"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"github.com/remem-org/remem-go/internal/vector/hnsw"
 )
@@ -40,7 +41,7 @@ func BenchmarkIndexedPebble(b *testing.B) {
 
 	b.ResetTimer()
 	for i := range b.N {
-		if err := ix.Indexed(ctx, benchTenant, id.New(), vecs[i%len(vecs)]); err != nil {
+		if err := ix.Indexed(ctx, benchTenant, id.New(), vector.Single(vecs[i%len(vecs)])); err != nil {
 			b.Fatal(err)
 		}
 	}

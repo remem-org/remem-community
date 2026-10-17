@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/remem-org/remem-go/internal/storage/memkv"
+	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/indexes"
 	"github.com/remem-org/remem-go/internal/vector/indexqueue"
@@ -17,9 +17,7 @@ import (
 // Indexed and Removed are deferred, and the suite does not call them: they are
 // the write path's, and it has Flush.
 func TestTheWrappedIndexStillSatisfiesTheContract(t *testing.T) {
-	vectortest.Run(t, func(t *testing.T) vector.Index {
-		kv := memkv.New()
-		t.Cleanup(func() { _ = kv.Close() })
+	vectortest.Run(t, func(t *testing.T, kv storage.KV) vector.Index {
 		idx, err := indexes.Open(kv, indexes.Config{
 			Kind: "hnsw", Metric: "l2", Neighbours: 16,
 			BuildEffort: 200, SearchEffort: 64, ResidentBudgetBytes: 64 << 20,

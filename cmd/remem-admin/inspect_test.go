@@ -191,3 +191,21 @@ func captureRun(t *testing.T, args ...string) (string, int, error) {
 	}
 	return b.String(), code, runErr
 }
+
+// A passage key names its record and its number; its value holds a span of the
+// memory's content and a vector, neither of which is shown.
+func TestInspectKeyDescribesAPassage(t *testing.T) {
+	kv := memkv.New()
+	ids := seedInspectable(t, kv, "acme", 1)
+	key := keys.Passage("acme", tenant.DefaultNamespace, ids[0], 3)
+
+	desc, err := describeKey(context.Background(), kv, hex.EncodeToString(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"passage", "derived", "passage    3 of record " + ids[0].String()} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("the description lacks %q:\n%s", want, desc)
+		}
+	}
+}

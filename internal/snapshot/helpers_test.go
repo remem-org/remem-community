@@ -18,6 +18,7 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant/tenantkv"
 	"github.com/remem-org/remem-go/internal/text"
 	"github.com/remem-org/remem-go/internal/txn"
+	"github.com/remem-org/remem-go/internal/users"
 	"github.com/remem-org/remem-go/internal/vector"
 )
 
@@ -39,6 +40,7 @@ type world struct {
 	events *events.Store
 	dir    *tenantkv.Directory
 	clk    *clock.Fake
+	users  *users.Service
 }
 
 func newWorld(t *testing.T) *world {
@@ -49,7 +51,8 @@ func newWorld(t *testing.T) *world {
 
 	repo := record.NewRepo(kv,
 		record.WithIndexer(attr.NewIndexer(attr.MustTable())),
-		record.WithIndexer(text.New()))
+		record.WithIndexer(text.New()),
+		record.WithIndexer(record.NewPassageIndexer()))
 	return &world{
 		kv:     kv,
 		repo:   repo,
@@ -57,6 +60,7 @@ func newWorld(t *testing.T) *world {
 		events: events.NewStore(kv),
 		dir:    tenantkv.New(kv, clk),
 		clk:    clk,
+		users:  users.New(kv, clk),
 	}
 }
 
@@ -125,7 +129,7 @@ func (w *world) store(t *testing.T, tid tenant.ID, content string, opts ...memoO
 		},
 		SchemaVersion: 1,
 		Vectors: map[string]*vector.Vector{
-			record.VectorContent: {ModelID: "test-model", Dim: 4, Values: vectorFor(rid)},
+			record.VectorContent: {ModelID: worldModel, Dim: worldDim, Values: vectorFor(rid)},
 		},
 		CreatedAt: w.clk.Now().UTC(),
 		UpdatedAt: w.clk.Now().UTC(),
@@ -138,8 +142,24 @@ func (w *world) store(t *testing.T, tid tenant.ID, content string, opts ...memoO
 	return rid
 }
 
+// worldModel and worldDim are what the test world stamps on every vector: the
+// model this build serves, so a Go snapshot of the world is one this build may
+// take verbatim. Before passages the world used a four-wide "test-model" and
+// relied on an import with no model keeping any Go vector; that rule is gone,
+// because a vector of another model kept verbatim is two spaces in one ranking.
+const (
+	worldModel = embedding.Model
+	worldDim   = embedding.Dim
+)
+
+// vectorFor is a deterministic unit vector of the world's width.
 func vectorFor(rid id.ID) []float32 {
-	return []float32{float32(rid[0]) / 255, float32(rid[1]) / 255, float32(rid[2]) / 255, 1}
+	v := make([]float32, worldDim)
+	for i := range v {
+		v[i] = float32(rid[i%len(rid)]) / 255
+	}
+	v[0] += 1
+	return embedding.Normalise(v)
 }
 
 func (w *world) connect(t *testing.T, tid tenant.ID, from, to id.ID,
@@ -177,6 +197,7 @@ func (w *world) sources() (snapshot.Sources, func()) {
 		Tenants: w.dir,
 		Records: w.repo,
 		Events:  w.events,
+		Users:   w.users,
 	}, func() {
 		_ = snap.Close()
 	}

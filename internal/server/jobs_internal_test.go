@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +40,7 @@ var fixtures = map[jobs.Type]func(*testing.T, *deps, tenant.ID) []byte{
 	TypeTextRebuild:       seedMemories,
 	TypeGraphRebuild:      seedConnectedMemories,
 	TypeAttrRebuild:       seedMemories,
+	TypePassagesRebuild:   seedMemories,
 	TypeJobsReap:          seedFinishedJobs,
 	TypeLifecycleMaintain: seedDueMemories,
 	TypeDiscoverySimilar:  seedNearDuplicates,
@@ -138,6 +140,9 @@ func seedMemories(t *testing.T, d *deps, tid tenant.ID) []byte {
 		"the deployment pipeline runs on a self-hosted runner",
 		"invoice INV-2024-8871 was paid on the third of March",
 		"marzipan recipes from a Bavarian bakery",
+		// Long enough for passages under the fake embedder, so every derived
+		// space this fixture feeds has rows — the passage space included.
+		strings.Repeat("the harbour authority recorded the tide tables for October ", 12),
 	} {
 		if _, err := d.memories.Create(ctx, memory.CreateReq{Content: content}); err != nil {
 			t.Fatalf("seeding a memory: %v", err)
@@ -204,9 +209,14 @@ func seedNearDuplicates(t *testing.T, d *deps, tid tenant.ID) []byte {
 		"the deployment pipeline runs on a self-hosted runner nightly",
 	}
 
-	vectors, err := d.embedding.Embed(ctx, contents)
+	// Discovery compares canonical vectors, which are document vectors.
+	docs, err := d.embedding.EmbedDocuments(ctx, contents)
 	if err != nil {
 		t.Fatal(err)
+	}
+	vectors := make([][]float32, len(docs))
+	for i, doc := range docs {
+		vectors[i] = doc.Vector
 	}
 	cos := 1 - distance.CosineDistance(vectors[0], vectors[1])
 	if cos < d.cfg.Discovery.Threshold {

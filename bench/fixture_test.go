@@ -11,6 +11,7 @@ import (
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
 	"github.com/remem-org/remem-go/internal/config"
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/graph"
 	"github.com/remem-org/remem-go/internal/memory"
 	"github.com/remem-org/remem-go/internal/record"
@@ -37,7 +38,12 @@ type fixedEmbedder struct{}
 func (fixedEmbedder) Dim() int        { return 4 }
 func (fixedEmbedder) ModelID() string { return "benchmark-fixed-4d" }
 
-func (fixedEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+func (e fixedEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([]embedding.Document, error) {
+	vs, err := e.EmbedQueries(ctx, texts)
+	return embedding.WholeDocuments(vs), err
+}
+
+func (fixedEmbedder) EmbedQueries(_ context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
 	for i, t := range texts {
 		v := []float32{1, 0, 0, 0}

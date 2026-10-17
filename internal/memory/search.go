@@ -8,13 +8,17 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/codec"
 	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
+	"github.com/remem-org/remem-go/internal/keys"
 	"github.com/remem-org/remem-go/internal/query"
+	"github.com/remem-org/remem-go/internal/record"
 	"github.com/remem-org/remem-go/internal/tenant"
+	"github.com/remem-org/remem-go/internal/vector"
 )
 
 // Search returns the memories matching a query, best first.
@@ -113,7 +117,7 @@ func (s *Service) search(ctx context.Context, req SearchReq, retainContinuation 
 		if supplied != nil {
 			q.Vector = supplied
 		} else {
-			qs, err := s.embedder.Embed(ctx, []string{req.Query})
+			qs, err := s.embedder.EmbedQueries(ctx, []string{req.Query})
 			if err != nil {
 				return SearchResult{}, err
 			}
@@ -206,6 +210,7 @@ func (s *Service) search(ctx context.Context, req SearchReq, retainContinuation 
 			FusedScore: hit.FusedScore,
 			Distance:   hit.Distance,
 			Sources:    sourcesOf(hit),
+			Passage:    s.passageOf(ctx, reader, t, rec, hit),
 		})
 	}
 	out.HasMore = end < len(session.ranked)
@@ -419,9 +424,48 @@ func sourcesOf(hit query.Hit) []SourceScore {
 			Score:    c.Score,
 			Rank:     c.Rank,
 			Distance: c.Distance,
+			Passage:  c.Passage,
 		})
 	}
 	return out
+}
+
+// passageOf resolves the passage that ranked hit into its span, for the page
+// being returned and nothing else: one point read per result, through the same
+// pinned snapshot the result's body was read through, so the span and the
+// content it bounds are of one version of the memory.
+//
+// A memory indexed by its canonical vector has no passage rows, and its passage
+// 0 is its whole content. A row that is missing for a later passage, or a span
+// that does not fit the content read beside it, is reported as no passage
+// rather than as a wrong one: the index ranks from what it last applied, and a
+// write that landed since is the one case where the two can disagree.
+func (s *Service) passageOf(ctx context.Context, r attr.Reader, t tenant.ID, rec *record.Record, hit query.Hit) *PassageMatch {
+	if !hit.Vector {
+		return nil
+	}
+	b, err := r.Get(ctx, keys.Passage(t, tenant.DefaultNamespace, rec.ID, hit.Passage))
+	if err != nil {
+		if errs.Is(err, errs.NotFound) && hit.Passage == 0 {
+			return &PassageMatch{Index: 0, Start: 0, End: uint32(len(rec.Content))}
+		}
+		return nil
+	}
+	row, err := vector.DecodePassage(b)
+	if err != nil || int(row.End) > len(rec.Content) ||
+		!utf8.RuneStart(byteAt(rec.Content, row.Start)) || !utf8.RuneStart(byteAt(rec.Content, row.End)) {
+		return nil
+	}
+	return &PassageMatch{Index: hit.Passage, Start: row.Start, End: row.End}
+}
+
+// byteAt is content[i], or a rune start at the end of the content, so that an
+// offset equal to the length counts as a character boundary.
+func byteAt(content string, i uint32) byte {
+	if int(i) >= len(content) {
+		return 'a'
+	}
+	return content[i]
 }
 
 // suppliedQueryVector settles a search's query_vector against where this

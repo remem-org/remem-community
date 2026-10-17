@@ -59,13 +59,13 @@ func TestACorruptVectorIsCorruption(t *testing.T) {
 	if err := s.Put(ctx, "acme", ns, rid, sample()); err != nil {
 		t.Fatal(err)
 	}
-	if err := kv.Set(ctx, vector.Key("acme", ns, rid), []byte("not a vector")); err != nil {
+	if err := kv.Set(ctx, vector.CanonicalKey("acme", ns, rid), []byte("not a vector")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Get(ctx, "acme", ns, rid); !errs.Is(err, errs.Corruption) {
 		t.Fatalf("Get = %v, want Corruption", err)
 	}
-	err := s.Scan(ctx, "acme", func(id.ID, []float32) error { return nil })
+	err := s.Scan(ctx, "acme", func(vector.Key, []float32) error { return nil })
 	if !errs.Is(err, errs.Corruption) {
 		t.Fatalf("Scan = %v, want Corruption", err)
 	}
@@ -127,8 +127,8 @@ func TestScanIsTenantScopedAndOrdered(t *testing.T) {
 	}
 
 	var seen []id.ID
-	if err := s.Scan(ctx, "acme", func(rid id.ID, _ []float32) error {
-		seen = append(seen, rid)
+	if err := s.Scan(ctx, "acme", func(k vector.Key, _ []float32) error {
+		seen = append(seen, k.ID)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -153,7 +153,7 @@ func TestScanStopsAtTheCallbacksError(t *testing.T) {
 	}
 	boom := errors.New("stop")
 	n := 0
-	err := s.Scan(ctx, "acme", func(id.ID, []float32) error {
+	err := s.Scan(ctx, "acme", func(vector.Key, []float32) error {
 		n++
 		if n == 2 {
 			return boom
@@ -170,7 +170,7 @@ func TestScanStopsAtTheCallbacksError(t *testing.T) {
 
 func TestAnUnscopedScanIsRefused(t *testing.T) {
 	s, _ := newStore(t)
-	err := s.Scan(context.Background(), "", func(id.ID, []float32) error { return nil })
+	err := s.Scan(context.Background(), "", func(vector.Key, []float32) error { return nil })
 	if !errs.Is(err, errs.Invalid) {
 		t.Fatal("Invariant 1: there is no unscoped read path")
 	}

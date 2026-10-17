@@ -28,6 +28,7 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant/tenantkv"
 	"github.com/remem-org/remem-go/internal/text"
 	"github.com/remem-org/remem-go/internal/txn"
+	"github.com/remem-org/remem-go/internal/users"
 )
 
 // The portable snapshot commands.
@@ -93,6 +94,7 @@ func exportCommand(args []string) (int, error) {
 		Tenants: dir,
 		Records: record.NewRepo(kv),
 		Events:  events.NewStore(kv),
+		Users:   users.New(kv, clock.System()),
 	}, f, snapshot.ExportOpts{
 		Compression: compression,
 		PageSize:    *pageSize,
@@ -107,17 +109,17 @@ func exportCommand(args []string) (int, error) {
 	}
 
 	fmt.Printf("exported %d tenant(s), %d record(s), %d vector(s) (%d without one), "+
-		"%d edge(s), %d event(s) to %s in %s\n",
+		"%d edge(s), %d event(s), %d user(s) to %s in %s\n",
 		stats.Tenants, stats.Records, stats.Vectors, stats.MissingVectors,
-		stats.Edges, stats.Events, *out, time.Since(started).Round(time.Millisecond))
+		stats.Edges, stats.Events, stats.Users, *out, time.Since(started).Round(time.Millisecond))
 
 	// What a shared-only export cost, said out loud. Losing user-supplied
 	// annotation quietly is the failure this format exists not to have.
-	if stats.EdgesWithMetaDropped > 0 || stats.EventsDropped > 0 {
+	if stats.EdgesWithMetaDropped > 0 || stats.EventsDropped > 0 || stats.UsersDropped > 0 {
 		fmt.Printf("dropped, because proto/snapshot/v1 has no field for them: "+
-			"metadata on %d connection(s), %d lifecycle audit event(s). "+
+			"metadata on %d connection(s), %d lifecycle audit event(s), %d user(s). "+
 			"Export without --shared-only to keep them.\n",
-			stats.EdgesWithMetaDropped, stats.EventsDropped)
+			stats.EdgesWithMetaDropped, stats.EventsDropped, stats.UsersDropped)
 	}
 	return 0, nil
 }
@@ -135,7 +137,7 @@ func importCommand(args []string) (int, error) {
 		"continue from the cursor a previous run left beside the snapshot")
 	batch := fs.Int("batch", snapshot.DefaultBatchSize, "rows per transaction")
 	modelPath := fs.String("model-path", os.Getenv("REMEM_EMBEDDING_MODEL_PATH"),
-		"the all-MiniLM-L6-v2 directory, for the embeddings an import recomputes")
+		"the pplx-embed-context-v1-0.6b directory, for the embeddings an import recomputes")
 	onnxPath := fs.String("onnx-library-path", os.Getenv("REMEM_EMBEDDING_ONNX_LIBRARY_PATH"),
 		"the ONNX Runtime shared library")
 	provider := fs.String("embedding-provider", envOr("REMEM_EMBEDDING_PROVIDER", config.ProviderONNX),
@@ -236,6 +238,7 @@ func importCommand(args []string) (int, error) {
 	repo := record.NewRepo(kv,
 		record.WithIndexer(attr.NewIndexer(attr.MustTable())),
 		record.WithIndexer(text.New()),
+		record.WithIndexer(record.NewPassageIndexer()),
 		record.WithScheduler(lifecycle.NewScheduler(
 			lifecycle.NewRegistry(dir, policykv.New(kv, clk).Loader()))))
 
@@ -257,6 +260,7 @@ func importCommand(args []string) (int, error) {
 	rep, err := snapshot.Import(ctx, snapshot.Destination{
 		KV: kv, Tenants: dir, Records: repo,
 		Edges: graph.NewStore(kv), Events: events.NewStore(kv), Embedder: embedder,
+		Users: users.New(kv, clock.System()),
 	}, f, snapshot.ImportOpts{
 		OnConflict: mode,
 		Vectors:    policy,
@@ -282,9 +286,13 @@ func importCommand(args []string) (int, error) {
 	}
 	_ = os.Remove(cursorPath)
 
-	fmt.Printf("imported %d record(s), %d edge(s), %d event(s) in %s\n",
-		rep.Stats.Records, rep.Stats.Edges, rep.Stats.Events,
+	fmt.Printf("imported %d record(s), %d edge(s), %d event(s), %d user(s) in %s\n",
+		rep.Stats.Records, rep.Stats.Edges, rep.Stats.Events, rep.Stats.Users,
 		time.Since(started).Round(time.Millisecond))
+	if rep.Stats.Users > 0 {
+		fmt.Println("users keep their ids, names and states, and no token survives a snapshot: " +
+			"issue each one again with `remem-admin tokens issue`")
+	}
 	fmt.Printf("embeddings: %d recomputed, %d taken from the snapshot\n",
 		rep.ReEmbedded, rep.VectorsVerbatim)
 	if rep.Unchanged > 0 || rep.Skipped > 0 {
@@ -384,6 +392,7 @@ func verifyCommand(args []string) (int, error) {
 		Tenants: dir,
 		Records: record.NewRepo(kv),
 		Events:  events.NewStore(kv),
+		Users:   users.New(kv, clock.System()),
 	}, f)
 	if err != nil {
 		return 0, err
@@ -535,26 +544,46 @@ func importEmbedder(header *snapshot.Header, policy snapshot.VectorPolicy,
 
 	needs := policy == snapshot.VectorsReEmbed || (policy == snapshot.VectorsAuto && foreign)
 	if !needs {
-		return nil, nil
+		// Nothing has to be re-embedded, but a memory's passages are derived
+		// from its content by the model, and a snapshot carries none. A build
+		// that has the model computes them during the import; one that does
+		// not imports the canonical vectors as they are and leaves the tenants
+		// marked, and the server computes the passages before it next serves.
+		if !onnx.Available || modelPath == "" {
+			fmt.Println("no model: memories are imported without passages, which the server computes before it serves")
+			return nil, nil
+		}
+		e, err := onnx.Open(onnx.Config{ModelPath: modelPath, SharedLibraryPath: onnxPath})
+		if err != nil {
+			return nil, err
+		}
+		fmt.Printf("computing passages with %s\n", e.ModelID())
+		return e, nil
 	}
-	if !onnx.Available {
-		return nil, fmt.Errorf(
-			"this snapshot's embeddings have to be recomputed and this remem-admin was built " +
-				"without the model. Rebuild it with\n" +
-				"    CGO_ENABLED=1 CGO_LDFLAGS=\"-L$(pwd)/.tools/lib\" go build -tags onnx -o remem-admin ./cmd/remem-admin\n" +
-				"after running scripts/fetch-model.sh")
-	}
-	if modelPath == "" {
-		return nil, errors.New(
-			"import needs --model-path (or REMEM_EMBEDDING_MODEL_PATH) to recompute this " +
-				"snapshot's embeddings")
-	}
-	e, err := onnx.Open(onnx.Config{ModelPath: modelPath, SharedLibraryPath: onnxPath})
+	e, err := openModel(modelPath, onnxPath, "this snapshot's embeddings have to be recomputed",
+		"import needs --model-path (or REMEM_EMBEDDING_MODEL_PATH) to recompute this snapshot's embeddings")
 	if err != nil {
 		return nil, err
 	}
 	fmt.Printf("recomputing embeddings with %s\n", e.ModelID())
 	return e, nil
+}
+
+// openModel loads the embedder for a command that has to compute embeddings,
+// refusing by name on a build that has no model — before any database is
+// opened, so a refused command leaves nothing behind. why says what needs it;
+// noPath is the refusal when no model directory was given.
+func openModel(modelPath, onnxPath, why, noPath string) (embedding.Embedder, error) {
+	if !onnx.Available {
+		return nil, fmt.Errorf(
+			"%s and this remem-admin was built without the model. Rebuild it with\n"+
+				"    CGO_ENABLED=1 CGO_LDFLAGS=\"-L$(pwd)/.tools/lib\" go build -tags onnx -o remem-admin ./cmd/remem-admin\n"+
+				"after running scripts/fetch-model.sh", why)
+	}
+	if modelPath == "" {
+		return nil, errors.New(noPath)
+	}
+	return onnx.Open(onnx.Config{ModelPath: modelPath, SharedLibraryPath: onnxPath})
 }
 
 // openReadOnly opens a data directory for reading, refusing a path that holds

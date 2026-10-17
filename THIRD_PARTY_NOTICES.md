@@ -158,11 +158,36 @@ fetching it, or asking upstream to publish notices with the release.
 
 ### 2.4 The embedding model
 
-`all-MiniLM-L6-v2`, baked into the image at `/opt/remem/model` from the
-`Qdrant/all-MiniLM-L6-v2-onnx` repository. Apache-2.0, declared in the model
-card; the repository publishes no `LICENSE` file, so there is no file to carry.
-The weights derive from `sentence-transformers/all-MiniLM-L6-v2`, also
-Apache-2.0. The Apache License 2.0 text is reproduced in section 3.
+`pplx-embed-context-v1-0.6b`, published by Perplexity AI and baked into the
+image at `/opt/remem/model` from
+`perplexity-ai/pplx-embed-context-v1-0.6b`, revision
+`b42df969d4d78d1840769e45c68c4e4ce763768b`. MIT, declared in the pinned
+model card. The fp32 ONNX graph, both external weight files and tokenizer are
+checked against the hashes in `scripts/fetch-model.sh`. The repository publishes
+no separate `LICENSE` file or copyright notice at that revision; the MIT text
+is reproduced here and travels in the image's `THIRD_PARTY_NOTICES.md`.
+
+```text
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ### 2.5 The base image
 

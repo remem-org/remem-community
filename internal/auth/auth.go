@@ -24,6 +24,9 @@ type Credential struct {
 	// a contradiction, and guessing which half was meant is how isolation
 	// bugs are configured into existence.
 	CrossTenant bool
+	// Kind is KindOperator for the operator credential and KindConfigured for
+	// every other configured key. A configured credential is never KindUser.
+	Kind Kind
 	// Authorized is the explicit set of tenants a cross-tenant credential may
 	// act in. Empty leaves its authority unnarrowed, which is the single
 	// operator credential.
@@ -73,6 +76,10 @@ func NewKeyring(creds []Credential) (*Keyring, error) {
 		if c.Secret == "" {
 			return nil, errs.E(errs.Invalid, op, fmt.Errorf("%s has no secret", where))
 		}
+		if c.Kind == KindUser {
+			return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+				"%s is configured as a user credential; users are stored, and their tokens verified, by the user service", where))
+		}
 		if c.Tenant != "" {
 			if _, err := tenant.Parse(string(c.Tenant)); err != nil {
 				return nil, errs.E(errs.Invalid, op, fmt.Errorf("%s is bound to %q: %w", where, c.Tenant, err))
@@ -112,7 +119,7 @@ func NewKeyring(creds []Credential) (*Keyring, error) {
 		if id == "" {
 			id = fmt.Sprintf("credential-%d", i)
 		}
-		k.byHash[h] = Principal{ID: id, Tenant: c.Tenant, CrossTenant: c.CrossTenant, Authorized: c.Authorized}
+		k.byHash[h] = Principal{ID: id, Tenant: c.Tenant, CrossTenant: c.CrossTenant, Authorized: c.Authorized, Kind: c.Kind}
 		k.order = append(k.order, h)
 	}
 	return k, nil

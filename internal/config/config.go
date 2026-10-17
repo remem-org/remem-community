@@ -197,8 +197,6 @@ type EmbeddingConfig struct {
 	// loader path, which is what a container with ldconfig run gets.
 	ONNXLibraryPath string `toml:"onnx_library_path"`
 	BatchSize       int    `toml:"batch_size"`
-	// MaxSequenceTokens is the model's input limit; longer text is truncated.
-	MaxSequenceTokens int `toml:"max_sequence_tokens"`
 	// CacheSize is how many vectors the embedding LRU remembers.
 	CacheSize int `toml:"cache_size"`
 	// Workers bounds how many batches wait on the model at once. The model

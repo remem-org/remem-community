@@ -176,10 +176,48 @@ and a second run that changes nothing.
 row 7), so writing the cosine into it is what makes "closest first" survive into
 `find_related`.
 
-### What 0.7 actually selects, measured
+### The threshold is 0.6 in the passage model's space (passage-vectors)
+
+The model became `pplx-embed-context-v1-0.6b`, and a similarity threshold is a
+number in one model's space, so it was measured again rather than carried over
+(design decision 11 of `openspec/changes/passage-vectors`). Discovery compares
+canonical vectors, which are now document vectors.
+
+Phase 11's ten-memory corpus was not kept, so it was rebuilt in the same shape
+(topics of four, three and two memories and one unlike anything else). It showed
+a clean gap between topics, different-topic pairs at most 0.201 and same-topic at
+least 0.350, but only three paraphrase pairs, the closest at 0.701, beside a pair
+at 0.673. Three pairs are not enough to place a boundary, so a labelled corpus
+was built instead: twelve topics, two of them German, each holding two facts
+written two ways. Every pair is a paraphrase, a topic-mate or unrelated by
+construction, 1,128 pairs in all, every one scored by the real model:
+
+| | pairs | min | p05 | median | p95 | max |
+|---|---|---|---|---|---|---|
+| paraphrase | 24 | **0.670** | 0.724 | 0.837 | 0.906 | 0.920 |
+| topic-mate | 48 | 0.136 | 0.176 | 0.332 | 0.423 | **0.518** |
+| unrelated | 1,056 | −0.023 | 0.038 | 0.146 | 0.263 | 0.417 |
+
+| Threshold | Paraphrases linked | Topic-mates | Unrelated |
+|---|---|---|---|
+| 0.50 | 24 of 24 | 2 of 48 | 0 |
+| 0.55 to 0.65 | 24 of 24 | 0 | 0 |
+| 0.70 | 23 of 24 | 0 | 0 |
+| 0.75 | 21 of 24 | 0 | 0 |
+
+**The meaning was kept and the number moved to keep it.** `similar_to` still
+means "says nearly the same thing": paraphrases link, topic-mates do not. The new
+space is more compressed than MiniLM's, so 0.7 now misses a paraphrase, and 0.6
+sits in the middle of a gap 0.152 wide that holds every paraphrase and nothing
+else, in English and in German. Both corpora are in
+`internal/discovery/threshold_onnx_test.go`, and the labelled one gates the
+configured threshold: it must sit above every topic-mate and unrelated pair and
+below every paraphrase.
+
+### What 0.7 selected under all-MiniLM-L6-v2, measured in Phase 11
 
 Ten memories over three topics plus one unlike anything else, embedded by the
-real model, every ordered pair scored:
+model of the time, every ordered pair scored:
 
 | | pairs | max | median | at or above 0.7 |
 |---|---|---|---|---|

@@ -233,6 +233,64 @@ This path was exercised on a real deployment four migrations behind
 (`index.tags` 2, `index.attr` 1, `attr` 1, `index.timeseries` 1): the chain ran,
 6,686 records and 32,911 edges exported, imported and verified clean.
 
+## Upgrading a Go deployment to the passage model
+
+A data directory written before `passage-vectors` holds 384-wide
+all-MiniLM-L6-v2 vectors, one per memory, of its first 128 tokens. This build
+embeds every memory whole, as contextual passages, with
+`pplx-embed-context-v1-0.6b` at 1,024 dimensions, and the two are not one space.
+So the first start of the new binary **re-embeds the whole corpus before it
+listens** (migration `0003-reembed-passages`):
+
+1. It takes the pre-migration backup, a Pebble checkpoint in
+   `<data_dir>/.backups/pre-<unix>/`, because it rewrites canonical vectors.
+2. It re-embeds every memory, sixteen at a time, writing the new canonical
+   vector and the passage rows with a checkpoint. Progress is logged and is on
+   `/metrics` as `remem_migration_progress_ratio` and
+   `remem_migration_records_remaining`.
+3. When a tenant is finished, it clears that tenant's approximate-index node
+   records and queues a `vector.rebuild` job, which builds the graph in the new
+   space once the server is up.
+
+**How long.** The cost is the model's, and it is proportional to the corpus's
+tokens, not its memory count. On the 6-core development host a full segment runs
+at about 260 tokens a second, so a corpus of 7.3 million tokens (a 1,737-memory
+agent-browsing corpus) is about eight hours. Measure your own hardware: count your
+corpus's characters, divide by about four for tokens, and by your host's tokens
+per second. `docs/architecture/retrieval.md` has the measurements.
+
+**If it is interrupted** — killed, out of power, out of patience — start the
+binary again. It resumes from its last checkpoint and does not re-embed what it
+finished.
+
+**Offline upgrade.** Stop the server and use the ONNX admin build:
+
+```bash
+remem-admin rebuild --data-dir ./data --index passages \
+  --model-path .models/pplx-embed-context-v1-0.6b \
+  --onnx-library-path .tools/onnxruntime/lib/libonnxruntime.so
+```
+
+On an older directory this runs the same migration chain as server startup:
+backup, checkpointed canonical-vector and passage writes, index-rebuild jobs,
+and the format advance. An interrupted command resumes on the next invocation.
+The next server start has no re-embedding left to do. Once the format is current,
+the command rebuilds only derived passage rows. `--index all` includes the
+upgrade and rebuilds every derived index. Omit `--tenant` during an upgrade,
+since the format covers the whole directory; tenant-scoped rebuilds remain
+available after it is current. The embedding cost is the same offline: rehearse
+on a copy to measure the downtime.
+
+**Rolling back.** Stop the new binary and start the old one on the backup
+checkpoint. The old binary refuses the migrated directory by name, because it
+does not know the `passage_index` format.
+
+**Snapshots.** A snapshot written before the upgrade is re-embedded on import,
+like a Rust one, and needs the ONNX build. A snapshot written after it is taken
+verbatim; its passages are computed during the import when `remem-admin` has
+the model (`--model-path`), and otherwise the import marks the tenants and the
+server computes them at its next start, before it listens.
+
 ## Going the other way
 
 There is no path from Go back to Rust, and there will not be one. Rust is frozen
@@ -249,9 +307,9 @@ so a backup taken from a live server is one point in time.
 ./remem-admin export --data-dir /var/lib/remem-go --out backup-$(date +%F).rsnap
 ```
 
-A Go snapshot carries five things the shared schema cannot: connection metadata,
-an edge's update time, a record's archive time, per-tenant schema versions, and
-the lifecycle audit stream. `--shared-only` writes the shared sections alone —
+A Go snapshot carries six things the shared schema cannot: connection metadata,
+an edge's update time, a record's archive time, per-tenant schema versions, the
+lifecycle audit stream, and users. `--shared-only` writes the shared sections alone —
 useful only if something other than Go must read the file — and prints what that
 costs:
 
@@ -266,6 +324,24 @@ implementation and are taken verbatim.
 ```bash
 ./remem-admin import --data-dir /var/lib/remem-restored --in backup-2026-09-09.rsnap
 ```
+
+**A restore keeps users and drops every token.** Users come back with the same
+ids, names and states, so `/history` still names who did what. But no token, and
+nothing a token could be recovered from, is ever written into a snapshot. Plan for
+this before you need it: after a restore, issue each agent a new token and hand
+it over.
+
+```bash
+./remem-admin users list --data-dir /var/lib/remem-restored
+TOKEN=$(./remem-admin tokens issue --data-dir /var/lib/remem-restored --user <id>)
+```
+
+**A directory this release has opened refuses an older binary**, whether or not
+it holds a user. The first start stamps the `user_format` manifest entry, which a
+binary from before users has never heard of, so that binary refuses to open the
+directory rather than ignore part of it. To go back, export with `--shared-only`.
+That drops users along with the other Go-only data, and says so. Or stay on a
+binary that understands `user_format`.
 
 ## Upgrading a multi-tenant deployment to a build that serves one tenant
 

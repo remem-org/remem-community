@@ -6,10 +6,12 @@ import (
 	"math"
 	"testing"
 
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
+	"github.com/remem-org/remem-go/internal/txn"
 	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"github.com/remem-org/remem-go/internal/vector/flat"
@@ -27,9 +29,11 @@ import (
 
 // The real embedding width. Measuring recall at a convenient 64 dimensions
 // would measure a different problem: how hard a nearest-neighbour search is
-// depends on the dimensionality of the space it runs in, and 384 is the one the
-// product runs in.
-const recallDim = 384
+// depends on the dimensionality of the space it runs in, and this is the one
+// the product runs in. It was 384 until the model became
+// pplx-embed-context-v1-0.6b; the measurements in docs/architecture/vector.md
+// say which width each was taken at.
+const recallDim = embedding.Dim
 
 // The benchmark corpus: 20 topics, each a cloud of points around a centre, with
 // queries drawn from the same topics.
@@ -102,7 +106,7 @@ func TestRebuildMatchesIncrementalConstruction(t *testing.T) {
 
 	incremental, incKV := newHNSW(t, hnsw.Options{Params: hnsw.Params{EfSearch: 64}})
 	for i := range n {
-		if err := incremental.Insert(ctx, "acme", ids[i], vecs[i]); err != nil {
+		if err := incremental.Insert(ctx, "acme", ids[i], vector.Single(vecs[i])); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -321,4 +325,165 @@ func (r *recallRNG) unit(dim int) []float32 {
 		v[i] *= inv
 	}
 	return v
+}
+
+// passageCorpus is memories of several passages each, the shape a contextual
+// embedder produces: memories cluster by topic, and a memory's passages cluster
+// tightly around the memory, because each was embedded knowing the whole of it.
+// The spike measured passages of one document at 0.94–0.99 cosine from their
+// document vector; passageSpread puts them there.
+//
+// The passage count per memory runs from 1 to maxPassages, so some memories
+// are indexed by a single canonical vector and some by many passages, and a
+// long memory near a query is the crowding case grouping exists for.
+type passageCorpus struct {
+	memories    int
+	topics      int
+	maxPassages int
+}
+
+const passageSpread = 0.25
+
+// write stores the corpus as the record repository would: each memory's
+// canonical vector, and its passage rows when it has more than one. It returns
+// the number of index entries written.
+func (c passageCorpus) write(t *testing.T, kv storage.KV) int {
+	t.Helper()
+	r := newRecallRNG(5)
+	centres := make([][]float32, c.topics)
+	for i := range centres {
+		centres[i] = r.unit(recallDim)
+	}
+	store := vector.NewStore(kv)
+	ctx := context.Background()
+	entries := 0
+	for i := range c.memories {
+		memory := around(r, centres[i%c.topics], recallSpread)
+		r.next()
+		n := 1 + int((r.s>>33)%uint64(c.maxPassages))
+		rows := make([]vector.PassageRow, 0, n)
+		if n > 1 {
+			for p := range n {
+				rows = append(rows, vector.PassageRow{Start: uint32(p), End: uint32(p + 1),
+					Vector: &vector.Vector{ModelID: "recall-test", Dim: recallDim, Values: around(r, memory, passageSpread)}})
+			}
+		}
+		rid := id.New()
+		if err := txn.Do(ctx, kv, func(tx txn.Tx) error {
+			if err := store.Stage(tx, "acme", tenant.DefaultNamespace, rid,
+				&vector.Vector{ModelID: "recall-test", Dim: recallDim, Values: memory}); err != nil {
+				return err
+			}
+			return vector.StagePassages(tx, "acme", tenant.DefaultNamespace, rid, rows)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		entries += n
+	}
+	return entries
+}
+
+// query is a point near one of the corpus's topics.
+func (c passageCorpus) queries(n int) [][]float32 {
+	r := newRecallRNG(5)
+	centres := make([][]float32, c.topics)
+	for i := range centres {
+		centres[i] = r.unit(recallDim)
+	}
+	q := newRecallRNG(6)
+	out := make([][]float32, n)
+	for i := range out {
+		out[i] = around(q, centres[(i*7)%c.topics], recallSpread)
+	}
+	return out
+}
+
+// around is a unit vector near c, with spread scaled to the width as the topic
+// corpus scales it.
+func around(r *recallRNG, c []float32, spread float64) []float32 {
+	sigma := float32(spread / math.Sqrt(float64(recallDim)))
+	v := make([]float32, recallDim)
+	var sum float64
+	for j := range v {
+		v[j] = c[j] + sigma*r.next()
+		sum += float64(v[j]) * float64(v[j])
+	}
+	inv := float32(1 / math.Sqrt(sum))
+	for j := range v {
+		v[j] *= inv
+	}
+	return v
+}
+
+// measurePassageRecall is measureRecall over a passage corpus. Recall counts
+// memories: of the exact top-k memories, each ranked by its nearest passage,
+// the fraction the approximate index's top k also returned.
+func measurePassageRecall(t *testing.T, c passageCorpus, efs []int, k, queries int) (map[int]float64, int) {
+	t.Helper()
+	ctx := context.Background()
+	kv := memkv.New()
+	t.Cleanup(func() { _ = kv.Close() })
+	entries := c.write(t, kv)
+
+	exact := flat.New(vector.NewStore(kv), distance.L2)
+	qs := c.queries(queries)
+	want := make([]map[id.ID]bool, queries)
+	for i, q := range qs {
+		hits, err := exact.Search(ctx, "acme", q, k, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) != k {
+			t.Fatalf("the exact index returned %d of %d memories for query %d", len(hits), k, i)
+		}
+		want[i] = make(map[id.ID]bool, k)
+		for _, h := range hits {
+			want[i][h.ID] = true
+		}
+	}
+
+	out := make(map[int]float64, len(efs))
+	for _, ef := range efs {
+		approx, err := hnsw.New(kv, hnsw.Options{
+			Metric: distance.L2, Params: hnsw.Params{EfSearch: ef}, ResidentBudgetBytes: 8 << 30,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := 0
+		for i, q := range qs {
+			got, err := approx.Search(ctx, "acme", q, k, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := map[id.ID]bool{}
+			for _, h := range got {
+				if seen[h.ID] {
+					t.Fatalf("query %d returned memory %s twice", i, h.ID)
+				}
+				seen[h.ID] = true
+				if want[i][h.ID] {
+					found++
+				}
+			}
+		}
+		out[ef] = float64(found) / float64(k*queries)
+	}
+	return out, entries
+}
+
+// Recall over memories that have passages, at the size the everyday suite can
+// afford: 300 memories of up to 16 passages in 4 topics, a few thousand
+// entries, where some memories are many entries near a query and others one.
+func TestPassageRecallAgainstFlat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("a few thousand entries at the real embedding width")
+	}
+	c := passageCorpus{memories: 300, topics: 4, maxPassages: 16}
+	r, entries := measurePassageRecall(t, c, []int{16, 64}, 10, 60)
+	t.Logf("memory recall@10 over %d memories, %d entries: %.4f at ef_search=16, %.4f at 64",
+		c.memories, entries, r[16], r[64])
+	if r[64] < 0.95 {
+		t.Fatalf("memory recall@10 at ef_search=64 is %.4f, want >= 0.95", r[64])
+	}
 }

@@ -164,3 +164,37 @@ func TestAMalformedTenantSetIsRefusedNamingTheEntry(t *testing.T) {
 		}
 	}
 }
+
+// A presented credential beginning "rmm_" is verified as a stored user token,
+// so a configured secret with that prefix could never authenticate. It is
+// refused where it is written, naming the setting, rather than discovered as a
+// key that silently never works.
+func TestAConfiguredSecretCannotLookLikeAUserToken(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*config.Config)
+		want string
+	}{
+		{"api_key", func(c *config.Config) { c.Server.APIKey = "rmm_operator" }, "server.api_key"},
+		{"api_keys", func(c *config.Config) { c.Server.APIKeys = []string{"rmm_agent@acme"} }, "server.api_keys[0]"},
+	} {
+		c := config.Default()
+		tc.set(&c)
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "rmm_") {
+			t.Errorf("%s: got %v, want a refusal naming %s and the prefix", tc.name, err, tc.want)
+		}
+	}
+}
+
+// The singular api_key is the operator credential; every api_keys entry is a
+// configured key, whatever tenant it names.
+func TestCredentialsSayWhichIsTheOperator(t *testing.T) {
+	c := config.Default()
+	c.Server.APIKey = "root-key"
+	c.Server.APIKeys = []string{"key-acme@acme", "second-root"}
+	got := c.Credentials()
+	if !got[0].Operator || got[1].Operator || got[2].Operator {
+		t.Fatalf("operator flags %v %v %v, want true false false", got[0].Operator, got[1].Operator, got[2].Operator)
+	}
+}

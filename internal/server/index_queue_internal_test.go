@@ -123,7 +123,7 @@ func TestALostQueueOperationDegradesTheTenantAndQueuesARebuild(t *testing.T) {
 		t.Fatalf("before the loss Health = %+v, %v; want healthy", h, err)
 	}
 
-	if err := d.indexQueue.Indexed(ctx, tid, id.New(), []float32{1, 2, 3}); err != nil {
+	if err := d.indexQueue.Indexed(ctx, tid, id.New(), vector.Single([]float32{1, 2, 3})); err != nil {
 		t.Fatalf("the enqueue itself failed: %v", err)
 	}
 	if err := d.indexQueue.Flush(ctx); err != nil {

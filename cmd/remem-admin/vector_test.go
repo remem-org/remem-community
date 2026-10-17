@@ -49,11 +49,11 @@ func TestVectorRebuildRestoresTheIndex(t *testing.T) {
 	}
 	want := id.New()
 	q := []float32{1, 0, 0, 0}
-	if err := idx.Insert(ctx, "acme", want, q); err != nil {
+	if err := idx.Insert(ctx, "acme", want, vector.Single(q)); err != nil {
 		t.Fatal(err)
 	}
 	for range 50 {
-		if err := idx.Insert(ctx, "acme", id.New(), []float32{0, 1, 0, 0}); err != nil {
+		if err := idx.Insert(ctx, "acme", id.New(), vector.Single([]float32{0, 1, 0, 0})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -109,7 +109,7 @@ func TestVectorRebuildRestoresTheIndex(t *testing.T) {
 	// And the canonical vectors are untouched: a rebuild reads them, it does
 	// not rewrite them into something else.
 	count := 0
-	if err := vector.NewStore(kv).Scan(ctx, "acme", func(id.ID, []float32) error {
+	if err := vector.NewStore(kv).Scan(ctx, "acme", func(vector.Key, []float32) error {
 		count++
 		return nil
 	}); err != nil {

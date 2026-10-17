@@ -44,6 +44,13 @@ func Vector(t tenant.ID, ns tenant.Namespace, rid id.ID) []byte {
 	return append(begin(t, ns, SpaceVector, idLen), rid[:]...)
 }
 
+// Passage addresses one passage of a memory's content: its span and vector.
+// The passage number is big-endian, so a memory's passages sort in order.
+func Passage(t tenant.ID, ns tenant.Namespace, rid id.ID, passage uint32) []byte {
+	k := append(begin(t, ns, SpacePassage, idLen+4), rid[:]...)
+	return binary.BigEndian.AppendUint32(k, passage)
+}
+
 // EdgeOut addresses a canonical out-edge.
 func EdgeOut(t tenant.ID, ns tenant.Namespace, from id.ID, rel RelType, to id.ID) []byte {
 	k := begin(t, ns, SpaceEdgeOut, idLen+2+idLen)
@@ -193,6 +200,11 @@ func TextTermRange(t tenant.ID, ns tenant.Namespace, term string) (lower, upper 
 // AttrSlotRange is every entry of one attribute slot, in value order.
 func AttrSlotRange(t tenant.ID, ns tenant.Namespace, slot uint16) (lower, upper []byte) {
 	return PrefixRange(binary.BigEndian.AppendUint16(begin(t, ns, SpaceAttrIndex, 2), slot))
+}
+
+// PassagesOfRange is every passage of one record, in passage order.
+func PassagesOfRange(t tenant.ID, ns tenant.Namespace, rid id.ID) (lower, upper []byte) {
+	return PrefixRange(append(begin(t, ns, SpacePassage, idLen), rid[:]...))
 }
 
 // EdgesFromRange is every out-edge of one record.
@@ -391,6 +403,29 @@ func ParseJobPause(k []byte) (tenant.ID, tenant.Namespace, string, error) {
 		return "", "", "", corrupt(op, "job pause key names no type")
 	}
 	return t, ns, string(rest), nil
+}
+
+// ParsePassage decodes a passage key back into its record and passage number.
+func ParsePassage(k []byte) (tenant.ID, tenant.Namespace, id.ID, uint32, error) {
+	const op = "keys.ParsePassage"
+
+	t, ns, rest, err := parseScope(k, op)
+	if err != nil {
+		return "", "", id.Zero, 0, err
+	}
+	if len(rest) < 1 || Space(rest[0]) != SpacePassage {
+		return "", "", id.Zero, 0, corrupt(op, "key is not in the passage space")
+	}
+	rest = rest[1:]
+	if len(rest) != idLen+4 {
+		return "", "", id.Zero, 0, corrupt(op, fmt.Sprintf(
+			"passage key body is %d bytes, want %d", len(rest), idLen+4))
+	}
+	rid, err := id.FromBytes(rest[:idLen])
+	if err != nil {
+		return "", "", id.Zero, 0, corrupt(op, "passage key holds a malformed id")
+	}
+	return t, ns, rid, binary.BigEndian.Uint32(rest[idLen:]), nil
 }
 
 // ParseJobRun decodes a history key back into its finish time and run id.

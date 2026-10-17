@@ -16,9 +16,15 @@ func TestAnExternalEmbedderDeclaresItsModelAndComputesNothing(t *testing.T) {
 	if e.ModelID() != "cohere-embed-english-v3.0" || e.Dim() != 768 {
 		t.Fatalf("declared %q/%d", e.ModelID(), e.Dim())
 	}
-	_, err := e.Embed(context.Background(), []string{"anything"})
-	if !errs.Is(err, errs.Invalid) || !strings.Contains(err.Error(), "external") {
-		t.Fatalf("an external embedder must refuse to embed, naming the mode; got %v", err)
+	// Each refusal names the mode and the request field that carries the
+	// vector instead, so a caller is told what to send.
+	_, err := e.EmbedQueries(context.Background(), []string{"anything"})
+	if !errs.Is(err, errs.Invalid) || !strings.Contains(err.Error(), "external") || !strings.Contains(err.Error(), "query_vector") {
+		t.Fatalf("an external embedder must refuse a query, naming the mode and query_vector; got %v", err)
+	}
+	_, err = e.EmbedDocuments(context.Background(), []string{"anything"})
+	if !errs.Is(err, errs.Invalid) || !strings.Contains(err.Error(), "external") || !strings.Contains(err.Error(), "`embedding`") {
+		t.Fatalf("an external embedder must refuse a document, naming the mode and embedding; got %v", err)
 	}
 	if !embedding.CallerSupplied(e) {
 		t.Fatal("an external embedder is caller-supplied")

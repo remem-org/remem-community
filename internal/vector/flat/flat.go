@@ -20,10 +20,13 @@
 package flat
 
 import (
+	"bytes"
+	"cmp"
 	"container/heap"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
@@ -68,26 +71,23 @@ func New(store *vector.Store, metric distance.Metric, opts ...Option) *Index {
 	return x
 }
 
-// Insert writes a canonical vector.
+// Insert writes a memory's entry set as canonical rows: its canonical vector,
+// and its passage rows when it has more than one entry.
 //
 // It carries the running model's identity, because a vector without one cannot
 // be told apart from a vector produced by a model that has since been replaced.
-// The transactional write path — a memory and its vector committing together —
+// The transactional write path — a memory and its rows committing together —
 // goes through the record repository instead; this is the rebuild and
 // maintenance path.
-func (x *Index) Insert(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error {
+func (x *Index) Insert(ctx context.Context, t tenant.ID, rid id.ID, entries []vector.Entry) error {
 	const op = "flat.Insert"
 	if err := checkScope(t, op); err != nil {
 		return err
 	}
-	if len(v) == 0 {
-		return errs.E(errs.Invalid, op, errors.New("an empty vector cannot be indexed"))
+	if err := vector.CheckEntries(entries); err != nil {
+		return errs.E(errs.Invalid, op, err)
 	}
-	return x.store.Put(ctx, t, tenant.DefaultNamespace, rid, &vector.Vector{
-		ModelID: modelOf(ctx),
-		Dim:     len(v),
-		Values:  v,
-	})
+	return x.store.PutEntries(ctx, t, tenant.DefaultNamespace, rid, modelOf(ctx), entries)
 }
 
 func (x *Index) Delete(ctx context.Context, t tenant.ID, rid id.ID) error {
@@ -95,14 +95,19 @@ func (x *Index) Delete(ctx context.Context, t tenant.ID, rid id.ID) error {
 	if err := checkScope(t, op); err != nil {
 		return err
 	}
-	return x.store.Delete(ctx, t, tenant.DefaultNamespace, rid)
+	return x.store.DeleteEntries(ctx, t, tenant.DefaultNamespace, rid)
 }
 
-// Search returns up to k nearest vectors, nearest first.
+// Search returns up to k distinct memories, nearest first, each at the distance
+// of its nearest entry.
 //
 // The filter is applied before a candidate can occupy a slot, so k counts
 // results rather than candidates: an index that truncated first and filtered
-// afterwards would return fewer results than it holds, without saying so.
+// afterwards would return fewer results than it holds, without saying so. And
+// a memory occupies one slot however many passages it has, so k counts
+// memories: every entry is compared, the nearest per memory is kept, and the k
+// nearest memories are returned. This is the definition the approximate index
+// is held to.
 func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
 	const op = "flat.Search"
 
@@ -120,8 +125,9 @@ func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, fil
 	// deciding whether a candidate belongs is one comparison and evicting it is
 	// one pop. Sorting the whole corpus instead would be O(n log n) in the
 	// tenant's entire memory count for every query.
-	best := &worstFirst{}
-	err := x.store.ScanVectors(ctx, t, func(rid id.ID, sv *vector.Vector) error {
+	nearest := map[id.ID]vector.Hit{}
+	err := x.store.ScanEntries(ctx, t, func(key vector.Key, sv *vector.Vector) error {
+		rid := key.ID
 		// Before the filter: a corpus is refused whole, not only the part of it
 		// this query's filter happens to admit.
 		if x.model != "" && sv.ModelID != "" && sv.ModelID != x.model {
@@ -137,18 +143,31 @@ func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, fil
 		if err != nil {
 			return errs.E(errs.KindOf(err), op, fmt.Errorf("comparing against record %s: %w", rid, err))
 		}
-		if best.Len() < k {
-			heap.Push(best, vector.Hit{ID: rid, Distance: d})
-			return nil
-		}
-		if d < (*best)[0].Distance {
-			(*best)[0] = vector.Hit{ID: rid, Distance: d}
-			heap.Fix(best, 0)
+		// Strictly nearer replaces, so a tie keeps the lower passage number:
+		// entries arrive in passage order.
+		if h, seen := nearest[rid]; !seen || d < h.Distance {
+			nearest[rid] = vector.Hit{ID: rid, Passage: key.Passage, Distance: d}
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// A max-heap of the k best memories so far: the worst kept hit is at the
+	// root, so deciding whether a memory belongs is one comparison and evicting
+	// it is one pop. Sorting every memory instead would be O(n log n) in the
+	// tenant's memory count for every query.
+	best := &worstFirst{}
+	for _, h := range nearest {
+		if best.Len() < k {
+			heap.Push(best, h)
+			continue
+		}
+		if worse((*best)[0], h) {
+			(*best)[0] = h
+			heap.Fix(best, 0)
+		}
 	}
 
 	// Drain the heap: it pops worst-first, so filling the slice backwards puts
@@ -185,27 +204,26 @@ func (x *Index) Rebuild(ctx context.Context, t tenant.ID, src vector.Source, _ .
 		return errs.E(errs.Invalid, op, errors.New("a rebuild needs a source"))
 	}
 
-	replacements := make(map[id.ID]*vector.Vector)
-	if err := src.Scan(ctx, t, func(rid id.ID, v []float32) error {
+	// What a source yields is coordinates and nothing else, so the model id,
+	// each passage's span and a multi-passage memory's document vector are
+	// inherited from what is stored rather than overwritten: a rebuild cannot
+	// know them, and claiming to would be a lie the corpus then carries for
+	// ever. See vector.Store.ReplaceEntries.
+	replacements := make(map[id.ID][]vector.Entry)
+	if err := src.Scan(ctx, t, func(key vector.Key, v []float32) error {
 		if len(v) == 0 {
 			return errs.E(errs.Invalid, op, errors.New("an empty vector cannot be indexed"))
 		}
-		replacements[rid] = &vector.Vector{
-			// Deliberately whatever the context carries, which is usually
-			// nothing: an empty model id makes vector.Store.Replace keep the
-			// model already recorded for that record rather than overwrite it.
-			// A rebuild reads coordinates through vector.Source and cannot know
-			// what produced them, so claiming to know would be a lie the corpus
-			// then carries for ever.
-			ModelID: rawModelOf(ctx),
-			Dim:     len(v),
-			Values:  append([]float32(nil), v...),
-		}
+		replacements[key.ID] = append(replacements[key.ID],
+			vector.Entry{Passage: key.Passage, Vector: append([]float32(nil), v...)})
 		return nil
 	}); err != nil {
 		return err
 	}
-	return x.store.Replace(ctx, t, tenant.DefaultNamespace, replacements)
+	for _, set := range replacements {
+		slices.SortFunc(set, func(a, b vector.Entry) int { return cmp.Compare(a.Passage, b.Passage) })
+	}
+	return x.store.ReplaceEntries(ctx, t, tenant.DefaultNamespace, rawModelOf(ctx), replacements)
 }
 
 func (x *Index) Stats(ctx context.Context, t tenant.ID) (vector.Stats, error) {
@@ -215,7 +233,7 @@ func (x *Index) Stats(ctx context.Context, t tenant.ID) (vector.Stats, error) {
 	}
 
 	var s vector.Stats
-	err := x.store.Scan(ctx, t, func(_ id.ID, v []float32) error {
+	err := x.store.Scan(ctx, t, func(_ vector.Key, v []float32) error {
 		s.Vectors++
 		s.Dim = len(v)
 		return nil
@@ -277,8 +295,17 @@ func modelOf(ctx context.Context) string {
 // worstFirst is a max-heap of hits by distance.
 type worstFirst []vector.Hit
 
+// worse orders hits by distance, and a tie by record id, so that which of two
+// equally near memories survives does not depend on map iteration order.
+func worse(a, b vector.Hit) bool {
+	if a.Distance != b.Distance {
+		return a.Distance > b.Distance
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+}
+
 func (h worstFirst) Len() int           { return len(h) }
-func (h worstFirst) Less(i, j int) bool { return h[i].Distance > h[j].Distance }
+func (h worstFirst) Less(i, j int) bool { return worse(h[i], h[j]) }
 func (h worstFirst) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *worstFirst) Push(x any)        { *h = append(*h, x.(vector.Hit)) }
 func (h *worstFirst) Pop() any {

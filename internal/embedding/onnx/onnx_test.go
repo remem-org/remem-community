@@ -18,9 +18,9 @@ func mustOpenEmbedder(t *testing.T) embedding.Embedder {
 	t.Helper()
 	path := os.Getenv("REMEM_EMBEDDING_MODEL_PATH")
 	if path == "" {
-		path = filepath.Join("..", "..", "..", ".models", "all-MiniLM-L6-v2")
+		path = filepath.Join("..", "..", "..", ".models", "pplx-embed-context-v1-0.6b")
 	}
-	if _, err := os.Stat(filepath.Join(path, "model.onnx")); err != nil {
+	if _, err := os.Stat(filepath.Join(path, "onnx", "model.onnx")); err != nil {
 		t.Skipf("no model at %s; run scripts/fetch-model.sh", path)
 	}
 	e, err := onnx.Open(onnx.Config{
@@ -73,11 +73,11 @@ func TestBatchShapeDoesNotChangeAVector(t *testing.T) {
 	const short = "the sky is blue"
 	long := strings.Repeat("a much longer neighbouring sentence with many more tokens in it. ", 12)
 
-	alone, err := e.Embed(ctx, []string{short})
+	alone, err := e.EmbedQueries(ctx, []string{short})
 	if err != nil {
 		t.Fatal(err)
 	}
-	together, err := e.Embed(ctx, []string{short, long})
+	together, err := e.EmbedQueries(ctx, []string{short, long})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestBatchShapeDoesNotChangeAVector(t *testing.T) {
 
 func TestVectorsAreL2Normalised(t *testing.T) {
 	e := mustOpenEmbedder(t)
-	v, err := e.Embed(context.Background(), []string{"hello world"})
+	v, err := e.EmbedQueries(context.Background(), []string{"hello world"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,16 +98,16 @@ func TestVectorsAreL2Normalised(t *testing.T) {
 	}
 }
 
-func TestDimensionIs384(t *testing.T) {
+func TestDimensionIs1024(t *testing.T) {
 	e := mustOpenEmbedder(t)
-	if e.Dim() != 384 {
+	if e.Dim() != 1024 {
 		t.Fatalf("Dim() = %d", e.Dim())
 	}
-	v, err := e.Embed(context.Background(), []string{"anything"})
+	v, err := e.EmbedQueries(context.Background(), []string{"anything"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v[0]) != 384 {
+	if len(v[0]) != 1024 {
 		t.Fatalf("a vector has %d components", len(v[0]))
 	}
 }
@@ -123,11 +123,11 @@ func TestTheModelIsIdentified(t *testing.T) {
 func TestTheSameTextAlwaysProducesTheSameVector(t *testing.T) {
 	e := mustOpenEmbedder(t)
 	ctx := context.Background()
-	a, err := e.Embed(ctx, []string{"determinism matters"})
+	a, err := e.EmbedQueries(ctx, []string{"determinism matters"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := e.Embed(ctx, []string{"determinism matters"})
+	b, err := e.EmbedQueries(ctx, []string{"determinism matters"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,28 +136,37 @@ func TestTheSameTextAlwaysProducesTheSameVector(t *testing.T) {
 	}
 }
 
-// Text longer than the sequence limit is truncated, not refused: a memory too
-// long to embed exactly is still worth storing and still worth finding.
-func TestVeryLongTextIsTruncatedRatherThanRefused(t *testing.T) {
+// A text longer than one segment is embedded whole, not truncated or refused:
+// every passage gets a vector, and together they cover the content.
+func TestALongTextIsEmbeddedWhole(t *testing.T) {
 	e := mustOpenEmbedder(t)
-	long := strings.Repeat("the quick brown fox jumps over the lazy dog. ", 500)
-	v, err := e.Embed(context.Background(), []string{long})
+	long := strings.Repeat("the quick brown fox jumps over the lazy dog. ", 500) // about 5,000 tokens
+	docs, err := e.EmbedDocuments(context.Background(), []string{long})
 	if err != nil {
-		t.Fatalf("a very long text was refused: %v", err)
+		t.Fatalf("a long text was refused: %v", err)
 	}
-	if n := norm(v[0]); math.Abs(float64(n)-1.0) > 1e-5 {
-		t.Fatalf("norm is %f", n)
+	ps := docs[0].Passages
+	if len(ps) < 17 {
+		t.Fatalf("%d passages; a text longer than one segment needs at least 17", len(ps))
+	}
+	if ps[0].Start != 0 || int(ps[len(ps)-1].End) != len(long) {
+		t.Fatalf("passages cover [%d,%d) of %d bytes", ps[0].Start, ps[len(ps)-1].End, len(long))
+	}
+	for i, p := range ps {
+		if n := norm(p.Vector); math.Abs(float64(n)-1.0) > 1e-5 {
+			t.Fatalf("passage %d has norm %f", i, n)
+		}
 	}
 }
 
 func TestEmptyAndWhitespaceTextsProduceUsableVectors(t *testing.T) {
 	e := mustOpenEmbedder(t)
-	got, err := e.Embed(context.Background(), []string{"", "   ", "\n\t"})
+	got, err := e.EmbedQueries(context.Background(), []string{"", "   ", "\n\t"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i, v := range got {
-		if len(v) != 384 {
+		if len(v) != 1024 {
 			t.Fatalf("case %d has %d components", i, len(v))
 		}
 		for _, x := range v {
@@ -169,7 +178,7 @@ func TestEmptyAndWhitespaceTextsProduceUsableVectors(t *testing.T) {
 }
 
 func TestAnEmptyBatchIsRefused(t *testing.T) {
-	if _, err := mustOpenEmbedder(t).Embed(context.Background(), nil); err == nil {
+	if _, err := mustOpenEmbedder(t).EmbedQueries(context.Background(), nil); err == nil {
 		t.Fatal("an empty batch was accepted")
 	}
 }
@@ -196,7 +205,7 @@ func TestCloseIsIdempotentAndLaterUseIsRefused(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if _, err := e.Embed(context.Background(), []string{"after close"}); err == nil {
+	if _, err := e.EmbedQueries(context.Background(), []string{"after close"}); err == nil {
 		t.Fatal("a closed model served a request")
 	}
 }

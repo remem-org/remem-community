@@ -45,7 +45,6 @@ const (
 	DefaultTenant           = "default"
 	DefaultAutoProvision    = true
 	DefaultEmbeddingBatch   = 32
-	DefaultMaxSeqTokens     = 256
 	DefaultEmbeddingCache   = 4096
 	DefaultEmbeddingWorkers = 2
 
@@ -90,7 +89,7 @@ const (
 	// discovery pulls in the graph, the record repository and the job
 	// framework. TestConfigDefaultsMatchTheDiscoveryPackage in internal/server
 	// is what stops the two copies drifting.
-	DefaultDiscoveryThreshold     = 0.7
+	DefaultDiscoveryThreshold     = 0.6
 	DefaultDiscoveryTopK          = 5
 	DefaultDiscoveryMaxCandidates = 64
 
@@ -112,10 +111,10 @@ const (
 const (
 	// EmbeddingModel is the only model whose vectors are comparable with the
 	// ones already stored.
-	EmbeddingModel = "all-MiniLM-L6-v2"
-	// EmbeddingDimension is that model's output width: 384, mean-pooled and
-	// L2-normalised.
-	EmbeddingDimension = 384
+	EmbeddingModel = "pplx-embed-context-v1-0.6b"
+	// EmbeddingDimension is that model's output width: 1,024, mean-pooled,
+	// quantised by the model's int8 output rule and L2-normalised.
+	EmbeddingDimension = 1024
 
 	// ProviderONNX embeds text in this process with EmbeddingModel.
 	ProviderONNX = "onnx"
@@ -170,14 +169,13 @@ func Default() Config {
 			AutoProvision: DefaultAutoProvision,
 		},
 		Embedding: EmbeddingConfig{
-			Provider:          ProviderONNX,
-			Model:             EmbeddingModel,
-			BatchSize:         DefaultEmbeddingBatch,
-			MaxSequenceTokens: DefaultMaxSeqTokens,
-			CacheSize:         DefaultEmbeddingCache,
-			Workers:           DefaultEmbeddingWorkers,
-			IntraOpThreads:    DefaultEmbeddingIntraOpThreads,
-			FillWindow:        DefaultEmbeddingFill,
+			Provider:       ProviderONNX,
+			Model:          EmbeddingModel,
+			BatchSize:      DefaultEmbeddingBatch,
+			CacheSize:      DefaultEmbeddingCache,
+			Workers:        DefaultEmbeddingWorkers,
+			IntraOpThreads: DefaultEmbeddingIntraOpThreads,
+			FillWindow:     DefaultEmbeddingFill,
 		},
 		Vector: VectorConfig{
 			Dimension:          EmbeddingDimension,

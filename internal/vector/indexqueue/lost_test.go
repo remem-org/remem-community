@@ -60,7 +60,7 @@ func TestAnApplyFailureDegradesTheTenantAndSchedulesARebuild(t *testing.T) {
 	q := indexqueue.New(r, indexqueue.WithWorkers(1), indexqueue.WithRebuilder(rb))
 	t.Cleanup(func() { _ = q.Close(context.Background()) })
 
-	if err := q.Indexed(context.Background(), acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(context.Background(), acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Flush(context.Background()); err != nil {
@@ -89,16 +89,16 @@ func TestARefusedEnqueueDegradesTheTenantAndSchedulesARebuild(t *testing.T) {
 	t.Cleanup(func() { r.open(); _ = q.Close(context.Background()) })
 
 	bg := context.Background()
-	if err := q.Indexed(bg, acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(bg, acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the worker to take the first operation", func() bool { return r.started() >= 1 })
-	if err := q.Indexed(bg, acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(bg, acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(bg)
 	cancel()
-	if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err == nil {
+	if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err == nil {
 		t.Fatal("an enqueue on a full shard with a cancelled caller was accepted")
 	}
 
@@ -116,7 +116,7 @@ func TestACompletedRebuildClearsTheMark(t *testing.T) {
 	q := indexqueue.New(r, indexqueue.WithWorkers(1), indexqueue.WithRebuilder(&rebuilds{}))
 	t.Cleanup(func() { _ = q.Close(context.Background()) })
 
-	if err := q.Indexed(context.Background(), acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(context.Background(), acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Flush(context.Background()); err != nil {
@@ -153,7 +153,7 @@ func TestALossDuringARebuildKeepsTheMark(t *testing.T) {
 	l.during = func() {
 		// The rebuild runs on the caller's goroutine and the worker is free, so
 		// this operation applies — and fails — while the repair is underway.
-		if err := q.Indexed(context.Background(), acme, id.New(), []float32{1}); err != nil {
+		if err := q.Indexed(context.Background(), acme, id.New(), vector.Single([]float32{1})); err != nil {
 			t.Error(err)
 		}
 		if err := q.Flush(context.Background()); err != nil {
@@ -161,7 +161,7 @@ func TestALossDuringARebuildKeepsTheMark(t *testing.T) {
 		}
 	}
 
-	if err := q.Indexed(context.Background(), acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(context.Background(), acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Flush(context.Background()); err != nil {
@@ -190,7 +190,7 @@ func TestWhatAShutdownLeavesUndoneDoesNotDegrade(t *testing.T) {
 	if err := q.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.Indexed(context.Background(), acme, id.New(), []float32{1}); err == nil {
+	if err := q.Indexed(context.Background(), acme, id.New(), vector.Single([]float32{1})); err == nil {
 		t.Fatal("an enqueue after Close was accepted")
 	}
 	if got := rb.count(acme); got != 0 {
@@ -212,7 +212,7 @@ func TestWhatAShutdownLeavesUndoneDoesNotDegrade(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range perIteration {
-				_ = q.Indexed(context.Background(), acme, id.New(), []float32{1})
+				_ = q.Indexed(context.Background(), acme, id.New(), vector.Single([]float32{1}))
 			}
 		}()
 		_ = q.Close(context.Background())

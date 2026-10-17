@@ -247,6 +247,10 @@ var retiredSettings = map[string]string{
 	"lifecycle.archive_at_health": "the health that archives is a field on each retention policy " +
 		"now, so one tenant can retire aggressively while another does not. See " +
 		"archive_at_health on PATCH /api/v1/tenants/{id}/policies",
+	"embedding.max_sequence_tokens": "the embedding window is fixed by the passage format, not a " +
+		"setting: content is embedded whole, as passages of 256 tokens in segments of 16, and that " +
+		"rule decides what is written to disk. The setting also never bound: it claimed 256 tokens " +
+		"while the previous model's tokenizer truncated at 128 before it was read",
 	"jobs.queue_capacity": "the job queue is durable, so its capacity is the disk rather than a " +
 		"number; the bounded in-memory channel this bounded is the thing the job framework replaced, " +
 		"because it dropped work under load and only counted the drops. See jobs.retention for how " +

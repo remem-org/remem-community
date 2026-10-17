@@ -58,19 +58,18 @@ RUN set -eux; \
     rm /tmp/tok.tgz
 
 FROM golang:${GO_VERSION}-bookworm AS model
-# The model is baked in at a pinned revision. all-MiniLM-L6-v2 is a fixed
-# constant of the system, not a tuning knob: a vector produced by another model
-# is not comparable with the ones already stored.
-ARG MODEL_REPO=Qdrant/all-MiniLM-L6-v2-onnx
-ARG MODEL_REVISION=main
+# The fetch script pins the pplx fp32 graph, both external weight files and
+# tokenizer at one revision, and checks every SHA-256 before this stage succeeds.
 COPY scripts/fetch-model.sh /usr/local/bin/fetch-model.sh
+COPY --from=tokenizers /opt/tokenizers /tmp/model-tokenizers
 RUN set -eux; \
     chmod +x /usr/local/bin/fetch-model.sh; \
-    TOKENIZERS_LIB_DIR=/tmp/discard MODEL_REPO="${MODEL_REPO}" MODEL_REVISION="${MODEL_REVISION}" \
-      /usr/local/bin/fetch-model.sh /opt/model || true; \
-    test -s /opt/model/model.onnx; \
+    TOKENIZERS_LIB_DIR=/tmp/model-tokenizers /usr/local/bin/fetch-model.sh /opt/model; \
+    test -s /opt/model/onnx/model.onnx; \
+    test -s /opt/model/onnx/model.onnx_data; \
+    test -s /opt/model/onnx/model.onnx_data_1; \
     test -s /opt/model/tokenizer.json; \
-    rm -rf /tmp/discard
+    rm -rf /tmp/model-tokenizers
 
 FROM golang:${GO_VERSION}-bookworm AS builder
 ENV GOTOOLCHAIN=local \
@@ -92,11 +91,9 @@ COPY . .
 # building at all — server.openEmbedder fails rather than falling back, because
 # a server that quietly produced meaningless vectors would fill a durable corpus
 # with them and stamp the real model's name on every one.
-# remem-admin is built without the onnx tag: it inspects a data directory and
-# never embeds anything, so linking 90 MB of model runtime into it would buy
-# nothing. It ships in the image because the operations it exists for —
-# `graph verify` among them — need a stopped server or a backup checkpoint, and
-# both of those are inside the container.
+# remem-admin links the model too: snapshot imports and offline passage
+# upgrades compute embeddings. All three binaries share the runtime already
+# present in the image.
 #
 # GO_BUILD_TAGS is the product edition: empty for community, `business` for
 # business. An edition release writes its own default here
@@ -105,7 +102,7 @@ COPY . .
 ARG GO_BUILD_TAGS=
 RUN go build -trimpath -tags "onnx ${GO_BUILD_TAGS}" -o /out/remem ./cmd/remem \
  && go build -trimpath -tags "${GO_BUILD_TAGS}" -o /out/remem-mcp ./cmd/remem-mcp \
- && go build -trimpath -tags "${GO_BUILD_TAGS}" -o /out/remem-admin ./cmd/remem-admin
+ && go build -trimpath -tags "onnx ${GO_BUILD_TAGS}" -o /out/remem-admin ./cmd/remem-admin
 
 FROM debian:bookworm-slim AS runtime
 # curl is here for the health probe, not for the server: an image whose

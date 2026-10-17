@@ -39,6 +39,8 @@ func indexNameFor(s keys.Space) string {
 		return "attr"
 	case keys.SpaceEdgeIn:
 		return "graph-in"
+	case keys.SpacePassage:
+		return "passages"
 	}
 	return ""
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/tenant"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/indexqueue"
 )
 
@@ -31,7 +32,7 @@ func TestSettleWaitsForTheTenantsQueuedWrites(t *testing.T) {
 
 	rid := id.New()
 	v := []float32{1, 0, 0, 0}
-	if err := q.Indexed(ctx, acme, rid, v); err != nil {
+	if err := q.Indexed(ctx, acme, rid, vector.Single(v)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -90,7 +91,7 @@ type gatedIndex struct {
 	openOnce sync.Once
 }
 
-func (g *gatedIndex) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error {
+func (g *gatedIndex) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []vector.Entry) error {
 	<-g.gate
 	return g.Maintained.Indexed(ctx, t, rid, v)
 }

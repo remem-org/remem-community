@@ -35,7 +35,7 @@ func TestConcurrentSearchesMatchSequentialResults(t *testing.T) {
 
 	rng := newTestRNG(23)
 	for range corpus {
-		if err := ix.Indexed(ctx, "concurrent", id.New(), rng.unit(dim)); err != nil {
+		if err := ix.Indexed(ctx, "concurrent", id.New(), vector.Single(rng.unit(dim))); err != nil {
 			t.Fatal(err)
 		}
 	}

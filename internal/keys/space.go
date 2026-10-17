@@ -73,6 +73,22 @@ const (
 	// row is — a lost attempt is an execution nothing can explain afterwards —
 	// and bounded by jobs.retention rather than kept for ever.
 	SpaceJobRun Space = 0x0E
+	// SpacePassage holds the passage vectors of memories longer than one
+	// passage: each passage's byte span and its vector, keyed by record and
+	// passage number so one memory's passages are one range. Derived from the
+	// record's content, the model and the passage format, and never exported.
+	// The byte is reserved for it in docs/architecture/belief.md.
+	//
+	SpacePassage Space = 0x0F
+	// SpaceUser holds a tenant's users, their tokens and the index that makes a
+	// user name unique within the tenant. Canonical: a user is an identity that
+	// audit events and evidence refer to by id, and nothing could rebuild one.
+	// The name index is derived from the user rows, but it shares the space so
+	// that one tenant's users are one range; it is rebuilt by the package that
+	// owns the space, on import, rather than by the generic rebuild path. The
+	// byte sits outside the maintained-memory block 0x10-0x2F, as recorded in
+	// docs/architecture/belief.md.
+	SpaceUser Space = 0x30
 )
 
 var spaceNames = map[Space]string{
@@ -90,6 +106,8 @@ var spaceNames = map[Space]string{
 	SpaceSession:     "session",
 	SpaceJobPause:    "job_pause",
 	SpaceJobRun:      "job_run",
+	SpacePassage:     "passage",
+	SpaceUser:        "user",
 }
 
 // String returns the stable snake_case name used in logs, metric labels and
@@ -137,6 +155,10 @@ var derivations = map[Space][]Space{
 	SpaceAttrIndex:   {SpaceAttrRow},
 	SpaceText:        {SpaceRecord},
 	SpaceVectorIndex: {SpaceVector},
+	// A passage row is computed from the record's content by the model. Not
+	// from the canonical vector: that is the document vector, a mean the
+	// passages are not derived from.
+	SpacePassage: {SpaceRecord},
 }
 
 // Class reports whether the space is canonical or derived. An undeclared space
@@ -163,7 +185,8 @@ func AllSpaces() []Space {
 	return []Space{
 		SpaceSystem, SpaceRecord, SpaceVector, SpaceEdgeOut, SpaceEdgeIn,
 		SpaceAttrRow, SpaceAttrIndex, SpaceText, SpaceVectorIndex,
-		SpaceJob, SpaceEvent, SpaceSession, SpaceJobPause, SpaceJobRun,
+		SpaceJob, SpaceEvent, SpaceSession, SpaceJobPause, SpaceJobRun, SpacePassage,
+		SpaceUser,
 	}
 }
 

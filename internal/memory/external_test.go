@@ -161,16 +161,21 @@ func TestAnUpdateThatLeavesContentAloneNeedsNoVector(t *testing.T) {
 	}
 }
 
-// countingExternal is an external declaration that counts Embed calls, so a
-// test can prove a search ran no model rather than infer it.
+// countingExternal is an external declaration that counts embedding calls of
+// either kind, so a test can prove a request ran no model rather than infer it.
 type countingExternal struct {
 	*embedding.External
 	calls int
 }
 
-func (c *countingExternal) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (c *countingExternal) EmbedQueries(ctx context.Context, texts []string) ([][]float32, error) {
 	c.calls++
-	return c.External.Embed(ctx, texts)
+	return c.External.EmbedQueries(ctx, texts)
+}
+
+func (c *countingExternal) EmbedDocuments(ctx context.Context, texts []string) ([]embedding.Document, error) {
+	c.calls++
+	return c.External.EmbedDocuments(ctx, texts)
 }
 
 // seedAxes stores one memory per axis, each pointing along its own axis, and

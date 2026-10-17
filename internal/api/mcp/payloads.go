@@ -233,6 +233,19 @@ type searchHit struct {
 	Score   float32       `json:"score"`
 	Matched []string      `json:"matched,omitempty"`
 	Sources []sourceScore `json:"sources,omitempty"`
+	// Passage is the passage whose vector ranked this memory, absent on a
+	// keyword-only hit. A model can quote the span instead of the whole
+	// memory, and should read it as where the match was strongest rather than
+	// as the answer.
+	Passage *passagePayload `json:"passage,omitempty"`
+}
+
+// passagePayload is one passage of a memory's content: its number, 0 for the
+// first, and the UTF-8 byte range it covers, [start, end).
+type passagePayload struct {
+	Index uint32 `json:"index"`
+	Start uint32 `json:"start"`
+	End   uint32 `json:"end"`
 }
 
 type sourceScore struct {
@@ -246,6 +259,8 @@ type sourceScore struct {
 	// because a model reading one source needs to know what it added up to.
 	FusedScore float32 `json:"fused_score"`
 	Distance   float32 `json:"distance"`
+	// Passage is the passage a vector source came from, absent on any other.
+	Passage *uint32 `json:"passage,omitempty"`
 }
 
 // matchedBy is the compact list of indexes that found a memory.
@@ -287,4 +302,13 @@ type relatedPayload struct {
 	NextCursor string       `json:"next_cursor,omitempty"`
 	HasMore    bool         `json:"has_more"`
 	Truncated  bool         `json:"truncated"`
+}
+
+// vectorPassage is the passage of a vector source, and nil for any other.
+func vectorPassage(s memory.SourceScore) *uint32 {
+	if s.Source != "vector" {
+		return nil
+	}
+	p := s.Passage
+	return &p
 }

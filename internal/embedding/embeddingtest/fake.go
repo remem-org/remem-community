@@ -18,6 +18,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/remem-org/remem-go/internal/embedding"
 )
@@ -57,7 +58,7 @@ func (f *Fake) WithModel(id string) *Fake {
 func (f *Fake) Dim() int        { return f.dim }
 func (f *Fake) ModelID() string { return f.modelID }
 
-// Calls reports how many times Embed was invoked. Batching assertions read it:
+// Calls reports how many times either operation was invoked. Batching assertions read it:
 // a CreateBatch of twenty memories that embedded twenty times has lost the only
 // thing batching was for.
 func (f *Fake) Calls() int {
@@ -80,21 +81,82 @@ func (f *Fake) Fail(err error) {
 	f.err = err
 }
 
-func (f *Fake) Embed(_ context.Context, texts []string) ([][]float32, error) {
+// PassageWords is how many words make one of the fake's passages. The model's
+// passages are 256 tokens; the fake's are short, so that a test can write a
+// multi-passage memory in a line or two and know which passage a word is in:
+// word w is in passage w / PassageWords.
+const PassageWords = 32
+
+func (f *Fake) begin(n int) error {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
-	f.texts += len(texts)
-	err := f.err
-	f.mu.Unlock()
-	if err != nil {
+	f.texts += n
+	return f.err
+}
+
+// EmbedQueries returns each text's bag-of-words vector.
+func (f *Fake) EmbedQueries(_ context.Context, texts []string) ([][]float32, error) {
+	if err := f.begin(len(texts)); err != nil {
 		return nil, err
 	}
-
 	out := make([][]float32, len(texts))
 	for i, text := range texts {
 		out[i] = f.vector(text)
 	}
 	return out, nil
+}
+
+// EmbedDocuments splits each text into passages of PassageWords words, the way
+// the model splits one into passages of 256 tokens: deterministically, with
+// byte spans, none for a text that fits one passage. Each passage's vector is
+// the bag of its own words, so a search for a word ranks the memory by the
+// passage that holds it. The document vector is the bag of the first segment's
+// words, as the model's is the mean over its first segment.
+func (f *Fake) EmbedDocuments(_ context.Context, texts []string) ([]embedding.Document, error) {
+	if err := f.begin(len(texts)); err != nil {
+		return nil, err
+	}
+	out := make([]embedding.Document, len(texts))
+	for i, text := range texts {
+		words := wordSpans(text)
+		if len(words) <= PassageWords {
+			out[i] = embedding.Document{Vector: f.vector(text)}
+			continue
+		}
+		var d embedding.Document
+		for w := 0; w < len(words); w += PassageWords {
+			last := min(w+PassageWords, len(words)) - 1
+			start, end := words[w][0], words[last][1]
+			d.Passages = append(d.Passages, embedding.Passage{
+				Start: uint32(start), End: uint32(end), Vector: f.vector(text[start:end]),
+			})
+		}
+		segmentEnd := words[min(len(words), PassageWords*embedding.SegmentPassages)-1][1]
+		d.Vector = f.vector(text[:segmentEnd])
+		out[i] = d
+	}
+	return out, nil
+}
+
+// wordSpans is the byte range of every whitespace-separated word.
+func wordSpans(text string) [][2]int {
+	var out [][2]int
+	start := -1
+	for i, r := range text {
+		if unicode.IsSpace(r) {
+			if start >= 0 {
+				out = append(out, [2]int{start, i})
+				start = -1
+			}
+		} else if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		out = append(out, [2]int{start, len(text)})
+	}
+	return out
 }
 
 // vector hashes each word to a small set of dimensions and accumulates. Two

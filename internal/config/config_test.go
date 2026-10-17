@@ -135,7 +135,7 @@ workers = 3
 	if c.Server.HTTPAddr != "127.0.0.1:1111" || c.Jobs.Workers != 3 {
 		t.Fatalf("file values not applied: %+v", c.Server)
 	}
-	if c.Vector.Dimension != 384 {
+	if c.Vector.Dimension != config.EmbeddingDimension {
 		t.Fatal("unset keys must keep their defaults")
 	}
 

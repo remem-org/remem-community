@@ -10,6 +10,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/obs"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/indexqueue"
 )
 
@@ -44,7 +45,7 @@ func TestAnAcceptedOperationIsNeverLostSilentlyWhenCloseRacesIt(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range perIteration {
-				if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err == nil {
+				if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err == nil {
 					n.Add(1)
 				}
 			}
@@ -83,7 +84,7 @@ func TestWaitReturnsOnceTheWorkersHaveStopped(t *testing.T) {
 	q := indexqueue.New(r, indexqueue.WithWorkers(1), indexqueue.WithSize(8))
 	ctx := context.Background()
 	for range 4 {
-		if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+		if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -126,7 +127,7 @@ func TestASecondCloseWaitsForTheFirstOnesWorkers(t *testing.T) {
 	q := indexqueue.New(r, indexqueue.WithWorkers(1), indexqueue.WithSize(8))
 	ctx := context.Background()
 	for range 4 {
-		if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+		if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 			t.Fatal(err)
 		}
 	}

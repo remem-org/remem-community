@@ -68,7 +68,16 @@ import (
 // row 16 records that absolute similarity is not comparable across the two
 // pooling schemes at all — unrelated pairs sit at 0.626 median cosine in Rust's
 // CLS space and 0.074 in Go's mean-pooled one. See docs/architecture/discovery.md.
-const DefaultThreshold = 0.7
+//
+// It was Rust's 0.7 until the model became pplx-embed-context-v1-0.6b
+// (openspec/changes/passage-vectors, design decision 11). Re-measured in that
+// space over 48 labelled memories, paraphrases sit at 0.670 and above and
+// topic-mates at 0.518 and below, so 0.7 would now miss a paraphrase and 0.6
+// sits in the middle of the gap: every paraphrase linked, no topic-mate, no
+// unrelated pair. The meaning of similar_to — "says nearly the same thing" —
+// is what was kept; the number moved to keep it.
+// TestTheDiscoveryThresholdOverALabelledCorpus, behind the onnx tag, holds it.
+const DefaultThreshold = 0.6
 
 // DefaultTopK is how many relationships one memory may gain per run.
 // config.rs:275.

@@ -34,10 +34,10 @@ func TestReloadSkipsAVectorOfAnotherWidthInsteadOfPanicking(t *testing.T) {
 		t.Cleanup(func() { _ = kv.Close() })
 		idx := newIndex(t, kv, hnsw.Options{})
 		keep, odd := seqID(1), seqID(2)
-		if err := idx.Insert(ctx, "acme", keep, []float32{1, 0}); err != nil {
+		if err := idx.Insert(ctx, "acme", keep, vector.Single([]float32{1, 0})); err != nil {
 			t.Fatal(err)
 		}
-		if err := idx.Insert(ctx, "acme", odd, []float32{0, 1}); err != nil {
+		if err := idx.Insert(ctx, "acme", odd, vector.Single([]float32{0, 1})); err != nil {
 			t.Fatal(err)
 		}
 		putWidened(t, kv, odd)
@@ -62,7 +62,7 @@ func TestReloadSkipsAVectorOfAnotherWidthInsteadOfPanicking(t *testing.T) {
 		t.Cleanup(func() { _ = kv.Close() })
 		idx := newIndex(t, kv, hnsw.Options{})
 		keep := seqID(1)
-		if err := idx.Insert(ctx, "acme", keep, []float32{1, 0}); err != nil {
+		if err := idx.Insert(ctx, "acme", keep, vector.Single([]float32{1, 0})); err != nil {
 			t.Fatal(err)
 		}
 		putWidened(t, kv, seqID(2))
@@ -217,7 +217,7 @@ func TestOnlyRepairableCorruptionSchedulesARebuild(t *testing.T) {
 		t.Cleanup(func() { _ = kv.Close() })
 		idx := newIndex(t, kv, hnsw.Options{})
 		for i, rid := range []id.ID{seqID(1), seqID(2), seqID(3)} {
-			if err := idx.Insert(ctx, "acme", rid, []float32{float32(i), 1}); err != nil {
+			if err := idx.Insert(ctx, "acme", rid, vector.Single([]float32{float32(i), 1})); err != nil {
 				t.Fatal(err)
 			}
 		}

@@ -51,8 +51,17 @@ const AttrBackfillID = "0001-attribute-rows"
 // from the version package, for the reason [NewRegistry] does: the check that
 // no step advances a format past what the binary writes cannot be exercised
 // against a constant.
-func Builtin(supported version.Versions, indexer RowIndexer, reindexer TextReindexer) (*Registry, error) {
-	return NewRegistry(supported, attrBackfill(indexer), textIndexRebuild(reindexer))
+//
+// The re-embedding step is always registered. A build that supplied no
+// embedder through [WithPassages] refuses only a directory that needs the
+// step, and says why.
+func Builtin(supported version.Versions, indexer RowIndexer, reindexer TextReindexer,
+	opts ...BuiltinOption) (*Registry, error) {
+	var d builtinDeps
+	for _, o := range opts {
+		o(&d)
+	}
+	return NewRegistry(supported, attrBackfill(indexer), textIndexRebuild(reindexer), passageReembed(d), userFormatStamp())
 }
 
 // TextReindexer queues a rebuild of one tenant's keyword index inside tx.

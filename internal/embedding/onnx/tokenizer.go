@@ -13,15 +13,20 @@ import (
 	"github.com/remem-org/remem-go/internal/errs"
 )
 
-// tokenizer wraps the Hugging Face WordPiece tokenizer that produced the Rust
-// corpus.
+// tokenizer wraps the model's Qwen3 byte-level BPE tokenizer.
 //
-// The binding is used rather than a Go reimplementation for one reason: the
-// tokenizer decides what the model sees, and BERT's normalisation — lowercase,
-// accent stripping, CJK character splitting, punctuation handling — has enough
-// corners that a reimplementation would agree on the 200 reference strings and
-// diverge on the 201st. Sharing the implementation removes that whole class of
-// difference and leaves only pooling, which is testable.
+// The binding is used rather than a Go reimplementation because the tokenizer
+// decides what the model sees, and byte-level BPE with Qwen's pre-tokenisation
+// rules has enough corners that a reimplementation would agree on every test
+// string and diverge on the next. Sharing the implementation leaves only the
+// passage construction and the pooling, which the reference test holds.
+//
+// This tokenizer.json configures no truncation, no padding and no special
+// tokens, which is what Remem needs: content is tokenised whole, once, and the
+// passage construction inserts the separators itself. MiniLM's tokenizer
+// truncated to 128 tokens inside the encode call, before Remem's own limit ever
+// applied, and nothing reported it; the encode here asks for no special tokens
+// and the reference test would notice a truncation as a missing passage.
 type tokenizer struct {
 	mu    sync.Mutex
 	inner *tokenizers.Tokenizer
@@ -52,102 +57,40 @@ func (t *tokenizer) Close() {
 	}
 }
 
-// encoding is one tokenised text, padded to the batch width.
-type encoding struct {
+// tokens is one text's token ids and, for each, the UTF-8 byte range of the
+// text it came from.
+//
+// The offsets are bytes because the Rust tokenizer reports bytes and this
+// binding passes them through — verified against the non-ASCII reference case,
+// 2,079 bytes and 1,626 characters. Python's binding converts them to character
+// indices, which is why the reference script converts back. A byte-level BPE
+// token can be part of a character, so two adjacent tokens can report the same
+// character's whole range; a span built from a first and a last token's offsets
+// still falls on character boundaries.
+type tokens struct {
 	ids     []int64
-	mask    []int64
-	typeIDs []int64
+	offsets [][2]uint32
 }
 
-type batchEncoding struct {
-	rows  []encoding
-	width int
-}
-
-// encodeBatch tokenises every text and pads them to the longest.
-//
-// The attention mask comes from the tokenizer, never from the length of the id
-// slice. That distinction is the whole task: tokenizer.json for this model
-// configures fixed padding to 128 tokens, so a five-word memory arrives as 128
-// ids of which 123 are [PAD]. Deriving the mask from len(ids) marks all 128 as
-// real, the model then attends to the padding, and every vector comes out
-// wrong — plausibly wrong, at the right width and the right norm.
-//
-// The padding the tokenizer applies is also stripped here, and the batch is
-// padded to its own longest sequence instead. The cost of a run is quadratic in
-// sequence length and most memories are short, so a batch of one-line memories
-// held at 128 columns does many times the work for the same answer. It is also
-// what the Rust pipeline does, and a difference in sequence width is a
-// difference in the vector.
-func (t *tokenizer) encodeBatch(texts []string, maxLen int) (batchEncoding, error) {
-	const op = "onnx.encodeBatch"
+func (t *tokenizer) encode(text string) (tokens, error) {
+	const op = "onnx.encode"
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.inner == nil {
-		return batchEncoding{}, errs.E(errs.Unavailable, op, errors.New("the tokenizer has been closed"))
+		return tokens{}, errs.E(errs.Unavailable, op, errors.New("the tokenizer has been closed"))
 	}
-
-	type row struct{ ids, mask, types []uint32 }
-	raw := make([]row, len(texts))
-	width := 1 // never zero: a batch of empty strings still needs one column
-	for i, text := range texts {
-		enc := t.inner.EncodeWithOptions(text, true, // true: add [CLS] and [SEP]
-			tokenizers.WithReturnAttentionMask(), tokenizers.WithReturnTypeIDs())
-
-		n := trueLength(enc.AttentionMask, len(enc.IDs))
-		if n > maxLen {
-			n = maxLen
-		}
-		raw[i] = row{ids: enc.IDs[:n], mask: enc.AttentionMask[:n], types: clip(enc.TypeIDs, n)}
-		if n > width {
-			width = n
-		}
+	enc, err := t.inner.EncodeWithOptionsErr(text, false, tokenizers.WithReturnOffsets())
+	if err != nil {
+		return tokens{}, errs.E(errs.Storage, op, fmt.Errorf("tokenising: %w", err))
 	}
-
-	out := batchEncoding{rows: make([]encoding, len(texts)), width: width}
-	for i, r := range raw {
-		e := encoding{
-			ids:     make([]int64, width),
-			mask:    make([]int64, width),
-			typeIDs: make([]int64, width),
-		}
-		for j := range r.ids {
-			e.ids[j] = int64(r.ids[j])
-			e.mask[j] = int64(r.mask[j])
-			if j < len(r.types) {
-				e.typeIDs[j] = int64(r.types[j])
-			}
-		}
-		// Positions beyond the text keep id 0 ([PAD]), mask 0 and type 0.
-		out.rows[i] = e
+	if len(enc.Offsets) != len(enc.IDs) {
+		return tokens{}, errs.E(errs.Storage, op, errors.New("the tokenizer returned offsets for a different number of tokens"))
+	}
+	out := tokens{ids: make([]int64, len(enc.IDs)), offsets: make([][2]uint32, len(enc.IDs))}
+	for i, id := range enc.IDs {
+		out.ids[i] = int64(id)
+		out.offsets[i] = [2]uint32{uint32(enc.Offsets[i][0]), uint32(enc.Offsets[i][1])}
 	}
 	return out, nil
-}
-
-// trueLength is how many leading positions the attention mask marks as real.
-//
-// A tokenizer with no mask configured returns none, and every position is then
-// real — which is correct for a tokenizer that also applied no padding. The
-// fallback is deliberate rather than an assumption: it is only reached when
-// there is nothing to strip.
-func trueLength(mask []uint32, ids int) int {
-	if len(mask) == 0 {
-		return ids
-	}
-	n := 0
-	for _, m := range mask {
-		if m == 0 {
-			break
-		}
-		n++
-	}
-	return n
-}
-
-func clip(v []uint32, n int) []uint32 {
-	if len(v) < n {
-		return v
-	}
-	return v[:n]
 }

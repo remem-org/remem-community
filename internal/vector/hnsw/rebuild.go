@@ -1,9 +1,11 @@
 package hnsw
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
+	"slices"
 
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
@@ -170,29 +172,30 @@ func (x *Index) replace(ctx context.Context, t tenant.ID, src vector.Source) err
 	// Drain first. Every refusal the source can produce happens before a byte
 	// of the tenant's data is touched, which is what makes a failed rebuild a
 	// no-op rather than a partial one.
-	vectors := make(map[id.ID]*vector.Vector)
-	if err := src.Scan(ctx, t, func(rid id.ID, v []float32) error {
+	entries := make(map[id.ID][]vector.Entry)
+	if err := src.Scan(ctx, t, func(key vector.Key, v []float32) error {
 		if len(v) == 0 {
 			return errs.E(errs.Invalid, op, errors.New("an empty vector cannot be indexed"))
 		}
-		vectors[rid] = &vector.Vector{
-			// x.modelID and not stampedModel: when this server was not told
-			// which model it runs, the model id is left empty so that
-			// vector.Store.Replace keeps the one already recorded. A rebuild
-			// reads coordinates through vector.Source and cannot know what
-			// produced them; writing "unknown" over a corpus that did know is
-			// how `remem-admin vector rebuild` made a tenant unsearchable.
-			ModelID: x.modelID,
-			Dim:     len(v),
-			Values:  append([]float32(nil), v...),
-		}
+		entries[key.ID] = append(entries[key.ID],
+			vector.Entry{Passage: key.Passage, Vector: append([]float32(nil), v...)})
 		return nil
 	}); err != nil {
 		return err
 	}
+	for _, set := range entries {
+		slices.SortFunc(set, func(a, b vector.Entry) int { return cmp.Compare(a.Passage, b.Passage) })
+	}
 
 	x.markRebuilding(t)
-	if err := x.store.Replace(ctx, t, tenant.DefaultNamespace, vectors); err != nil {
+	// x.modelID and not stampedModel: when this server was not told which model
+	// it runs, the model id is left empty so that the store keeps the one
+	// already recorded. A rebuild reads coordinates through vector.Source and
+	// cannot know what produced them; writing "unknown" over a corpus that did
+	// know is how `remem-admin vector rebuild` made a tenant unsearchable. The
+	// same holds for each passage's span and a multi-passage memory's document
+	// vector, which the store inherits too (vector.Store.ReplaceEntries).
+	if err := x.store.ReplaceEntries(ctx, t, tenant.DefaultNamespace, x.modelID, entries); err != nil {
 		return err
 	}
 	if err := x.clearNodes(ctx, t); err != nil {
@@ -268,7 +271,7 @@ func (x *Index) dropUnreadable(ctx context.Context, doomed [][]byte) error {
 // list between this batch's staging and its commit and then be overwritten by
 // the older one.
 func (x *Index) insertBatch(ctx context.Context, t tenant.ID, r *resident,
-	ids []id.ID, vectors map[id.ID]*vector.Vector,
+	ids []vector.Key, vectors map[vector.Key]*vector.Vector,
 ) (_ int, sz size, _ error) {
 	const op = "hnsw.Rebuild"
 

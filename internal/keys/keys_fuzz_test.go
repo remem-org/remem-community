@@ -26,6 +26,7 @@ func FuzzKeyDecoders(f *testing.F) {
 	f.Add(keys.Text(t, ns, "raft", rid))
 	f.Add(keys.Job(t, ns, keys.JobPending, 1_700_000_000_000, rid))
 	f.Add(keys.Event(t, ns, rid, 1_700_000_000_000, 7))
+	f.Add(keys.Passage(t, ns, rid, 4))
 	f.Add(keys.System("format"))
 	f.Add([]byte{})
 	// A non-minimal uvarint for a zero-length tenant.
@@ -51,6 +52,11 @@ func FuzzKeyDecoders(f *testing.F) {
 			mustBeCorruption(tt, "ParseEvent", k, err)
 		} else if got := keys.Event(tid, n, subj, ts, seq); !bytes.Equal(got, k) {
 			tt.Fatalf("ParseEvent accepted %x, which re-encodes as %x", k, got)
+		}
+		if tid, n, r, p, err := keys.ParsePassage(k); err != nil {
+			mustBeCorruption(tt, "ParsePassage", k, err)
+		} else if got := keys.Passage(tid, n, r, p); !bytes.Equal(got, k) {
+			tt.Fatalf("ParsePassage accepted %x, which re-encodes as %x", k, got)
 		}
 		if _, _, s, err := keys.ParseSpace(k); err != nil {
 			mustBeCorruption(tt, "ParseSpace", k, err)

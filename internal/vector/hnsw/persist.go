@@ -21,12 +21,20 @@ import (
 // internal/version, for the same reason attr.RowFormatVersion is: a node record
 // this binary cannot read is one unreadable row of a *derived* index. That is a
 // rebuild, not a refusal to open the database.
-const NodeFormatVersion uint8 = 1
+const NodeFormatVersion uint8 = 2
+
+// nodeFormatCanonical is the format of a node for a memory's passage 0, which
+// is also what every node was before passages existed. A passage-0 node is still
+// written in it, byte for byte as before, so the graph of a memory indexed by
+// its canonical vector does not change on disk; only a passage numbered 1 or
+// above needs the passage field format 2 adds.
+const nodeFormatCanonical uint8 = 1
 
 // A node record is:
 //
-//	[u8      format version]
+//	[u8      format version: 1 for passage 0, 2 otherwise]
 //	[16      record id]
+//	[uvarint passage number]       format 2 only
 //	[u8      top layer]
 //	[per layer 0..top:]
 //	  [uvarint neighbour count]
@@ -40,13 +48,19 @@ const NodeFormatVersion uint8 = 1
 // a record whose stored layer disagrees with the one this binary would give it
 // is read as a graph built under different parameters, which is a rebuild.
 func encodeNode(n *node) []byte {
-	size := 1 + 16 + 1
+	size := 1 + 16 + binary.MaxVarintLen32 + 1
 	for _, l := range n.links {
 		size += 8 + len(l)*4
 	}
 	b := make([]byte, 0, size)
-	b = append(b, NodeFormatVersion)
-	b = append(b, n.id[:]...)
+	if n.key.Passage == 0 {
+		b = append(b, nodeFormatCanonical)
+		b = append(b, n.key.ID[:]...)
+	} else {
+		b = append(b, NodeFormatVersion)
+		b = append(b, n.key.ID[:]...)
+		b = binary.AppendUvarint(b, uint64(n.key.Passage))
+	}
 	b = append(b, uint8(n.level))
 	for l := 0; l <= n.level; l++ {
 		var links []uint32
@@ -65,7 +79,7 @@ func encodeNode(n *node) []byte {
 // names still has a canonical vector.
 type storedNode struct {
 	num   uint32
-	id    id.ID
+	key   vector.Key
 	level int
 	links [][]uint32
 }
@@ -79,21 +93,39 @@ func decodeNode(num uint32, b []byte) (*storedNode, error) {
 	if len(b) < 1+16+1 {
 		return nil, bad("shorter than a header")
 	}
-	if b[0] != NodeFormatVersion {
+	if b[0] != nodeFormatCanonical && b[0] != NodeFormatVersion {
 		return nil, errs.E(errs.IncompatibleVersion, op, fmt.Errorf(
-			"node record %d is format %d and this binary reads %d", num, b[0], NodeFormatVersion))
+			"node record %d is format %d and this binary reads %d and %d", num, b[0], nodeFormatCanonical, NodeFormatVersion))
 	}
 	rid, err := id.FromBytes(b[1:17])
 	if err != nil {
 		return nil, bad("holds a malformed record id")
 	}
-	level := int(b[17])
+	key := vector.Key{ID: rid}
+	rest := b[17:]
+	if b[0] == NodeFormatVersion {
+		p, w := binary.Uvarint(rest)
+		if w <= 0 || p > 0xFFFFFFFF {
+			return nil, bad("holds a malformed passage number")
+		}
+		if p == 0 {
+			// Passage 0 is always written in format 1, so a format 2 record
+			// naming it is not one this package wrote.
+			return nil, bad("is format 2 and names passage 0")
+		}
+		key.Passage = uint32(p)
+		rest = rest[w:]
+	}
+	if len(rest) < 1 {
+		return nil, bad("ends before its top layer")
+	}
+	level := int(rest[0])
 	if level > maxLevel {
 		return nil, bad(fmt.Sprintf("claims layer %d, above the %d bound", level, maxLevel))
 	}
 
-	out := &storedNode{num: num, id: rid, level: level, links: make([][]uint32, level+1)}
-	rest := b[18:]
+	out := &storedNode{num: num, key: key, level: level, links: make([][]uint32, level+1)}
+	rest = rest[1:]
 	for l := 0; l <= level; l++ {
 		count, w := binary.Uvarint(rest)
 		if w <= 0 {
@@ -173,8 +205,8 @@ type loadResult struct {
 // left undone — no later insert can succeed on it — and a caller that trusted
 // the pairing would dereference a vector that is not there.
 type pendingWork struct {
-	pending    []id.ID
-	vectors    map[id.ID]*vector.Vector
+	pending    []vector.Key
+	vectors    map[vector.Key]*vector.Vector
 	unreadable [][]byte
 }
 
@@ -203,8 +235,8 @@ func (x *Index) load(ctx context.Context, t tenant.ID) (*graph, loadResult, erro
 		staged++
 	}
 
-	for _, rid := range work.pending {
-		dirty, err := g.insert(rid, work.vectors[rid].Values)
+	for _, key := range work.pending {
+		dirty, err := g.insert(key, work.vectors[key].Values)
 		if err != nil {
 			return nil, res, err
 		}
@@ -249,11 +281,14 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 	const op = "hnsw.load"
 	var res loadResult
 
-	vectors := make(map[id.ID]*vector.Vector)
-	order := make([]id.ID, 0, 64)
+	// The entries, not the canonical vectors: a memory's passages when it has
+	// any, its canonical vector otherwise (vector.Store.ScanEntries). This is
+	// the membership rule the reconciliation below enforces in both directions.
+	vectors := make(map[vector.Key]*vector.Vector)
+	order := make([]vector.Key, 0, 64)
 	widths := make(map[int]int)
 	modelID := ""
-	if err := x.store.ScanVectors(ctx, t, func(rid id.ID, v *vector.Vector) error {
+	if err := x.store.ScanEntries(ctx, t, func(rid vector.Key, v *vector.Vector) error {
 		if v.ModelID != "" {
 			switch {
 			case modelID == "":
@@ -306,12 +341,12 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 	// what they said.
 	g.nodes = make([]*node, maxNum+1)
 	for _, sn := range stored {
-		v, ok := vectors[sn.id]
+		v, ok := vectors[sn.key]
 		if !ok {
 			res.Dropped++
 			continue
 		}
-		if sn.level != levelOf(sn.id, g.params.M) {
+		if sn.level != levelOf(sn.key, g.params.M) {
 			// The graph was built under a different M. Its links are still
 			// readable but they are not the structure these parameters
 			// describe, so the tenant is degraded and wants a rebuild.
@@ -326,10 +361,10 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 			// all one width, which answers *every* search with an error rather
 			// than this one record with none.
 			res.Unplaceable++
-			delete(vectors, sn.id)
+			delete(vectors, sn.key)
 			continue
 		}
-		n := &node{id: sn.id, slot: g.allocSlot(v.Values), norm: distance.Norm(v.Values), level: sn.level}
+		n := &node{key: sn.key, slot: g.allocSlot(v.Values), norm: distance.Norm(v.Values), level: sn.level}
 		n.links = sn.links
 		n.back = make([][]uint32, sn.level+1)
 		// The stored lists enter the running count here, in the loop that
@@ -338,7 +373,7 @@ func (x *Index) materialise(ctx context.Context, t tenant.ID, work *pendingWork)
 			g.linkEntries += int64(len(l))
 		}
 		g.nodes[sn.num] = n
-		g.byID[sn.id] = sn.num
+		g.byID[sn.key] = sn.num
 		g.live++
 	}
 

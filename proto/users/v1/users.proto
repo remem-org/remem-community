@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+// Package users.v1 holds the rows of the user space (space 0x30): a tenant's
+// users, their tokens, the name index, and the untenanted token-index row at
+// /tokens/<token id>.
+//
+// It is protobuf for the reason tenant rows are: a rolling upgrade runs mixed
+// binaries against one directory, and an older binary that rewrites a row a
+// newer one wrote must not destroy the fields it never heard of.
+//
+// No row repeats the id its key already holds. A second copy inside the value
+// is a second thing that can disagree with the first.
+package users.v1;
+
+option go_package = "github.com/remem-org/remem-go/internal/users/pb;pb";
+
+// State is whether a user's tokens authenticate.
+enum State {
+  // Never written. A row carrying it is corrupt.
+  STATE_UNSPECIFIED = 0;
+  STATE_ACTIVE = 1;
+  // A disabled user's tokens are refused. The user is kept, because audit
+  // events and evidence refer to its id, and can be enabled again.
+  STATE_DISABLED = 2;
+}
+
+// User is one user of a tenant, stored at the user row of its id.
+message User {
+  // name is the name as the operator wrote it. Uniqueness is decided on its
+  // folded form, which keys the name index.
+  string name = 1;
+  State state = 2;
+  uint64 created_at_unix_ms = 3;
+  uint64 updated_at_unix_ms = 4;
+}
+
+// Token is one token, stored at the token row of the token's own id.
+message Token {
+  // user_id is the user this token authenticates as: sixteen bytes.
+  bytes user_id = 1;
+  // digest is the SHA-256 of the secret. The secret itself is never stored.
+  bytes digest = 2;
+  uint64 created_at_unix_ms = 3;
+  // expires_at_unix_ms is when the token stops authenticating. Absent means
+  // never.
+  optional uint64 expires_at_unix_ms = 4;
+  // revoked_at_unix_ms is when the token was revoked. Present means revoked,
+  // and revocation is permanent.
+  optional uint64 revoked_at_unix_ms = 5;
+}
+
+// Name is the name-index row for one folded name: which user holds it.
+message Name {
+  bytes user_id = 1;
+}
+
+// TokenIndex is the untenanted row naming the tenant a token belongs to.
+// Authentication reads it before any tenant is known.
+message TokenIndex {
+  string tenant = 1;
+}

@@ -35,6 +35,11 @@ const (
 	// from its record bodies. Before Phase 13 only `remem-admin rebuild --index
 	// attr` could, which needs a stopped server.
 	TypeAttrRebuild jobs.Type = "attr.rebuild"
+	// TypePassagesRebuild re-embeds a tenant's memories and rewrites their
+	// passage rows. The one rebuild that runs the model: a passage row is a
+	// function of the content and the model, so recomputing it is embedding
+	// the corpus again.
+	TypePassagesRebuild jobs.Type = "passages.rebuild"
 	// TypeJobsReap removes finished job rows past the retention.
 	TypeJobsReap jobs.Type = "jobs.reap"
 	// TypeLifecycleMaintain is the per-tenant lifecycle pass: expiry,
@@ -65,6 +70,8 @@ func rebuildJobFor(s keys.Space) (jobs.Type, bool) {
 		// One job for both: the slot entries are written by the same Stage
 		// call that writes the row they index.
 		return TypeAttrRebuild, true
+	case keys.SpacePassage:
+		return TypePassagesRebuild, true
 	}
 	return "", false
 }
@@ -123,6 +130,14 @@ func (d *deps) registerBuiltinJobs() error {
 		Type:        TypeAttrRebuild,
 		Description: "reproject the attribute rows and slot index for this tenant from its record bodies",
 		Handler:     jobs.HandlerFunc(d.rebuildAttrs),
+		MaxAttempts: 2,
+	}, {
+		Type:        TypePassagesRebuild,
+		Description: "re-embed this tenant's memories and rewrite their passage rows from their content",
+		Handler:     jobs.HandlerFunc(d.rebuildPassages),
+		// Two attempts, as the other rebuilds. This one is also the most
+		// expensive thing the server can be asked to do, and its checkpoint
+		// means a second attempt continues rather than repeats.
 		MaxAttempts: 2,
 	}, {
 		Type: TypeLifecycleMaintain,
@@ -224,6 +239,20 @@ func (d *deps) rebuildAttrs(ctx context.Context, j *jobs.Job, cp jobs.Checkpoint
 	// holding exactly the rows it was run to replace.
 	written, err := attr.RebuildRows(ctx, d.kv, j.Tenant, j.Namespace,
 		attr.WithRowCache(d.rowCache))
+	cp.Changed(uint64(written))
+	return err
+}
+
+// rebuildPassages recomputes the passage rows from the canonical content.
+//
+// It runs through the same embedder as the write path, so it queues behind
+// nothing a search needs: documents and queries have separate lanes, and the
+// model admits a waiting query before the next document pass. The job's
+// checkpoint is the rebuild's cursor, so an interrupted rebuild continues from
+// the last page it committed rather than embedding the tenant again.
+func (d *deps) rebuildPassages(ctx context.Context, j *jobs.Job, cp jobs.Checkpointer) error {
+	written, err := record.RebuildPassages(ctx, d.kv, j.Tenant, j.Namespace, d.embedder, j.Checkpoint,
+		func(next []byte) error { return cp.Save(ctx, next) })
 	cp.Changed(uint64(written))
 	return err
 }
@@ -414,5 +443,24 @@ func (r textReindexer) StageTextRebuild(ctx context.Context, tx txn.Tx, t tenant
 	}
 	return r.queue.Enqueue(ctx, tx, &jobs.Job{
 		Tenant: t, Namespace: tenant.DefaultNamespace, Type: TypeTextRebuild, MaxAttempts: 2,
+	})
+}
+
+// vectorReindexer queues an approximate-index rebuild for the re-embedding
+// migration, as a vector.rebuild job staged in the migration's own transaction:
+// the tenant's node records are cleared in that transaction, and the rebuild
+// builds the graph over the new vectors before a user's search would have to.
+// A tenant that already has one outstanding is left alone.
+type vectorReindexer struct{ queue *jobs.Queue }
+
+var _ schema.VectorReindexer = vectorReindexer{}
+
+func (r vectorReindexer) StageVectorRebuild(ctx context.Context, tx txn.Tx, t tenant.ID) error {
+	outstanding, err := r.queue.HasOutstanding(ctx, t, TypeVectorRebuild)
+	if err != nil || outstanding {
+		return err
+	}
+	return r.queue.Enqueue(ctx, tx, &jobs.Job{
+		Tenant: t, Namespace: tenant.DefaultNamespace, Type: TypeVectorRebuild, MaxAttempts: 2,
 	})
 }

@@ -234,6 +234,11 @@ type Result struct {
 	// Sources are the indexes that found this memory, best-scoring first.
 	// Present only when the request asked to explain.
 	Sources []SourceScore
+	// Passage is the passage whose vector ranked this memory, when vector
+	// evidence did. It is nil for a keyword-only result. It is evidence of
+	// where the match was strongest, not a guarantee that the answer lies
+	// inside it: a contextual passage's vector carries its neighbours' meaning.
+	Passage *PassageMatch
 }
 
 // SourceScore is one index's evidence for one memory.
@@ -252,6 +257,16 @@ type SourceScore struct {
 	// Distance is the raw metric value for a vector contribution, zero
 	// elsewhere.
 	Distance float32
+	// Passage is the entry that ranked a vector contribution, zero elsewhere.
+	Passage uint32
+}
+
+// PassageMatch is the passage that ranked a search result: its number in the
+// memory, 0 for the first, and the UTF-8 byte range of the content it covers,
+// [Start, End). The offsets fall on character boundaries.
+type PassageMatch struct {
+	Index      uint32
+	Start, End uint32
 }
 
 // SearchResult is one search's answer.

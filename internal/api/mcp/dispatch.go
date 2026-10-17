@@ -163,6 +163,9 @@ func (h *Handler) callTool(ctx context.Context, name string, raw json.RawMessage
 				Score:   r.Score,
 				Matched: matchedBy(r.Sources),
 			}
+			if p := r.Passage; p != nil {
+				hit.Passage = &passagePayload{Index: p.Index, Start: p.Start, End: p.End}
+			}
 			if a.Explain {
 				hit.Sources = make([]sourceScore, 0, len(r.Sources))
 				for _, s := range r.Sources {
@@ -172,6 +175,7 @@ func (h *Handler) callTool(ctx context.Context, name string, raw json.RawMessage
 						Rank:       s.Rank,
 						FusedScore: r.FusedScore,
 						Distance:   s.Distance,
+						Passage:    vectorPassage(s),
 					})
 				}
 			}

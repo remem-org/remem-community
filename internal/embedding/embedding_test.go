@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestABatchOfTwentyIsOneCallToTheModel(t *testing.T) {
 	for i := range reqs {
 		reqs[i] = fmt.Sprintf("memory %d", i)
 	}
-	got, err := s.Embed(context.Background(), reqs)
+	got, err := s.EmbedQueries(context.Background(), reqs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,11 +54,11 @@ func TestMoreTextsThanOneBatchAreEmbeddedInOrder(t *testing.T) {
 	for i := range texts {
 		texts[i] = fmt.Sprintf("memory %d", i)
 	}
-	got, err := s.Embed(context.Background(), texts)
+	got, err := s.EmbedQueries(context.Background(), texts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	direct, err := embeddingtest.New().Embed(context.Background(), texts)
+	direct, err := embeddingtest.New().EmbedQueries(context.Background(), texts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,10 +77,10 @@ func TestTheCacheServesARepeatedText(t *testing.T) {
 	s := newService(t, fake, embedding.ServiceConfig{})
 	ctx := context.Background()
 
-	if _, err := s.Embed(ctx, []string{"the sky is blue"}); err != nil {
+	if _, err := s.EmbedQueries(ctx, []string{"the sky is blue"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Embed(ctx, []string{"the sky is blue"}); err != nil {
+	if _, err := s.EmbedQueries(ctx, []string{"the sky is blue"}); err != nil {
 		t.Fatal(err)
 	}
 	if fake.Calls() != 1 {
@@ -98,7 +99,7 @@ func TestTheCacheReturnsACopy(t *testing.T) {
 	s := newService(t, embeddingtest.New(), embedding.ServiceConfig{})
 	ctx := context.Background()
 
-	first, err := s.Embed(ctx, []string{"mutate me"})
+	first, err := s.EmbedQueries(ctx, []string{"mutate me"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestTheCacheReturnsACopy(t *testing.T) {
 		first[0][i] = 999
 	}
 
-	second, err := s.Embed(ctx, []string{"mutate me"})
+	second, err := s.EmbedQueries(ctx, []string{"mutate me"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,7 @@ func TestDuplicatesWithinOneRequestAreEmbeddedOnce(t *testing.T) {
 	fake := embeddingtest.New()
 	s := newService(t, fake, embedding.ServiceConfig{})
 
-	got, err := s.Embed(context.Background(), []string{"same", "other", "same", "same"})
+	got, err := s.EmbedQueries(context.Background(), []string{"same", "other", "same", "same"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +146,7 @@ func TestConcurrentCallersAreCoalescedIntoBatches(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := s.Embed(context.Background(), []string{fmt.Sprintf("memory %d", i)}); err != nil {
+			if _, err := s.EmbedQueries(context.Background(), []string{fmt.Sprintf("memory %d", i)}); err != nil {
 				t.Errorf("Embed: %v", err)
 			}
 		}()
@@ -165,7 +166,7 @@ func TestAnIsolatedRequestIsNotHeldForTheFillWindow(t *testing.T) {
 	s := newService(t, embeddingtest.New(), embedding.ServiceConfig{FillWindow: window})
 
 	start := time.Now()
-	if _, err := s.Embed(context.Background(), []string{"a lone memory"}); err != nil {
+	if _, err := s.EmbedQueries(context.Background(), []string{"a lone memory"}); err != nil {
 		t.Fatal(err)
 	}
 	if took := time.Since(start); took > 100*time.Millisecond {
@@ -188,7 +189,7 @@ func TestABurstStillCoalescesWithALongFillWindow(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := s.Embed(context.Background(), []string{fmt.Sprintf("memory %d", i)}); err != nil {
+			if _, err := s.EmbedQueries(context.Background(), []string{fmt.Sprintf("memory %d", i)}); err != nil {
 				t.Errorf("Embed: %v", err)
 			}
 		}()
@@ -202,7 +203,7 @@ func TestABurstStillCoalescesWithALongFillWindow(t *testing.T) {
 
 func TestAnEmptyRequestIsRefused(t *testing.T) {
 	s := newService(t, embeddingtest.New(), embedding.ServiceConfig{})
-	if _, err := s.Embed(context.Background(), nil); !errs.Is(err, errs.Invalid) {
+	if _, err := s.EmbedQueries(context.Background(), nil); !errs.Is(err, errs.Invalid) {
 		t.Fatalf("got %v, want Invalid", err)
 	}
 }
@@ -213,7 +214,7 @@ func TestAModelFailureReachesEveryCallerInTheBatch(t *testing.T) {
 	fake.Fail(boom)
 	s := newService(t, fake, embedding.ServiceConfig{})
 
-	if _, err := s.Embed(context.Background(), []string{"a", "b"}); !errors.Is(err, boom) {
+	if _, err := s.EmbedQueries(context.Background(), []string{"a", "b"}); !errors.Is(err, boom) {
 		t.Fatalf("Embed = %v, want the model's error", err)
 	}
 }
@@ -229,7 +230,7 @@ func TestACancelledContextStopsWaiting(t *testing.T) {
 	s := newService(t, inner, embedding.ServiceConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := s.Embed(ctx, []string{"never finishes"}); err == nil {
+	if _, err := s.EmbedQueries(ctx, []string{"never finishes"}); err == nil {
 		t.Fatal("a cancelled request waited anyway")
 	}
 }
@@ -242,7 +243,7 @@ func TestCloseDoesNotHangOnAWedgedModel(t *testing.T) {
 	t.Cleanup(inner.release)
 
 	s := embedding.NewService(inner, embedding.ServiceConfig{})
-	go func() { _, _ = s.Embed(context.Background(), []string{"wedged"}) }()
+	go func() { _, _ = s.EmbedQueries(context.Background(), []string{"wedged"}) }()
 	inner.waitUntilCalled(t)
 
 	done := make(chan error, 1)
@@ -265,7 +266,7 @@ func TestCloseStopsEveryGoroutine(t *testing.T) {
 	before := runtime.NumGoroutine()
 	for range 5 {
 		s := embedding.NewService(embeddingtest.New(), embedding.ServiceConfig{})
-		if _, err := s.Embed(context.Background(), []string{"work"}); err != nil {
+		if _, err := s.EmbedQueries(context.Background(), []string{"work"}); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.Close(); err != nil {
@@ -304,8 +305,77 @@ func TestAMisbehavingEmbedderIsCaught(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := embedding.NewService(inner, embedding.ServiceConfig{})
 			defer func() { _ = s.Close() }()
-			if _, err := s.Embed(context.Background(), []string{"a", "b"}); err == nil {
-				t.Fatal("a misbehaving embedder was accepted")
+			if _, err := s.EmbedQueries(context.Background(), []string{"a", "b"}); err == nil {
+				t.Fatal("a misbehaving embedder's queries were accepted")
+			}
+			if _, err := s.EmbedDocuments(context.Background(), []string{"a", "b"}); err == nil {
+				t.Fatal("a misbehaving embedder's documents were accepted")
+			}
+		})
+	}
+}
+
+// A document's passages have a contract of their own, and a violation is as
+// silent downstream as a wrong vector: a span past the end of the content is a
+// slice that panics when a result is rendered, and a lone passage would give a
+// memory two index entries that always agree.
+func TestAMisbehavingEmbeddersPassagesAreCaught(t *testing.T) {
+	for _, mode := range []string{"one passage", "span outside"} {
+		t.Run(mode, func(t *testing.T) {
+			s := embedding.NewService(&brokenEmbedder{mode: mode}, embedding.ServiceConfig{})
+			defer func() { _ = s.Close() }()
+			if _, err := s.EmbedDocuments(context.Background(), []string{"ab", "cd"}); err == nil {
+				t.Fatal("a misbehaving embedder's passages were accepted")
+			}
+		})
+	}
+}
+
+// Documents travel through the same batching as queries: twenty memories
+// written together are collected into batches, repeated content is embedded
+// once per request, and every caller gets its own document back in order.
+func TestDocumentsAreBatchedDeduplicatedAndReturnedInOrder(t *testing.T) {
+	for _, batchSize := range []int{1, 32} {
+		t.Run(fmt.Sprintf("batch_size_%d", batchSize), func(t *testing.T) {
+			inner := &countingEmbedder{inner: embeddingtest.New()}
+			s := embedding.NewService(inner, embedding.ServiceConfig{BatchSize: batchSize})
+			defer func() { _ = s.Close() }()
+			long := strings.Repeat("word ", 3*embeddingtest.PassageWords)
+			texts := []string{"first", long, "first", "third"}
+			for request := 1; request <= 2; request++ {
+				got, err := s.EmbedDocuments(context.Background(), texts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				direct, err := embeddingtest.New().EmbedDocuments(context.Background(), texts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range texts {
+					if cosine(got[i].Vector, direct[i].Vector) < 0.999999 || len(got[i].Passages) != len(direct[i].Passages) {
+						t.Fatalf("document %d is not the one its text produces", i)
+					}
+				}
+				if len(got[1].Passages) != 3 {
+					t.Fatalf("long document has %d passages, want 3", len(got[1].Passages))
+				}
+				// The fill window can split a request into several calls. The invariant
+				// is the texts submitted: duplicates once, and every new request again.
+				seen := inner.documents()
+				if len(seen) != 3*request {
+					t.Fatalf("request %d submitted %d texts, want %d", request, len(seen), 3*request)
+				}
+				for _, text := range []string{"first", long, "third"} {
+					count := 0
+					for _, submitted := range seen {
+						if submitted == text {
+							count++
+						}
+					}
+					if count != request {
+						t.Fatalf("one text submitted %d times after %d requests", count, request)
+					}
+				}
 			}
 		})
 	}
@@ -330,16 +400,24 @@ func TestNormaliseProducesAUnitVector(t *testing.T) {
 // --- helpers ---------------------------------------------------------------
 
 type countingEmbedder struct {
-	inner embedding.Embedder
-	mu    sync.Mutex
-	n     int
+	inner    embedding.Embedder
+	mu       sync.Mutex
+	n        int
+	docTexts []string
 }
 
-func (c *countingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (c *countingEmbedder) EmbedQueries(ctx context.Context, texts []string) ([][]float32, error) {
 	c.mu.Lock()
 	c.n++
 	c.mu.Unlock()
-	return c.inner.Embed(ctx, texts)
+	return c.inner.EmbedQueries(ctx, texts)
+}
+func (c *countingEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([]embedding.Document, error) {
+	c.mu.Lock()
+	c.n++
+	c.docTexts = append(c.docTexts, texts...)
+	c.mu.Unlock()
+	return c.inner.EmbedDocuments(ctx, texts)
 }
 func (c *countingEmbedder) Dim() int        { return c.inner.Dim() }
 func (c *countingEmbedder) ModelID() string { return c.inner.ModelID() }
@@ -347,6 +425,12 @@ func (c *countingEmbedder) calls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.n
+}
+
+func (c *countingEmbedder) documents() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.docTexts...)
 }
 
 // blockingEmbedder stands in for a model that has wedged. It is releasable so
@@ -362,10 +446,14 @@ func newBlockingEmbedder() *blockingEmbedder {
 	return &blockingEmbedder{called: make(chan struct{}), released: make(chan struct{})}
 }
 
-func (b *blockingEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+func (b *blockingEmbedder) EmbedQueries(context.Context, []string) ([][]float32, error) {
 	b.callOnce.Do(func() { close(b.called) })
 	<-b.released
 	return nil, errors.New("released")
+}
+func (b *blockingEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([]embedding.Document, error) {
+	_, err := b.EmbedQueries(ctx, texts)
+	return nil, err
 }
 func (b *blockingEmbedder) Dim() int        { return embedding.Dim }
 func (b *blockingEmbedder) ModelID() string { return embedding.Model }
@@ -391,7 +479,28 @@ type brokenEmbedder struct{ mode string }
 
 func (b *brokenEmbedder) Dim() int        { return embedding.Dim }
 func (b *brokenEmbedder) ModelID() string { return embedding.Model }
-func (b *brokenEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+func (b *brokenEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([]embedding.Document, error) {
+	unit := make([]float32, embedding.Dim)
+	unit[0] = 1
+	switch b.mode {
+	case "one passage":
+		out := make([]embedding.Document, len(texts))
+		for i := range out {
+			out[i] = embedding.Document{Vector: unit, Passages: []embedding.Passage{{Start: 0, End: 1, Vector: unit}}}
+		}
+		return out, nil
+	case "span outside":
+		out := make([]embedding.Document, len(texts))
+		for i := range out {
+			out[i] = embedding.Document{Vector: unit, Passages: []embedding.Passage{
+				{Start: 0, End: 1, Vector: unit}, {Start: 1, End: 999, Vector: unit}}}
+		}
+		return out, nil
+	}
+	vs, err := b.EmbedQueries(ctx, texts)
+	return embedding.WholeDocuments(vs), err
+}
+func (b *brokenEmbedder) EmbedQueries(_ context.Context, texts []string) ([][]float32, error) {
 	unit := make([]float32, embedding.Dim)
 	unit[0] = 1
 	switch b.mode {
@@ -433,4 +542,54 @@ func cosine(a, b []float32) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// laneEmbedder answers queries at once and holds every document until
+// released: a stand-in for a model busy with long writes.
+type laneEmbedder struct {
+	*embeddingtest.Fake
+	held     chan struct{}
+	released chan struct{}
+}
+
+func (l *laneEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([]embedding.Document, error) {
+	l.held <- struct{}{}
+	<-l.released
+	return l.Fake.EmbedDocuments(ctx, texts)
+}
+
+// Long writes must not take the slots a search needs. With one shared pool,
+// writes enough to fill every worker slot left a query queued behind them for
+// as long as they ran — minutes, for a megabyte of content.
+func TestAQueryIsNotQueuedBehindLongWrites(t *testing.T) {
+	const workers = 2
+	inner := &laneEmbedder{Fake: embeddingtest.New(), held: make(chan struct{}, 16), released: make(chan struct{})}
+	s := embedding.NewService(inner, embedding.ServiceConfig{Workers: workers, BatchSize: 1})
+	defer func() { _ = s.Close() }()
+	defer close(inner.released)
+
+	for i := range workers + 2 {
+		go func() { _, _ = s.EmbedDocuments(context.Background(), []string{fmt.Sprintf("a long memory %d", i)}) }()
+	}
+	for range workers {
+		select {
+		case <-inner.held:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the writes never reached the model")
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.EmbedQueries(context.Background(), []string{"a search"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a query waited behind writes that held every worker slot")
+	}
 }

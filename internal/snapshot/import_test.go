@@ -23,6 +23,7 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/tenant/tenantkv"
 	"github.com/remem-org/remem-go/internal/text"
+	"github.com/remem-org/remem-go/internal/users"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -30,9 +31,10 @@ import (
 // composition root wires the server: the record repository already carries its
 // indexers, so an imported memory gets the same derived rows a stored one does.
 type destination struct {
-	kv   *memkv.Store
-	dst  snapshot.Destination
-	repo record.Repo
+	kv    *memkv.Store
+	dst   snapshot.Destination
+	repo  record.Repo
+	users *users.Service
 }
 
 func newDestination(t *testing.T, e embedding.Embedder) *destination {
@@ -43,16 +45,20 @@ func newDestination(t *testing.T, e embedding.Embedder) *destination {
 
 	repo := record.NewRepo(kv,
 		record.WithIndexer(attr.NewIndexer(attr.MustTable())),
-		record.WithIndexer(text.New()))
+		record.WithIndexer(text.New()),
+		record.WithIndexer(record.NewPassageIndexer()))
+	us := users.New(kv, clk)
 	return &destination{
-		kv:   kv,
-		repo: repo,
+		kv:    kv,
+		repo:  repo,
+		users: us,
 		dst: snapshot.Destination{
 			KV:       kv,
 			Tenants:  tenantkv.New(kv, clk),
 			Records:  repo,
 			Edges:    graph.NewStore(kv),
 			Events:   events.NewStore(kv),
+			Users:    us,
 			Embedder: e,
 		},
 	}
@@ -177,11 +183,12 @@ func TestAForeignSnapshotsVectorsAreReEmbedded(t *testing.T) {
 	}
 	// The stored vector is what this binary's embedder produces for that
 	// content, not the noise the file carried.
-	want, err := fakeEmbedder().Embed(ctx, []string{rec.Content})
+	docs, err := fakeEmbedder().EmbedDocuments(ctx, []string{rec.Content})
 	must(t, err)
-	for i := range want[0] {
-		if v.Values[i] != want[0][i] {
-			t.Fatalf("component %d is %v, want %v", i, v.Values[i], want[0][i])
+	want := docs[0].Vector
+	for i := range want {
+		if v.Values[i] != want[i] {
+			t.Fatalf("component %d is %v, want %v", i, v.Values[i], want[i])
 		}
 	}
 }
@@ -209,7 +216,7 @@ func TestAGoSnapshotsVectorsAreKeptOnlyWhenTheModelMatches(t *testing.T) {
 	t.Run("different model", func(t *testing.T) {
 		w := newWorld(t)
 		w.tenant(t, "default")
-		w.store(t, "default", "a memory some other model embedded")
+		w.store(t, "default", "a memory some other model embedded", fromMiniLM())
 		raw, _ := exportWorld(t, w, snapshot.ExportOpts{})
 
 		d := newDestination(t, fakeEmbedder())

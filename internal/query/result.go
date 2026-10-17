@@ -58,6 +58,8 @@ type Contribution struct {
 	// Rank is the position this record held in that index's own list,
 	// zero-based. It is what the fusion arithmetic is a function of.
 	Rank int `json:"rank"`
+	// Passage is the entry that ranked a vector contribution, zero elsewhere.
+	Passage uint32 `json:"passage,omitempty"`
 }
 
 // Hit is one ranked record.
@@ -81,6 +83,14 @@ type Hit struct {
 	// Sources are the per-index contributions, best-scoring first. Present
 	// only when the query asked to explain.
 	Sources []Contribution `json:"sources,omitempty"`
+
+	// Vector reports that vector evidence ranked this hit, and Passage is the
+	// entry it came from. They are on the hit rather than only in Sources
+	// because Sources is cleared unless the query explains, and which passage
+	// matched is part of every semantic answer (openspec/changes/passage-vectors,
+	// design decision 8). A keyword-only hit has neither.
+	Vector  bool   `json:"-"`
+	Passage uint32 `json:"-"`
 }
 
 // Result is one query's answer.

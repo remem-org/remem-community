@@ -11,7 +11,8 @@ Landed in Phase 3.
 | Concern | Authority | Everything else |
 |---|---|---|
 | What a memory says | the record body in the record key space | the projection an API returns is a view, not the truth |
-| What a memory means, numerically | the canonical vector in the vector key space | every index is derived from it and is rebuildable |
+| What a memory means, numerically | the canonical vector in the vector key space: the document vector | every index is derived from it and is rebuildable |
+| What each part of a memory means | its content, the model and the `passage_index` rules | passage rows are derived from those three and are rebuildable; nothing exports them |
 | Which model produced a vector | the `model_id` stamped on that vector | nothing infers it from the running configuration |
 | Whether a memory is retrievable | the `archived` field on the record | search filters on it; the vector survives archiving |
 | The order of results | the distance under the configured metric | a score is derived from a distance, never the reverse |
@@ -22,7 +23,8 @@ Landed in Phase 3.
 |---|---|---|---|
 | Record body | canonical | transactional | — |
 | Canonical vector | canonical | transactional | — |
-| The flat index | *is* the canonical vectors | none | — |
+| Passage rows | derived | transactional, by the passage indexer | the record's content, re-embedded (`passages.rebuild`, `remem-admin rebuild --index passages`) |
+| The flat index | *is* the index entries: passage rows, or the canonical vector of a memory with none | none | — |
 
 `flat` has no state of its own, and that is the whole reason the walking
 skeleton uses it. There is no derived structure to fall out of step with the
@@ -62,41 +64,136 @@ agent with no way to know which of its twenty facts were stored.
 
 ## Embedding
 
-**Mean pooling over the attention mask, then L2 normalisation.** Both halves of
-that sentence are load-bearing, and both were wrong at some point during Phase 3.
+**What a vector is.** Every vector Remem computes comes from
+`pplx-embed-context-v1-0.6b`, run from its fp32 ONNX export, 1,024 wide: the mean
+of the model's token states over a span, taken over the attention mask with
+separators and padding excluded, quantised by the model's own output rule
+`round_half_even(tanh(x)·127)` and L2-normalised. The int8 there is the rule the
+model was trained with, not the precision of its weights: cosine over those
+values is what training made meaningful, and the raw pooled floats are not.
 
-The model's tokenizer configures fixed padding to 128 tokens, so a five-word
-memory arrives as 128 ids of which 123 are `[PAD]`. A mask built from the length
-of the id slice marks all 128 as real; the model then attends to the padding,
-and every vector comes out wrong — at the right width, at the right norm, and
-in the wrong place. Nothing but a comparison against known-good vectors catches
-that. The mask comes from the tokenizer, the tokenizer's padding is stripped,
-and each batch is padded to its own longest sequence.
+**A memory is embedded whole, as passages.** Its content is tokenised once, with
+byte offsets and no special tokens, and its token *ids* — never its text — are
+cut into passages of 256 tokens. Passages are grouped into segments of at most
+sixteen, joined by the separator token, and each segment is one forward pass:
+every passage in it is embedded knowing the whole segment, which is what lets a
+detail in the twentieth sentence be found by the subject named in the first. A
+memory longer than one segment becomes segments overlapping by two passages, and
+a passage in an overlap takes its vector from the segment where it lies farther
+from the edge. Every passage of every memory is embedded, up to the content
+limit. Slicing ids rather than text is what makes a passage's vector independent
+of where it was cut out, since re-tokenising a substring can change the tokens
+at its edges.
 
-Normalisation happens after pooling, never before: normalising each token and
-then averaging is a different operation with an equally plausible result.
+**One canonical vector per memory: the document vector.** It is the mean over
+every content token of the first segment. For a memory that fits one passage it
+*is* that passage's vector, and such a memory has no passage rows at all.
+Discovery compares canonical vectors, a snapshot carries them, and `verify`
+checks them. Passage rows are a derived index: written in the record's own
+transaction by the passage indexer, never exported, and rebuilt from the content
+by `passages.rebuild` or `remem-admin rebuild --index passages`. A record whose
+content did not change leaves them exactly as they were; a test enumerates every
+code path that writes content and fails for one that does not stage passages.
 
-### Remem does not pool the way Rust did
+**The separator and the pad are one token.** Id 151643 joins passages and pads
+short rows, so only the mask tells them apart. Passage boundaries are positions
+recorded when a sequence is built, never found by looking for the separator's
+id — which is how the model card's own pipeline works, and why it cannot pad.
 
-Rust's vectors come from fastembed 3.14.1, which takes token 0 of
-`last_hidden_state` — CLS pooling. That is not what all-MiniLM-L6-v2 was
-trained for. Measured over the 200 reference strings:
+**The rules are a versioned format, not settings.** The model and its export,
+the output rule, the passage and segment sizes, document-vector pooling and byte
+spans are `passage_index` version 1. Changing any of them is a re-embedding of
+the corpus, which is what `embedding.max_sequence_tokens` pretended was a tuning
+knob; it is refused by name. A directory written before passages is re-embedded
+by migration `0003-reembed-passages` before the listener binds.
 
-| pooling | unrelated memories (median cos) | near-duplicates | separation |
+**The gate.** `fixtures/pplx_embedding_reference.json` is what an independent
+Python implementation of the model card's pipeline produces for a one-passage
+text, a forty-passage document across three segments and a non-ASCII document.
+Go matches it at cosine ≥ 0.9999 per document and per passage, with exact byte
+spans. The bar is not decoration: a pipeline with its separators dropped still
+scores 0.997–0.998.
+
+**Queries and documents.** A query is embedded by the same model as a
+one-passage document; a query longer than a passage is pooled over its first
+segment, never truncated, because `recall` sends an agent's whole context. The
+spike measured context-model queries against a second, query-specific model and
+the context model won (`openspec/changes/archive/2026-10-10-passage-vectors/spike-notes.md`).
+
+### Remem does not use the model Rust did
+
+Rust embeds with all-MiniLM-L6-v2 through fastembed 3.14.1, which takes token 0
+of `last_hidden_state` — CLS pooling, not what that model was trained for —
+from the first 128 tokens of each memory. Go mean-pooled the same model until
+`passage-vectors`, and now runs a different model altogether. Plan §II.10 row
+16 records both steps. The consequence is the same and stronger: no vector is
+comparable across the two implementations, and a Rust snapshot is re-embedded
+on import.
+
+### What the passage model costs, measured
+
+Measured 2026-10-10 for the `passage-vectors` change, before any of it was
+built: `pplx-embed-context-v1-0.6b` at revision `b42df969`, ONNX Runtime 1.29.0
+on the CPU provider with default threading, on a 6-core Intel Xeon W-2135
+(3.7 GHz, AVX-512 without VNNI, no SMT) with 62 GiB of RAM. A full segment is 16
+passages of 256 tokens with their separators: 4,111 tokens of real prose.
+
+**Remem runs the fp32 export**, and the int8-weight export was measured against
+it on the same inputs, each in a fresh process:
+
+| Input | fp32 (shipped) | int8 weights | fp32 faster by |
 |---|---|---|---|
-| CLS | 0.626 (p95 0.785) | 0.947 | 0.32 |
-| mean | 0.074 | 0.851 | **0.78** |
+| Query, 8 tokens (p50) | 45 ms | 296 ms | 6.6× |
+| Query, 31 tokens (p50) | 69 ms | 328 ms | 4.7× |
+| One passage, 256 tokens | 425 ms | 699 ms | 1.6× |
+| 1,024 tokens | 2.55 s | 3.06 s | 1.2× |
+| Full segment, 4,111 tokens | 15.9 s (259 tok/s) | 18.5 s (222 tok/s) | 1.17× |
+| Peak resident, query / full segment | 1.8 / 4.8 GiB | 0.6 / 3.7 GiB | |
 
-Under CLS two unrelated memories already score 0.63, which makes
-`search.similarity_threshold` unusable — the same defect class the behaviour
-baseline records at REM-74, where `1/(1+d)` floored at one third. Go mean-pools.
-Recorded as plan §II.10 row 16, with its consequence: a Rust snapshot's vectors
-are not importable as-is, and Phase 12 re-embeds on import.
+The int8 export's cost barely moves with query length (296 ms for 8 tokens,
+328 ms for 31), so it is a fixed cost per pass: without VNNI, the int8 kernels
+quantise activations dynamically and run integer products with no hardware
+help. The gap closes as attention comes to dominate. On a processor with VNNI or
+AMX the comparison may reverse, and that is the first thing to measure on target
+hardware. The two exports are different vector producers (worst cosine 0.9963),
+so a change of export is a change of the `passage_index` format and a
+re-embedding, never a setting.
 
-The 200-vector fixture is still a gate, on the CLS *projection* of Go's raw
-model output. That holds the model file, every tokenizer decision, the tensor
-layout and the mask exactly — everything except the one thing decided on
-purpose. It passes at cosine 1.0000000 on all 200.
+Batching full segments was measured under the int8 export only:
+
+| Batch of full segments | Wall time | Tokens per second | Peak resident |
+|---|---|---|---|
+| 1 | 18.8 s | 218 | 3.9 GiB |
+| 4 | 79.4 s | 207 | 13.0 GiB |
+| 8 | 163.5 s | 201 | 32.4 GiB |
+
+Three things follow, and the embedder is built around all three.
+
+- **Batching full segments buys nothing.** Throughput is flat whatever the
+  batch, because one 4K sequence already occupies every core. A forward pass
+  therefore holds at most one full segment's tokens, and only short segments and
+  queries are packed together.
+- **Memory grows about 4 GiB per segment in a batch, and ONNX Runtime's CPU
+  arena keeps its peak.** Resident memory stayed at 32 GiB after the batch-8 run
+  had finished. Three settings, measured on one full fp32 segment:
+
+  | Arena | Segment | Resident after the segment |
+  |---|---|---|
+  | On (ONNX Runtime's default) | 18.3 s | 5.2 GiB, kept |
+  | Off | 26.2 s | 1.85 GiB |
+  | **On, shrunk after the pass (Remem)** | 19.4 s | 3.5 GiB |
+
+  Remem shrinks after document passes only. Query passes keep the warm arena,
+  because latency is what they are for.
+- **A query never waits behind a long write.** Queries and documents have
+  separate lanes in the batching service, and the session's pass gate admits a
+  waiting query before the next document pass. A search therefore waits for at
+  most the one pass already running.
+- **Embedding is slow, by two orders of magnitude against MiniLM.** A corpus of
+  7.3 million tokens (a 1,737-memory agent-browsing corpus) is about eight hours of
+  embedding on this host at 259 tokens a second. A query costs about 45 ms
+  before it touches an index. Enterprise hardware moves these numbers; it does
+  not change their order.
 
 ### Model identity travels with every vector
 
@@ -233,12 +330,16 @@ version per key.
 
 ## Versions
 
-**A vector's version is the model that produced it.** Every canonical vector
-carries a model id and a dimension. A search refuses a tenant whose vectors name
-a different model from the one this server runs, because comparing them would
-return confident nonsense that nothing about their width or norm would reveal.
-That stamp is also why a Rust snapshot is re-embedded on import rather than
-copied: the model name is the same, and the pooling is not (plan §II.10 row 16).
+**A vector's version is the model that produced it.** Every canonical vector and
+every passage row carries a model id and a dimension. A search refuses a tenant
+whose vectors name a different model from the one this server runs, because
+comparing them would return confident nonsense that nothing about their width or
+norm would reveal. **How content becomes vectors is versioned as
+`passage_index`**: a newer value is refused by name, an absent one — a directory
+written under all-MiniLM-L6-v2 — is re-embedded by a blocking migration, and the
+old binary refuses a migrated directory because it has never heard of the
+format. A Rust snapshot, and a Go snapshot of another model, are re-embedded on
+import (plan §II.10 row 16).
 
 ## What this phase deliberately does not decide
 

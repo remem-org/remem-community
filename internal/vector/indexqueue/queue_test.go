@@ -34,7 +34,7 @@ func TestARemoveAfterAnInsertLeavesNoNode(t *testing.T) {
 	rid := id.New()
 	v := []float32{1, 0, 0, 0}
 
-	if err := q.Indexed(ctx, acme, rid, v); err != nil {
+	if err := q.Indexed(ctx, acme, rid, vector.Single(v)); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Removed(ctx, acme, rid); err != nil {
@@ -61,7 +61,7 @@ func TestAnInsertThroughTheQueueBecomesSearchable(t *testing.T) {
 	rid := id.New()
 	v := []float32{1, 0, 0, 0}
 
-	if err := q.Indexed(ctx, acme, rid, v); err != nil {
+	if err := q.Indexed(ctx, acme, rid, vector.Single(v)); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Flush(ctx); err != nil {
@@ -90,7 +90,7 @@ func TestOneTenantsOperationsApplyInEnqueueOrder(t *testing.T) {
 	var want []string
 	for n := range 100 {
 		rid := id.New()
-		if err := q.Indexed(ctx, acme, rid, []float32{float32(n)}); err != nil {
+		if err := q.Indexed(ctx, acme, rid, vector.Single([]float32{float32(n)})); err != nil {
 			t.Fatal(err)
 		}
 		want = append(want, "index/acme/"+rid.String())
@@ -123,16 +123,16 @@ func TestAFullQueueBlocksUntilAWorkerDrains(t *testing.T) {
 
 	// One operation reaches the worker and stops at the gate, a second fills
 	// the single buffer slot, and the third has nowhere to go.
-	if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the worker to take the first operation", func() bool { return r.started() >= 1 })
-	if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 
 	blocked := make(chan error, 1)
-	go func() { blocked <- q.Indexed(ctx, acme, id.New(), []float32{1}) }()
+	go func() { blocked <- q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})) }()
 	select {
 	case err := <-blocked:
 		t.Fatalf("the third operation returned %v on a full queue; it must wait for a worker", err)
@@ -159,17 +159,17 @@ func TestEnqueueOnAFullQueueRespectsContextCancellation(t *testing.T) {
 	t.Cleanup(func() { r.open(); _ = q.Close(context.Background()) })
 
 	bg := context.Background()
-	if err := q.Indexed(bg, acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(bg, acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the worker to take the first operation", func() bool { return r.started() >= 1 })
-	if err := q.Indexed(bg, acme, id.New(), []float32{1}); err != nil {
+	if err := q.Indexed(bg, acme, id.New(), vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(bg)
 	blocked := make(chan error, 1)
-	go func() { blocked <- q.Indexed(ctx, acme, id.New(), []float32{1}) }()
+	go func() { blocked <- q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})) }()
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 	select {
@@ -193,7 +193,7 @@ func TestFlushReturnsOnlyAfterEverythingEnqueuedIsApplied(t *testing.T) {
 
 	const total = 16
 	for range total {
-		if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+		if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -239,7 +239,7 @@ func TestARebuildDrainsItsTenantFirst(t *testing.T) {
 	ctx := context.Background()
 
 	rid := id.New()
-	if err := q.Indexed(ctx, acme, rid, []float32{1}); err != nil {
+	if err := q.Indexed(ctx, acme, rid, vector.Single([]float32{1})); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the worker to take the insert", func() bool { return r.started() >= 1 })
@@ -284,7 +284,7 @@ func TestAFailedOperationIsCountedAndLoggedAndNotReturned(t *testing.T) {
 	logs := &syncBuffer{}
 	ctx := obs.WithLogger(context.Background(), obs.LoggerTo(logs))
 	rid := id.New()
-	if err := q.Indexed(ctx, acme, rid, []float32{1}); err != nil {
+	if err := q.Indexed(ctx, acme, rid, vector.Single([]float32{1})); err != nil {
 		t.Fatalf("the failure surfaced to the caller as %v; a create must not fail over its index", err)
 	}
 	if err := q.Flush(ctx); err != nil {
@@ -325,7 +325,7 @@ func TestCloseDrainsWithinItsDeadline(t *testing.T) {
 
 	const total = 50
 	for range total {
-		if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+		if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -339,7 +339,7 @@ func TestCloseDrainsWithinItsDeadline(t *testing.T) {
 	}
 	// A closed queue refuses rather than blocks: the workers are gone and
 	// nothing would ever apply the operation.
-	if err := q.Indexed(ctx, acme, id.New(), []float32{1}); !errs.Is(err, errs.Unavailable) {
+	if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); !errs.Is(err, errs.Unavailable) {
 		t.Fatalf("enqueueing into a closed queue returned %v, want Unavailable", err)
 	}
 	// Closing twice is not an error: a shutdown path that is entered twice
@@ -357,7 +357,7 @@ func TestCloseWithNoTimeLeftStillStopsTheWorkers(t *testing.T) {
 	q := indexqueue.New(r, indexqueue.WithWorkers(1), indexqueue.WithSize(8))
 	ctx := context.Background()
 	for range 4 {
-		if err := q.Indexed(ctx, acme, id.New(), []float32{1}); err != nil {
+		if err := q.Indexed(ctx, acme, id.New(), vector.Single([]float32{1})); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -425,7 +425,7 @@ type recorder struct {
 	done []string
 }
 
-func (r *recorder) Indexed(_ context.Context, t tenant.ID, rid id.ID, _ []float32) error {
+func (r *recorder) Indexed(_ context.Context, t tenant.ID, rid id.ID, _ []vector.Entry) error {
 	return r.apply("index", t, rid)
 }
 
@@ -467,8 +467,10 @@ func (r *recorder) snapshot() []string {
 	return append([]string(nil), r.done...)
 }
 
-func (r *recorder) Insert(context.Context, tenant.ID, id.ID, []float32) error { return nil }
-func (r *recorder) Delete(context.Context, tenant.ID, id.ID) error            { return nil }
+func (r *recorder) Insert(context.Context, tenant.ID, id.ID, []vector.Entry) error {
+	return nil
+}
+func (r *recorder) Delete(context.Context, tenant.ID, id.ID) error { return nil }
 
 func (r *recorder) Search(context.Context, tenant.ID, []float32, int, vector.Filter) ([]vector.Hit, error) {
 	return nil, nil

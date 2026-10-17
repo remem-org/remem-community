@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/embedding"
@@ -150,4 +151,21 @@ func txnPut(ctx context.Context, d *destination, rec *record.Record) error {
 	return txn.Do(ctx, d.kv, func(tx txn.Tx) error {
 		return d.repo.Put(tenant.NewContext(ctx, rec.Tenant), tx, rec)
 	})
+}
+
+// withLongRecord adds a memory long enough for several passages under the fake
+// embedder, carrying a Rust vector of the old width.
+func withLongRecord() rustOpt {
+	return func(c *rustCorpus) {
+		c.records = append(c.records, &pb.Record{
+			Tenant: "default", Id: rustRecordID(9).Bytes(),
+			Content:         strings.Repeat("the harbour authority recorded the tide tables ", 12),
+			Policy:          "short_term",
+			CreatedAtUnixMs: 1700000000000, UpdatedAtUnixMs: 1700000000000,
+			Importance: 0.5, Health: 100,
+		})
+		v := make([]float32, 384)
+		v[9] = 1
+		c.vectors = append(c.vectors, &pb.Vector{Id: rustRecordID(9).Bytes(), ModelId: "all-MiniLM-L6-v2", Dim: 384, Values: v})
+	}
 }

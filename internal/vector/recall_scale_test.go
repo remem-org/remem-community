@@ -76,9 +76,23 @@ func TestRecallOverAQuarterMillion(t *testing.T) {
 // amount of ef would move it.
 func TestTheGraphIsConnected(t *testing.T) {
 	r := measureRecall(t, uniformCorpus(10_000), []int{64, 512}, 10, 100)
-	t.Logf("uniform 384-dimensional corpus: recall@10 = %.4f at ef_search=64, %.4f at 512", r[64], r[512])
+	t.Logf("uniform %d-dimensional corpus: recall@10 = %.4f at ef_search=64, %.4f at 512", recallDim, r[64], r[512])
 	if r[512] < 0.95 {
 		t.Fatalf("recall@10 at ef_search=512 over uniform vectors is %.4f, want >= 0.95: "+
 			"effort that high should reach everything, and a plateau means part of the graph is unreachable", r[512])
+	}
+}
+
+// Memory recall at scale over memories with passages: 5,000 memories at 100 a
+// topic, each of 1 to 32 passages, about eighty thousand entries. It is the
+// grouped search's counterpart of TestRecallOverTenThousand, and gated at the
+// same 0.95.
+func TestPassageRecallAtScale(t *testing.T) {
+	c := passageCorpus{memories: 5_000, topics: 50, maxPassages: 32}
+	r, entries := measurePassageRecall(t, c, []int{16, 64}, 10, 200)
+	t.Logf("memory recall@10 over %d memories, %d entries: %.4f at ef_search=16, %.4f at 64",
+		c.memories, entries, r[16], r[64])
+	if r[64] < 0.95 {
+		t.Fatalf("memory recall@10 at ef_search=64 is %.4f, want >= 0.95", r[64])
 	}
 }

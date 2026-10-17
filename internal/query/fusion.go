@@ -29,6 +29,10 @@ type RankedItem struct {
 	// is reported for debugging and for the differential harness, and is not
 	// shown to users.
 	Distance float32
+	// Passage is the index entry that ranked a vector step's item: the memory's
+	// nearest passage, 0 for one indexed by its canonical vector. Zero
+	// elsewhere.
+	Passage uint32
 }
 
 // RankedList is one index's contribution to a fused ranking.
@@ -62,6 +66,8 @@ func Fuse(lists []RankedList, limit int) []Hit {
 	type acc struct {
 		fused   float32
 		sources []Contribution
+		vector  bool
+		passage uint32
 	}
 	fused := make(map[id.ID]*acc)
 	order := make([]id.ID, 0, limit*len(lists))
@@ -77,7 +83,11 @@ func Fuse(lists []RankedList, limit int) []Hit {
 			a.fused += 1.0 / (float32(RRFK) + float32(rank) + 1.0)
 			a.sources = append(a.sources, Contribution{
 				Source: list.Source, Score: item.Score, Rank: rank, Distance: item.Distance,
+				Passage: item.Passage,
 			})
+			if list.Source == SourceVector {
+				a.vector, a.passage = true, item.Passage
+			}
 		}
 	}
 
@@ -93,6 +103,8 @@ func Fuse(lists []RankedList, limit int) []Hit {
 			FusedScore: a.fused,
 			Distance:   vectorDistance(a.sources),
 			Sources:    a.sources,
+			Vector:     a.vector,
+			Passage:    a.passage,
 		})
 	}
 

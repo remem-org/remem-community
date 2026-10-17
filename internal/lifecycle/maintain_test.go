@@ -19,6 +19,7 @@ import (
 	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/txn"
+	"github.com/remem-org/remem-go/internal/vector"
 )
 
 const acme = tenant.ID("acme")
@@ -57,7 +58,9 @@ func (f fixedSource) Policies(context.Context, tenant.ID) *lifecycle.Policies { 
 
 type recordingVectors struct{ h *harness }
 
-func (r recordingVectors) Indexed(context.Context, tenant.ID, id.ID, []float32) error { return nil }
+func (r recordingVectors) Indexed(context.Context, tenant.ID, id.ID, []vector.Entry) error {
+	return nil
+}
 func (r recordingVectors) Removed(_ context.Context, _ tenant.ID, rid id.ID) error {
 	r.h.deleted = append(r.h.deleted, rid)
 	return nil

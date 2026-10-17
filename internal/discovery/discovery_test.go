@@ -19,8 +19,9 @@ import (
 //
 // The vectors are built from angles, so each candidate's cosine against the
 // subject is the number in its name rather than whatever an embedder happened
-// to produce. 0.70 links because the comparison is `>=`, as Rust's is
-// (connection_manager.rs:141); 0.6999 does not.
+// to produce. The comparison is `>=`, as Rust's is (connection_manager.rs:141);
+// TestTheThresholdIsInclusive holds the boundary itself, wherever the measured
+// threshold sits.
 func TestThresholdAndTopKMatchRust(t *testing.T) {
 	h := newHarness(t)
 	subject := h.store(t, "acme", "the subject", unit(0))
@@ -64,7 +65,8 @@ func TestTheThresholdIsInclusive(t *testing.T) {
 	h := newHarness(t)
 	subject := h.store(t, "acme", "the subject", unit(0))
 	on := h.store(t, "acme", "exactly on the threshold", unit(angleFor(float64(discovery.DefaultThreshold))))
-	under := h.store(t, "acme", "just under it", unit(angleFor(0.6999)))
+	justUnder := float64(discovery.DefaultThreshold) - 0.0001
+	under := h.store(t, "acme", "just under it", unit(angleFor(justUnder)))
 
 	must(t, h.run(t, "acme", subject.rid))
 
@@ -77,7 +79,7 @@ func TestTheThresholdIsInclusive(t *testing.T) {
 			discovery.DefaultThreshold)
 	}
 	if linked[under.rid] {
-		t.Errorf("a candidate at 0.6999 was linked; it is below the threshold")
+		t.Errorf("a candidate at %v was linked; it is below the threshold", justUnder)
 	}
 }
 

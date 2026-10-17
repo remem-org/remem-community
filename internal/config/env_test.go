@@ -213,3 +213,28 @@ func TestTwoNamesForOneSettingAreRefusedRatherThanRaced(t *testing.T) {
 		t.Fatalf("the agreed value did not land: %q", cfg.Server.APIKey)
 	}
 }
+
+// embedding.max_sequence_tokens claimed a 256-token window that the embedder
+// never applied: MiniLM's tokenizer truncated at 128 before the setting was
+// read. Its successor is the passage format, which is fixed in code because it
+// decides what is written to disk. A file or a variable still naming it is
+// refused by name, saying so.
+func TestTheRetiredEmbeddingWindowIsRefusedByName(t *testing.T) {
+	check := func(how string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("embedding.max_sequence_tokens set by %s was accepted", how)
+		}
+		for _, want := range []string{"max_sequence_tokens", "no longer", "passage"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("by %s, the refusal does not say %q: %v", how, want, err)
+			}
+		}
+	}
+	_, err := config.Load(nil, []string{"REMEM_EMBEDDING_MAX_SEQUENCE_TOKENS=512"}, nil)
+	check("the environment", err)
+
+	path := writeTOML(t, "[embedding]\nmax_sequence_tokens = 512\n")
+	_, err = config.Load([]string{path}, nil, nil)
+	check("a configuration file", err)
+}

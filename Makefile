@@ -40,8 +40,16 @@ lint:
 # twenty points. The gate is on internal/, which is where the code is.
 COVER_MIN ?= 80
 
+# The timeout is above go test's default ten minutes because coverage under
+# -race counts every line atomically, and the vector recall tests run the
+# distance loop tens of millions of times: measured at 6.8x slower than -race
+# alone (TestRecallAgainstFlat, 21s -> 143s), which puts internal/vector at
+# about thirteen minutes. Shrinking those tests' corpus under coverage is the
+# better fix and is separate work.
+COVER_TIMEOUT ?= 30m
+
 cover:
-	go test $(TAGFLAGS) -race -count=1 -coverprofile=cover.out -coverpkg=./internal/... ./...
+	go test $(TAGFLAGS) -race -count=1 -timeout $(COVER_TIMEOUT) -coverprofile=cover.out -coverpkg=./internal/... ./...
 	go tool cover -func=cover.out | tail -1
 	@total=$$(go tool cover -func=cover.out | awk '/^total:/ {print $$3}' | tr -d '%'); \
 	if [ "$$(printf '%s\n' "$$total" "$(COVER_MIN)" | sort -g | head -1)" != "$(COVER_MIN)" ]; then \
@@ -75,6 +83,7 @@ fuzz:
 	go test ./internal/keys -run '^$$' -fuzz FuzzKeyDecoders -fuzztime $(FUZZTIME)
 	go test ./internal/snapshot -run '^$$' -fuzz FuzzSnapshotReader -fuzztime $(FUZZTIME)
 	go test ./internal/codec -run '^$$' -fuzz FuzzUnmarshalRecord -fuzztime $(FUZZTIME)
+	go test ./internal/vector -run '^$$' -fuzz FuzzDecodePassage -fuzztime $(FUZZTIME)
 
 # The crash tests (spec §46.5) start a real server or runner as a child process,
 # SIGKILL it at a chosen moment, and check what it left on disk. Each takes tens
@@ -95,14 +104,14 @@ bench:
 # building Remem never requires a protobuf toolchain.
 proto:
 	GOBIN=$(TOOLS) go install $(PROTOC_GEN_GO)
-	PATH="$(TOOLS):$$PATH" go run $(BUF) generate --path proto/record --path proto/tenant --path proto/session --path proto/schema --path proto/job --path proto/event --path proto/lifecycle
+	PATH="$(TOOLS):$$PATH" go run $(BUF) generate --path proto/record --path proto/tenant --path proto/session --path proto/schema --path proto/job --path proto/event --path proto/lifecycle --path proto/users
 	PATH="$(TOOLS):$$PATH" go run $(BUF) generate --template buf.gen.snapshot.yaml --path proto/snapshot
 	PATH="$(TOOLS):$$PATH" go run $(BUF) generate --path proto/snapshotext
 
 # Checked-in generated code that no longer matches its schema is code nobody is
 # reviewing. CI runs this so the two cannot drift.
 proto-check: proto
-	@if [ -n "$$(git status --porcelain -- internal/codec/pb internal/tenant/tenantkv/pb internal/session/pb internal/schema/pb internal/jobs/pb internal/events/pb internal/lifecycle/policykv/pb internal/snapshot/pb internal/snapshot/pbext)" ]; then \
+	@if [ -n "$$(git status --porcelain -- internal/codec/pb internal/tenant/tenantkv/pb internal/session/pb internal/schema/pb internal/jobs/pb internal/events/pb internal/lifecycle/policykv/pb internal/snapshot/pb internal/snapshot/pbext internal/users/pb)" ]; then \
 		echo "generated protobuf code is out of date — run 'make proto' and commit the result:"; \
 		git status --short -- internal/codec/pb internal/tenant/tenantkv/pb internal/session/pb internal/schema/pb internal/jobs/pb internal/events/pb internal/lifecycle/policykv/pb internal/snapshot/pb internal/snapshot/pbext; \
 		exit 1; \
@@ -154,7 +163,7 @@ model:
 # first; ONNX Runtime itself comes from the platform (brew install onnxruntime
 # on macOS, the base image in docker/Dockerfile).
 ONNX_LDFLAGS ?= -L$(CURDIR)/.tools/lib
-ONNX_MODEL ?= $(CURDIR)/.models/all-MiniLM-L6-v2
+ONNX_MODEL ?= $(CURDIR)/.models/pplx-embed-context-v1-0.6b
 
 test-onnx:
 	CGO_ENABLED=1 CGO_LDFLAGS="$(ONNX_LDFLAGS)" 	REMEM_EMBEDDING_MODEL_PATH="$(ONNX_MODEL)" 	go test -tags onnx -count=1 ./internal/embedding/... ./internal/memory/...

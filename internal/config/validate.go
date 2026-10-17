@@ -21,8 +21,8 @@ var tenantIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 // A bound needs two ends. The lower one is already here because zero would put
 // the insert back on the request path silently; this is the upper one, and it
 // exists because the queue allocates its channel at that depth per worker and
-// each slot holds an embedding. A million slots is about 1.5 GB of queued
-// vectors at 384 dimensions and a megabyte of channel per worker before a
+// each slot holds an embedding. A million slots is about 4 GB of queued
+// vectors at 1,024 dimensions and a megabyte of channel per worker before a
 // single operation arrives — far past any burst a server absorbs, and a digit
 // slipped into a configuration file rather than a number anybody chose.
 const MaxIndexQueueSize = 1 << 20
@@ -72,6 +72,9 @@ func (c Config) Validate() error {
 			p.add("server.api_key", why)
 		}
 	}
+	if strings.HasPrefix(c.Server.APIKey, userTokenPrefix) {
+		p.add("server.api_key", userTokenRefusal)
+	}
 	for i, entry := range c.Server.APIKeys {
 		cred, err := parseAPIKey(entry)
 		if err != nil {
@@ -82,6 +85,9 @@ func (c Config) Validate() error {
 			if why := weakSecret(cred.Secret); why != "" {
 				p.add(fmt.Sprintf("server.api_keys[%d]", i), why)
 			}
+		}
+		if strings.HasPrefix(cred.Secret, userTokenPrefix) {
+			p.add(fmt.Sprintf("server.api_keys[%d]", i), userTokenRefusal)
 		}
 	}
 	p.positive(c.Server.ReadTimeout, "server.read_timeout")
@@ -103,7 +109,6 @@ func (c Config) Validate() error {
 	// stored, and the mismatch would only surface as bad search results.
 	p.require(c.Embedding.Model != "", "embedding.model", "must name a model")
 	p.require(c.Embedding.BatchSize > 0, "embedding.batch_size", "must be greater than zero")
-	p.require(c.Embedding.MaxSequenceTokens > 0, "embedding.max_sequence_tokens", "must be greater than zero")
 	p.require(c.Embedding.CacheSize >= 0, "embedding.cache_size", "cannot be negative")
 	p.require(c.Embedding.Workers > 0, "embedding.workers", "must be greater than zero")
 	p.require(c.Embedding.IntraOpThreads >= 0, "embedding.intra_op_threads",
@@ -157,8 +162,8 @@ func (c Config) Validate() error {
 				"puts the index insert back on the request path without saying so")
 		p.require(c.Vector.IndexQueueSize <= MaxIndexQueueSize, "vector.index_queue_size",
 			fmt.Sprintf("cannot be above %d: each slot holds a queued embedding, so one worker's "+
-				"channel is allocated up front and a bound this size is already about 1.5 GB of "+
-				"them at 384 dimensions", MaxIndexQueueSize))
+				"channel is allocated up front and a bound this size is already about 4 GB of "+
+				"them at 1,024 dimensions", MaxIndexQueueSize))
 	}
 
 	// Text.
@@ -338,16 +343,28 @@ type Credential struct {
 	Secret      string
 	Tenant      string
 	CrossTenant bool
+	// Operator is true for the singular server.api_key, the credential users
+	// are administered with, and false for every server.api_keys entry.
+	Operator bool
 	// Authorized is the explicit tenant set of a credential written with
 	// several tenants after the "@". Empty means configuration did not narrow
 	// the credential's authority.
 	Authorized []string
 }
 
+// userTokenPrefix begins every stored user token (users.TokenPrefix). A
+// presented credential with it is verified as a user token and never against
+// configuration, so a configured secret with it could never authenticate. The
+// string is repeated rather than imported: configuration must not depend on the
+// package that stores users.
+const userTokenPrefix = "rmm_"
+
+const userTokenRefusal = `begins with "rmm_", which marks a stored user token; a configured key with it could never authenticate. Choose another secret, or issue a user token with remem-admin tokens issue`
+
 func (c Config) Credentials() []Credential {
 	var out []Credential
 	if c.Server.APIKey != "" {
-		out = append(out, Credential{ID: "operator", Secret: c.Server.APIKey, CrossTenant: true})
+		out = append(out, Credential{ID: "operator", Secret: c.Server.APIKey, CrossTenant: true, Operator: true})
 	}
 	for i, entry := range c.Server.APIKeys {
 		parsed, err := parseAPIKey(entry)

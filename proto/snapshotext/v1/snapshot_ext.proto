@@ -70,3 +70,19 @@ message Event {
   map<string, string> before    = 8;   // fields that moved. Never content.
   map<string, string> after     = 9;
 }
+
+// User is one user of a tenant (section 41, go.users).
+//
+// A user is canonical identity: audit events name it as their actor by id, and
+// a restore that dropped users would leave history pointing at nobody. A user
+// never carries a token. Tokens are credentials, and a snapshot is a portable
+// file, so every token is reissued after a restore rather than travelling in
+// one. The name index is not carried either; it is rebuilt from these rows.
+message User {
+  string tenant                 = 1;
+  bytes  id                     = 2;
+  string name                   = 3;   // as the operator wrote it
+  string state                  = 4;   // "active" or "disabled"
+  uint64 created_at_unix_ms     = 5;
+  uint64 updated_at_unix_ms     = 6;
+}

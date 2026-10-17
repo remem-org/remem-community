@@ -18,6 +18,12 @@ benchmarks
 .agents
 .superpowers
 data
+# The compose files' default corpus directory (REMEM_DATA_DIR). It is owned by
+# the container's uid, so including it failed the build on its unreadable
+# .cache, and when readable it would have copied the corpus -- memory content in
+# the clear -- into the builder stage's layers. A REMEM_DATA_DIR elsewhere in the
+# checkout needs its own line here; docs/DEPLOYMENT.md says to keep it outside.
+remem-data
 *.out
 *.test
 

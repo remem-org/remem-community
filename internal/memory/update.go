@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/auth"
 	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/events"
@@ -96,28 +97,33 @@ func (s *Service) Update(ctx context.Context, req UpdateReq) (*Memory, error) {
 	// there is no read-before-embed ordering to get wrong.
 	now := s.clk.Now().UTC()
 
-	var newVector *vector.Vector
+	var (
+		newVector   *vector.Vector
+		newPassages *record.PassageSet
+	)
 	if req.Content != nil && *req.Content != probe.Content {
-		var vs [][]float32
+		var docs []embedding.Document
 		if embedding.CallerSupplied(s.embedder) {
 			// Already checked by validateSupplied; this copies it.
 			v, eerr := s.suppliedVector("embedding", req.Embedding, op, "")
 			if eerr != nil {
 				return nil, eerr
 			}
-			vs = [][]float32{v}
+			docs = embedding.WholeDocuments([][]float32{v})
 		} else {
 			var eerr error
-			vs, eerr = s.embedder.Embed(ctx, []string{*req.Content})
+			docs, eerr = s.embedder.EmbedDocuments(ctx, []string{*req.Content})
 			if eerr != nil {
 				return nil, eerr
 			}
 		}
-		if len(vs) != 1 {
+		if len(docs) != 1 {
 			return nil, errs.E(errs.Storage, op, fmt.Errorf(
-				"the embedder returned %d vectors for one memory", len(vs)))
+				"the embedder returned %d documents for one memory", len(docs)))
 		}
-		newVector = &vector.Vector{ModelID: s.embedder.ModelID(), Dim: len(vs[0]), Values: vs[0]}
+		modelID := s.embedder.ModelID()
+		newVector = &vector.Vector{ModelID: modelID, Dim: len(docs[0].Vector), Values: docs[0].Vector}
+		newPassages = record.PassageSetOf(modelID, docs[0])
 	}
 
 	// What the attempt that commits decided, lifted out of the body so the
@@ -156,11 +162,11 @@ func (s *Service) Update(ctx context.Context, req UpdateReq) (*Memory, error) {
 		// that already wrote this content leaves nothing for the vector restage
 		// to do, and its vector is the one this attempt would have written.
 		contentChanged = req.Content != nil && *req.Content != rec.Content
-		v := newVector
+		v, passages := newVector, newPassages
 		if !contentChanged {
-			v = nil
+			v, passages = nil, nil
 		}
-		changed := req.apply(rec, now, v)
+		changed := req.apply(rec, now, v, passages)
 		stored = rec
 
 		if perr := s.repo.Put(ctx, tx, rec); perr != nil {
@@ -181,7 +187,7 @@ func (s *Service) Update(ctx context.Context, req UpdateReq) (*Memory, error) {
 		// the only thing that will ever say why the content is different.
 		_, aerr := s.events.Append(ctx, tx, events.Event{
 			Tenant: t, Namespace: rec.Namespace, Subject: rec.ID,
-			At: now, Kind: events.Updated, Actor: "api",
+			At: now, Kind: events.Updated, Actor: auth.ActorOf(ctx),
 			Reason: fmt.Sprintf("a caller changed %s", strings.Join(changed, ", ")),
 			After:  map[string]string{"fields": strings.Join(changed, ",")},
 		})
@@ -196,7 +202,7 @@ func (s *Service) Update(ctx context.Context, req UpdateReq) (*Memory, error) {
 		// maintained asynchronously (plan §II.4): the memory is changed the
 		// moment its transaction lands, and being findable by its new meaning
 		// follows a moment later.
-		s.indexed(ctx, t, rec.ID, newVector.Values)
+		s.indexed(ctx, t, rec.ID, indexEntries(newVector.Values, newPassages))
 	}
 	return fromRecord(rec), nil
 }
@@ -227,14 +233,18 @@ func (s *Service) enqueueRediscovery(ctx context.Context, tx txn.Tx, t tenant.ID
 //
 // It is the one place a request becomes a record, so the delivery surfaces
 // cannot drift into applying the same field two different ways.
-func (r UpdateReq) apply(rec *record.Record, now time.Time, v *vector.Vector) []string {
+func (r UpdateReq) apply(rec *record.Record, now time.Time, v *vector.Vector, passages *record.PassageSet) []string {
 	var changed []string
 	if r.Content != nil && *r.Content != rec.Content {
 		rec.Content = *r.Content
 		changed = append(changed, "content")
 	}
+	// The canonical vector and the passages move together or not at all: they
+	// are both functions of the content, and a record carrying one from the old
+	// content and the other from the new would be searchable by both.
 	if v != nil {
 		rec.Vectors[record.VectorContent] = v
+		rec.Passages = passages
 	}
 	if r.Tags != nil {
 		rec.Fields.Tags = normaliseTags(*r.Tags)

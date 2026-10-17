@@ -8,6 +8,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"github.com/remem-org/remem-go/internal/vector/hnsw"
 )
@@ -46,7 +47,7 @@ func searchCorpus(b *testing.B) (*hnsw.Index, [][]float32) {
 		ctx := context.Background()
 		rng := rand.New(rand.NewSource(7))
 		for range 10000 {
-			if err := ix.Indexed(ctx, benchTenant, id.New(), unitVector(rng, 384)); err != nil {
+			if err := ix.Indexed(ctx, benchTenant, id.New(), vector.Single(unitVector(rng, 384))); err != nil {
 				panic(err)
 			}
 		}

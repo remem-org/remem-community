@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/storage"
+	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/vector"
 )
@@ -29,12 +31,23 @@ import (
 // embedder produces and what cosine recovery assumes.
 const Dim = 4
 
-// Run executes the suite against an index built by open.
-//
-// open must return a fresh, empty index each time it is called, backed by
-// storage the test owns.
-func Run(t *testing.T, open func(*testing.T) vector.Index) {
+// Opener returns an index over kv. Called twice with the same kv, it returns
+// two indexes over the same rows: that is how the suite reopens an index, the
+// way a restart does, and how it writes rows behind an index's back.
+type Opener func(t *testing.T, kv storage.KV) vector.Index
+
+// Run executes the suite against indexes built by open, each over storage the
+// suite owns.
+func Run(t *testing.T, opener Opener) {
 	t.Helper()
+	// open is a fresh, empty index over fresh storage, for the cases that do
+	// not care where its rows live.
+	open := func(t *testing.T) vector.Index {
+		kv := memkv.New()
+		t.Cleanup(func() { _ = kv.Close() })
+		return opener(t, kv)
+	}
+	runPassages(t, opener)
 
 	t.Run("FindsTheExactMatchFirst", func(t *testing.T) {
 		idx := open(t)
@@ -138,8 +151,8 @@ func Run(t *testing.T, open func(*testing.T) vector.Index) {
 		idx := open(t)
 		ctx := context.Background()
 		rid := id.New()
-		must(t, idx.Insert(ctx, "acme", rid, unit([]float32{1, 0, 0, 0})))
-		must(t, idx.Insert(ctx, "acme", rid, unit([]float32{0, 1, 0, 0})))
+		must(t, idx.Insert(ctx, "acme", rid, vector.Single(unit([]float32{1, 0, 0, 0}))))
+		must(t, idx.Insert(ctx, "acme", rid, vector.Single(unit([]float32{0, 1, 0, 0}))))
 
 		hits, err := idx.Search(ctx, "acme", unit([]float32{0, 1, 0, 0}), 10, nil)
 		must(t, err)
@@ -242,8 +255,8 @@ func Run(t *testing.T, open func(*testing.T) vector.Index) {
 		ctx := context.Background()
 		replaced := id.New()
 		removed := id.New()
-		must(t, idx.Insert(ctx, "acme", replaced, unit([]float32{1, 0, 0, 0})))
-		must(t, idx.Insert(ctx, "acme", removed, unit([]float32{0, 0, 1, 0})))
+		must(t, idx.Insert(ctx, "acme", replaced, vector.Single(unit([]float32{1, 0, 0, 0}))))
+		must(t, idx.Insert(ctx, "acme", removed, vector.Single(unit([]float32{0, 0, 1, 0}))))
 
 		src := &fixedSource{}
 		src.add(replaced, unit([]float32{0, 1, 0, 0}))
@@ -269,8 +282,8 @@ func Run(t *testing.T, open func(*testing.T) vector.Index) {
 		replaced := id.New()
 		kept := id.New()
 		old := unit([]float32{1, 0, 0, 0})
-		must(t, idx.Insert(ctx, "acme", replaced, old))
-		must(t, idx.Insert(ctx, "acme", kept, unit([]float32{0, 0, 1, 0})))
+		must(t, idx.Insert(ctx, "acme", replaced, vector.Single(old)))
+		must(t, idx.Insert(ctx, "acme", kept, vector.Single(unit([]float32{0, 0, 1, 0}))))
 
 		src := &failingSource{fixedSource: fixedSource{}}
 		src.add(replaced, unit([]float32{0, 1, 0, 0}))
@@ -287,8 +300,8 @@ func Run(t *testing.T, open func(*testing.T) vector.Index) {
 		replaced := id.New()
 		kept := id.New()
 		old := unit([]float32{1, 0, 0, 0})
-		must(t, idx.Insert(ctx, "acme", replaced, old))
-		must(t, idx.Insert(ctx, "acme", kept, unit([]float32{0, 0, 1, 0})))
+		must(t, idx.Insert(ctx, "acme", replaced, vector.Single(old)))
+		must(t, idx.Insert(ctx, "acme", kept, vector.Single(unit([]float32{0, 0, 1, 0}))))
 
 		src := &fixedSource{}
 		src.add(replaced, unit([]float32{0, 1, 0, 0}))
@@ -436,7 +449,7 @@ func Run(t *testing.T, open func(*testing.T) vector.Index) {
 func insert(t *testing.T, idx vector.Index, tn tenant.ID, v []float32) id.ID {
 	t.Helper()
 	rid := id.New()
-	if err := idx.Insert(context.Background(), tn, rid, v); err != nil {
+	if err := idx.Insert(context.Background(), tn, rid, vector.Single(v)); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	return rid
@@ -475,7 +488,7 @@ type fixedSource struct {
 
 type failingSource struct{ fixedSource }
 
-func (s *failingSource) Scan(ctx context.Context, t tenant.ID, fn func(id.ID, []float32) error) error {
+func (s *failingSource) Scan(ctx context.Context, t tenant.ID, fn func(vector.Key, []float32) error) error {
 	if err := s.fixedSource.Scan(ctx, t, fn); err != nil {
 		return err
 	}
@@ -487,9 +500,9 @@ func (s *fixedSource) add(rid id.ID, v []float32) {
 	s.vecs = append(s.vecs, v)
 }
 
-func (s *fixedSource) Scan(_ context.Context, _ tenant.ID, fn func(id.ID, []float32) error) error {
+func (s *fixedSource) Scan(_ context.Context, _ tenant.ID, fn func(vector.Key, []float32) error) error {
 	for i, rid := range s.ids {
-		if err := fn(rid, s.vecs[i]); err != nil {
+		if err := fn(vector.Key{ID: rid}, s.vecs[i]); err != nil {
 			return err
 		}
 	}

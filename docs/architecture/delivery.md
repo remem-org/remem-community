@@ -187,6 +187,42 @@ sends operators to look at the first.
   reported by a client as a network error, sending an operator to the load
   balancer for a bug that is in this process.
 
+## Search passages: where vector evidence was strongest
+
+REST search results and MCP `search_memories` hits share the optional wire field
+`"passage": {"index": 4, "start": 6321, "end": 6925}`. It identifies the
+passage whose vector ranked the memory, including on a hybrid hit with vector
+evidence. It is returned without requiring `explain: true`. A keyword-only hit
+omits the key entirely; a span that cannot be resolved safely is also omitted,
+rather than returned as `null` or an empty object.
+
+| Field | Meaning |
+|---|---|
+| `index` | Zero-based passage number; 0 is a valid value |
+| `start` | Inclusive UTF-8 byte offset in the returned memory's `content` |
+| `end` | Exclusive UTF-8 byte offset in that same content |
+
+The range is `[start, end)`, measured in bytes rather than characters or tokens.
+A memory indexed by its single canonical vector reports passage 0 spanning its
+whole content. With `explain: true`, the vector entry in `sources` additionally
+carries `"passage": 4`, the passage index alone; text and graph sources omit it.
+
+**The span indicates where the semantic evidence was strongest, not a definitive
+answer.** Contextual embedding lets a passage match through information in its
+neighbours, so the closest passage need not contain the requested detail. Clients
+can use it to highlight or inspect evidence, but should read the surrounding
+content before quoting it as an answer. It is not a confidence probability or a
+guarantee that the answer lies within those offsets.
+
+The [passage-model spike](../../openspec/changes/archive/2026-10-10-passage-vectors/spike-notes.md)
+measured this distinction over 40 queries, split evenly between English and
+German. With the shipped fp32 model, the nearest passage contained the planted
+detail in **27 of 40 queries (67.5%, about two out of three)**, while the correct
+memory ranked first in all 40. The other queries matched a neighbouring passage
+inside the correct memory. The detail was always in passage 1, 330–480 tokens
+into the memory; this is a measurement of that fixture, not a general accuracy
+guarantee for arbitrary positions or corpora.
+
 ## Paging: two kinds of cursor behind one token
 
 Five surfaces return a `next_cursor` — listing, search, `related`, history and

@@ -18,8 +18,37 @@ package auth
 import (
 	"context"
 
+	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/tenant"
 )
+
+// Kind is what verified a principal, which decides how its actions are
+// attributed.
+type Kind uint8
+
+const (
+	// KindConfigured is a key from configuration's server.api_keys, or the
+	// anonymous principal of a development server. It carries no user: every
+	// such key acting in a tenant is one unattributed caller of it.
+	KindConfigured Kind = iota
+	// KindOperator is server.api_key, the operator credential. It carries no
+	// user either; it is how users are administered, not one of them.
+	KindOperator
+	// KindUser is a stored user token. It carries the user's id.
+	KindUser
+)
+
+func (k Kind) String() string {
+	switch k {
+	case KindConfigured:
+		return "configured"
+	case KindOperator:
+		return "operator"
+	case KindUser:
+		return "user"
+	}
+	return "unknown"
+}
 
 // Principal is a verified caller.
 type Principal struct {
@@ -38,6 +67,12 @@ type Principal struct {
 	// exist: an unbound credential is not, on its own, authorisation for a
 	// tenant created tomorrow.
 	Authorized []tenant.ID
+	// Kind is what verified the principal.
+	Kind Kind
+	// User is the stored user a user token authenticates as, and zero for
+	// every other kind. Two principals with different users are two callers;
+	// two with no user are, for attribution, the same unattributed one.
+	User id.ID
 }
 
 // Anonymous is the principal of a development server with no credentials
@@ -68,4 +103,22 @@ func NewContext(ctx context.Context, p Principal) context.Context {
 func FromContext(ctx context.Context) (Principal, bool) {
 	p, ok := ctx.Value(principalKey{}).(Principal)
 	return p, ok
+}
+
+// UnattributedActor is the actor an audit event records for a request whose
+// credential carries no user: the operator key, a configured key, or the
+// anonymous principal of a development server. It is what every request
+// recorded before users existed, so history written then still reads the same.
+const UnattributedActor = "api"
+
+// ActorOf names who an audit event written on behalf of ctx's request should
+// say acted: "user:<id>" for a user token, and [UnattributedActor] otherwise.
+//
+// The id rather than the name, because a name can change and an event, once
+// written, cannot.
+func ActorOf(ctx context.Context) string {
+	if p, ok := FromContext(ctx); ok && p.Kind == KindUser && !p.User.IsZero() {
+		return "user:" + p.User.String()
+	}
+	return UnattributedActor
 }

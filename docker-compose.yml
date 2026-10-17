@@ -1,7 +1,6 @@
 # Remem Community Edition: the server.
 #
 # Start it with:
-#   mkdir -p ./remem-data && sudo chown 10001:10001 ./remem-data
 #   REMEM_SERVER_API_KEY='replace-with-a-long-random-secret' docker compose up --build -d
 #
 # The corpus lives on the host, in the directory REMEM_DATA_DIR names --
@@ -9,12 +8,29 @@
 # bind mount rather than a Docker-managed named volume, so every durable Remem
 # data structure is where an operator can see and back it up, and
 # `docker compose down -v` no longer reaches it. The directory must be writable
-# by the container's user, uid 10001. See .env.example and docs/DEPLOYMENT.md,
+# by the container's user, uid 10001, and the remem-init service below makes it
+# so before the server starts. See .env.example and docs/DEPLOYMENT.md,
 # which also has the migration off the old `remem-data` named volume.
 #
 # The repository root's docker-compose.yml is a copy of this file, so that
 # `docker compose up` works in a checkout; an edition release writes its own.
 services:
+  # Compose creates a missing bind-mount source as root, and the server runs as
+  # uid 10001, so a fresh checkout's first start used to crash-loop on
+  # "open /var/lib/remem/LOCK: permission denied". This one-shot service hands
+  # the directory to that uid before the server starts. It reuses the server's
+  # image (built, never pulled) and changes the directory itself only, not its
+  # contents: a corpus owned by another uid is an operator's to migrate
+  # (docs/DEPLOYMENT.md), not something to rewrite on every start.
+  remem-init:
+    image: remem-go:community
+    pull_policy: never
+    user: "0"
+    entrypoint: ["chown", "10001:10001", "/var/lib/remem"]
+    volumes:
+      - ${REMEM_DATA_DIR:-./remem-data}:/var/lib/remem:z
+    restart: "no"
+
   remem:
     build:
       context: .
@@ -32,4 +48,7 @@ services:
     # Phase 13's end-to-end run). Hosts without SELinux ignore it.
     volumes:
       - ${REMEM_DATA_DIR:-./remem-data}:/var/lib/remem:z
+    depends_on:
+      remem-init:
+        condition: service_completed_successfully
     restart: unless-stopped

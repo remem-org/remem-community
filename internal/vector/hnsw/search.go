@@ -1,9 +1,12 @@
 package hnsw
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 
 	"github.com/remem-org/remem-go/internal/errs"
+	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
@@ -123,6 +126,149 @@ func (g *graph) nearest(q []float32, ef int) ([]candidate, error) {
 	return g.searchLayer(q, qn, []uint32{ep}, ef, 0, 0, s)
 }
 
+// nearestMemories walks the graph for the ef nearest *memories* to q, each at its
+// nearest entry, nearest first.
+//
+// It is [graph.nearest] with the bottom layer grouped by memory, which is what
+// lets ef bound distinct memories rather than passages. A memory with a
+// thousand passages nearest the query would otherwise fill an ef-64 result set
+// with its own passages, and a search for ten memories would find one and
+// double its effort until the graph was exhausted.
+func (g *graph) nearestMemories(q []float32, ef int) ([]candidate, error) {
+	const op = "hnsw.nearestMemories"
+	if g.entry == 0 {
+		return nil, nil
+	}
+	if g.dim != 0 && len(q) != g.dim {
+		return nil, errs.E(errs.Invalid, op, fmt.Errorf(
+			"this index holds %d-dimensional vectors and was queried with a %d-dimensional one", g.dim, len(q)))
+	}
+	qn := distance.Norm(q)
+	ep := g.entry
+	for l := g.entryLevel; l > 0; l-- {
+		next, err := g.greedy(q, qn, ep, l)
+		if err != nil {
+			return nil, err
+		}
+		ep = next
+	}
+	s := g.takeScratch()
+	defer g.putScratch(s)
+	return g.searchGrouped(q, qn, ep, ef, s)
+}
+
+// searchGrouped is the bottom layer's best-first walk with a result set keyed
+// by memory.
+//
+// Exploration is the ordinary walk: every neighbour that could improve the
+// result set is expanded, whichever memory it belongs to, because a memory's
+// passages are how the walk reaches the memories beyond it. What changes is the
+// result set. It holds at most one candidate per memory, the nearest of its
+// passages seen so far; a nearer passage of a memory already present replaces
+// it rather than taking a second slot, and the stopping rule compares against
+// the worst of ef distinct memories.
+//
+// The replacement is lazy: the heap keeps the superseded candidate, and best,
+// which maps each memory to its current one, decides which heap entries are
+// live. A stale entry is discarded when it reaches the top.
+func (g *graph) searchGrouped(q []float32, qn float64, ep uint32, ef int, s *scratch) ([]candidate, error) {
+	if ef < 1 {
+		ef = 1
+	}
+	s.prepare(len(g.nodes), ef)
+	visited := s.visited
+	frontier := &s.frontier
+	results := &s.results
+	if s.best == nil {
+		s.best = make(map[id.ID]candidate, ef)
+	} else {
+		clear(s.best)
+	}
+	best := s.best
+
+	memoryOf := func(n uint32) id.ID { return g.nodes[n].key.ID }
+	// worst is the furthest live candidate, discarding stale ones on the way.
+	worst := func() candidate {
+		for results.Len() > 0 {
+			top := results.peek()
+			if cur, ok := best[memoryOf(top.node)]; ok && cur.node == top.node {
+				return top
+			}
+			results.pop()
+		}
+		return candidate{}
+	}
+	offer := func(c candidate) {
+		mem := memoryOf(c.node)
+		if cur, ok := best[mem]; ok {
+			if c.dist < cur.dist {
+				best[mem] = c
+				results.push(c)
+			}
+			return
+		}
+		if len(best) < ef {
+			best[mem] = c
+			results.push(c)
+			return
+		}
+		if w := worst(); c.dist < w.dist {
+			results.pop()
+			delete(best, memoryOf(w.node))
+			best[mem] = c
+			results.push(c)
+		}
+	}
+
+	if ep == 0 || g.nodes[ep] == nil || visited.seen(ep) {
+		return nil, nil
+	}
+	d, err := g.dist(q, qn, ep)
+	if err != nil {
+		return nil, err
+	}
+	frontier.push(candidate{node: ep, dist: d})
+	offer(candidate{node: ep, dist: d})
+
+	for frontier.Len() > 0 {
+		c := frontier.pop()
+		if len(best) >= ef && c.dist > worst().dist {
+			break
+		}
+		n := g.nodes[c.node]
+		if n == nil || len(n.links) == 0 {
+			continue
+		}
+		for _, m := range n.links[0] {
+			if g.nodes[m] == nil || visited.seen(m) {
+				continue
+			}
+			d, err := g.dist(q, qn, m)
+			if err != nil {
+				return nil, err
+			}
+			if len(best) < ef || d < worst().dist {
+				frontier.push(candidate{node: m, dist: d})
+				offer(candidate{node: m, dist: d})
+			}
+		}
+	}
+
+	out := make([]candidate, 0, len(best))
+	for _, c := range best {
+		out = append(out, c)
+	}
+	// Nearest first, and a tie by node number, so the order never depends on
+	// map iteration.
+	slices.SortFunc(out, func(a, b candidate) int {
+		if a.dist != b.dist {
+			return cmp.Compare(a.dist, b.dist)
+		}
+		return cmp.Compare(a.node, b.node)
+	})
+	return out, nil
+}
+
 // candidate is a node and its distance from whatever is being searched for.
 type candidate struct {
 	node uint32
@@ -165,6 +311,9 @@ type scratch struct {
 	visited  visited
 	frontier nearestFirst
 	results  furthestFirst
+	// best is a grouped walk's current candidate per memory. Only
+	// [graph.searchGrouped] uses it.
+	best map[id.ID]candidate
 }
 
 // prepare readies the scratch for a walk over nodes node numbers bounded at ef,

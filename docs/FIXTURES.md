@@ -164,3 +164,36 @@ Publishing a `fixtures-v1.tar.zst` release artifact is out of scope for
 Task 0.3 (outward-facing; ruling R10) — this document exists so a future
 task can reproduce the exact bytes above, not so any of them are shipped
 from here.
+
+## The embedding reference (`fixtures/pplx_embedding_reference.json`)
+
+Not a corpus: what `pplx-embed-context-v1-0.6b`, run from its fp32 ONNX export,
+produces for three documents, computed in Python by `scripts/pplx_reference.py` from the model card's
+published ONNX pipeline and never from the Go code. The Go embedder must match
+it at cosine ≥ 0.9999 per document and per passage.
+
+| Case | Tokens | Passages | Segments | Why |
+|---|---|---|---|---|
+| `short` | 15 | 1 | `[0,16)` | a one-passage memory: document vector = passage 0 |
+| `forty-passages` | 10,135 | 40 | `[0,16) [14,30) [28,40)` | overlap ownership in both directions, a short last segment |
+| `non-ascii` | 610 | 3 | `[0,3)` | German, Japanese and emoji: byte spans, not characters |
+
+The script slices token **ids** into 256-token passages and inserts the
+separator id (151643) itself, where the card joins chunk text — because that is
+what Remem does, and a fixture built from a different input compares nothing.
+Vectors are stored as the int8 values before normalisation, which are exact.
+Python's `tokenizers` reports offsets in characters, so the spans are converted
+to UTF-8 byte offsets before they are written.
+
+```bash
+python3 -m venv .tools/pplx-venv
+.tools/pplx-venv/bin/pip install onnxruntime==1.29.0 tokenizers==0.23.3 numpy==2.5.3
+make model
+.tools/pplx-venv/bin/python -I scripts/pplx_reference.py \
+    .models/pplx-embed-context-v1-0.6b fixtures/pplx_embedding_reference.json
+```
+
+It takes about a minute on eight cores, and two runs produce byte-identical
+files (verified 2026-10-10 at model revision `b42df969`). A regenerated file
+that differs means the model, the runtime or the tokenizer moved, and that is
+a finding, not noise.

@@ -24,12 +24,13 @@
 package hnsw
 
 import (
+	"encoding/binary"
 	"errors"
 	"hash/fnv"
 	"math"
 
 	"github.com/remem-org/remem-go/internal/errs"
-	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 )
 
 // Params are the four numbers that decide the graph's shape and the search's
@@ -101,7 +102,7 @@ func (p Params) Validate() error {
 // test can assert.
 const maxLevel = 24
 
-// levelOf returns the top layer a record occupies.
+// levelOf returns the top layer an index entry occupies.
 //
 // It is derived from the record id rather than drawn from a random source, and
 // that is deliberate twice over. Invariant 9 forbids a random draw inside a
@@ -115,12 +116,21 @@ const maxLevel = 24
 // (0, 1]. The id is hashed rather than used directly because a UUIDv7's leading
 // 48 bits are a timestamp: records created in the same millisecond would
 // otherwise land on the same layer together.
-func levelOf(rid id.ID, m int) int {
+//
+// A passage numbered 1 or above hashes the id followed by its big-endian
+// number, so a memory's passages are spread over the layers like any other
+// entries rather than stacked on one. Passage 0 hashes the id alone, which is
+// exactly what a record hashed before passages existed: a memory indexed by its
+// canonical vector keeps the layer it always had.
+func levelOf(k vector.Key, m int) int {
 	if m < 2 {
 		return 0
 	}
 	h := fnv.New64a()
-	_, _ = h.Write(rid[:])
+	_, _ = h.Write(k.ID[:])
+	if k.Passage != 0 {
+		_, _ = h.Write(binary.BigEndian.AppendUint32(nil, k.Passage))
+	}
 	// The top 53 bits give a uniform value in [0, 1); shifting away from zero
 	// keeps -ln(u) finite.
 	u := float64(h.Sum64()>>11+1) / float64(uint64(1)<<53)

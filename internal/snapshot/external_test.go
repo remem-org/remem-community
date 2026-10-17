@@ -14,7 +14,7 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant"
 )
 
-// The test world stamps every vector "test-model", four wide. A destination
+// The test world stamps every vector worldModel, worldDim wide. A destination
 // whose vectors come from the caller and which declares that model is the one
 // place those vectors are usable as they stand.
 func externalDestination(t *testing.T, model string, dim int) *destination {
@@ -26,7 +26,7 @@ func TestAGoSnapshotOfTheSameExternalModelRoundTrips(t *testing.T) {
 	w := populated(t)
 	raw, _ := exportWorld(t, w, snapshot.ExportOpts{})
 
-	d := externalDestination(t, "test-model", 4)
+	d := externalDestination(t, worldModel, worldDim)
 	rep := d.importAll(t, raw, snapshot.ImportOpts{})
 	if rep.ReEmbedded != 0 {
 		t.Fatalf("re-embedded %d vectors; an external destination can compute none", rep.ReEmbedded)
@@ -37,7 +37,7 @@ func TestAGoSnapshotOfTheSameExternalModelRoundTrips(t *testing.T) {
 }
 
 func TestAForeignSnapshotIntoAnExternalDestinationIsRefusedByName(t *testing.T) {
-	d := externalDestination(t, "test-model", 4)
+	d := externalDestination(t, worldModel, worldDim)
 	_, err := snapshot.Import(context.Background(), d.dst, bytes.NewReader(rustLikeSnapshot(t)), snapshot.ImportOpts{})
 	wantRefused(t, err, "external", "re-embed")
 }
@@ -45,7 +45,7 @@ func TestAForeignSnapshotIntoAnExternalDestinationIsRefusedByName(t *testing.T) 
 func TestReEmbeddingIntoAnExternalDestinationIsRefusedByName(t *testing.T) {
 	w := populated(t)
 	raw, _ := exportWorld(t, w, snapshot.ExportOpts{})
-	d := externalDestination(t, "test-model", 4)
+	d := externalDestination(t, worldModel, worldDim)
 	_, err := snapshot.Import(context.Background(), d.dst, bytes.NewReader(raw),
 		snapshot.ImportOpts{Vectors: snapshot.VectorsReEmbed})
 	wantRefused(t, err, "external", "re-embed")
@@ -56,7 +56,7 @@ func TestAVectorFromAnotherModelIsRefusedNamingBoth(t *testing.T) {
 	raw, _ := exportWorld(t, w, snapshot.ExportOpts{})
 	d := externalDestination(t, "cohere-embed-english-v3.0", 4)
 	_, err := snapshot.Import(context.Background(), d.dst, bytes.NewReader(raw), snapshot.ImportOpts{})
-	wantRefused(t, err, "test-model", "cohere-embed-english-v3.0")
+	wantRefused(t, err, worldModel, "cohere-embed-english-v3.0")
 }
 
 func TestVectorModelsListsEveryModelInTheFile(t *testing.T) {
@@ -66,7 +66,7 @@ func TestVectorModelsListsEveryModelInTheFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	if len(models) != 1 || models[snapshot.VectorModel{ModelID: "test-model", Dim: 4}] != stats.Vectors {
+	if len(models) != 1 || models[snapshot.VectorModel{ModelID: worldModel, Dim: worldDim}] != stats.Vectors {
 		t.Fatalf("models = %v, want test-model/4 × %d", models, stats.Vectors)
 	}
 }
@@ -116,7 +116,7 @@ func TestAnExternalVectorIsComparedWithItsOwnNormNotWithOne(t *testing.T) {
 	w.tenant(t, "default")
 	a := w.store(t, "default", "a memory") // test-model, norm about 1.47
 	raw, _ := exportWorld(t, w, snapshot.ExportOpts{})
-	d := externalDestination(t, "test-model", 4)
+	d := externalDestination(t, worldModel, worldDim)
 	d.importAll(t, raw, snapshot.ImportOpts{})
 	if rep := verifyAgainst(t, d, raw); !rep.Clean() {
 		t.Fatalf("a caller's vector stored as given is faithful: %v", rep.Findings)

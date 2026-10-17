@@ -75,6 +75,10 @@ type Stats struct {
 	EdgesWithMetaDropped uint64
 	// EventsDropped counts audit events a shared-only export left behind.
 	EventsDropped uint64
+	// Users counts users written or read. A snapshot never carries a token.
+	Users uint64
+	// UsersDropped counts users a shared-only export left behind.
+	UsersDropped uint64
 }
 
 // EventSource yields a tenant's audit stream.
@@ -105,6 +109,10 @@ type Sources struct {
 	Records record.Repo
 	// Events is optional; nil exports no audit stream.
 	Events EventSource
+	// Users is optional; nil exports no users. Like the tenant directory, it
+	// is read outside Snap: users are not versioned with the corpus, and a user
+	// created mid-export is a user with no history yet.
+	Users UserSource
 }
 
 // Export writes every canonical row reachable from src to w.
@@ -167,6 +175,13 @@ func Export(ctx context.Context, src Sources, w io.Writer, opts ExportOpts) (Sta
 		return Stats{}, err
 	}
 	got.Tenants = uint64(len(metas))
+
+	// Users before any record: see exportUsers for why the order matters.
+	for _, m := range metas {
+		if err := exportUsers(ctx, src, sw, m.ID, opts, &got); err != nil {
+			return Stats{}, err
+		}
+	}
 
 	for _, m := range metas {
 		if err := exportTenant(ctx, src, sw, m.ID, opts, &got); err != nil {

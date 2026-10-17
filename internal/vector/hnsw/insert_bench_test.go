@@ -8,6 +8,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"github.com/remem-org/remem-go/internal/vector/hnsw"
 )
@@ -34,14 +35,14 @@ func BenchmarkInsert384Cosine(b *testing.B) {
 	}
 	// A populated graph, so the timed inserts pay a real construction search.
 	for _, v := range vecs[:1000] {
-		if err := ix.Indexed(ctx, benchTenant, id.New(), v); err != nil {
+		if err := ix.Indexed(ctx, benchTenant, id.New(), vector.Single(v)); err != nil {
 			b.Fatal(err)
 		}
 	}
 
 	b.ResetTimer()
 	for i := range b.N {
-		if err := ix.Indexed(ctx, benchTenant, id.New(), vecs[1000+i%1000]); err != nil {
+		if err := ix.Indexed(ctx, benchTenant, id.New(), vector.Single(vecs[1000+i%1000])); err != nil {
 			b.Fatal(err)
 		}
 	}

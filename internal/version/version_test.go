@@ -43,6 +43,9 @@ func TestEveryFormatIsChecked(t *testing.T) {
 		{"snapshot format", func(v *version.Versions) { v.SnapshotFormat = version.SnapshotFormat + 1 }, "snapshot format"},
 		{"attribute schema", func(v *version.Versions) { v.AttrSchema = version.AttrSchema + 1 }, "attribute slot schema"},
 		{"cluster compatibility", func(v *version.Versions) { v.ClusterCompat = version.ClusterCompat + 1 }, "cluster compatibility"},
+		{"text index", func(v *version.Versions) { v.TextIndex = version.TextIndex + 1 }, "text index"},
+		{"passage index", func(v *version.Versions) { v.PassageIndex = version.PassageIndex + 1 }, "passage index"},
+		{"user format", func(v *version.Versions) { v.UserFormat = version.UserFormat + 1 }, "user format"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := version.Current()
@@ -97,5 +100,39 @@ func TestStringReportsEveryVersion(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("Versions.String() omits %s: %s", want, s)
 		}
+	}
+}
+
+// A directory written before passages existed records no passage_index. Absent
+// reads as 0, which is older: the directory opens, and needs migrating rather
+// than being refused — the re-embedding migration is what moves it forward.
+func TestAnAbsentPassageIndexIsOlderAndOpens(t *testing.T) {
+	v := version.Current()
+	v.PassageIndex = 0
+	if got, ok := v.Get("passage_index"); !ok || got != 0 {
+		t.Fatalf("passage_index reads %d (known %v), want 0", got, ok)
+	}
+	if err := version.CheckOpen(v); err != nil {
+		t.Fatalf("a directory without passage_index was refused: %v", err)
+	}
+	if !v.NeedsMigration() {
+		t.Fatal("a directory without passage_index does not need migrating")
+	}
+}
+
+// A directory written before users existed records no user_format. Absent reads
+// as 0, which is older: the directory opens and is moved forward by a step that
+// writes nothing, because such a directory holds no user rows to convert.
+func TestAnAbsentUserFormatIsOlderAndOpens(t *testing.T) {
+	v := version.Current()
+	v.UserFormat = 0
+	if got, ok := v.Get("user_format"); !ok || got != 0 {
+		t.Fatalf("user_format reads %d (known %v), want 0", got, ok)
+	}
+	if err := version.CheckOpen(v); err != nil {
+		t.Fatalf("a directory without user_format was refused: %v", err)
+	}
+	if !v.NeedsMigration() {
+		t.Fatal("a directory without user_format does not need migrating")
 	}
 }

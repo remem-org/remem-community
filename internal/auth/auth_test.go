@@ -8,6 +8,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/auth"
 	"github.com/remem-org/remem-go/internal/errs"
+	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/tenant"
 )
 
@@ -192,5 +193,48 @@ func TestContradictoryCredentialsAreRefusedByName(t *testing.T) {
 				t.Fatalf("the refusal does not say why:\n%v", err)
 			}
 		})
+	}
+}
+
+// A configured credential carries no user, so nothing downstream can mistake
+// two configured keys for two callers. Which kind it is says how it is
+// attributed.
+func TestAConfiguredPrincipalCarriesNoUser(t *testing.T) {
+	k := keyring(t,
+		auth.Credential{ID: "operator", Secret: "root", CrossTenant: true, Kind: auth.KindOperator},
+		auth.Credential{ID: "acme", Secret: "key-acme", Tenant: "acme"},
+	)
+	op, err := k.Verify(context.Background(), "root")
+	if err != nil || op.Kind != auth.KindOperator || !op.User.IsZero() {
+		t.Fatalf("operator principal %+v, %v", op, err)
+	}
+	cfg, err := k.Verify(context.Background(), "key-acme")
+	if err != nil || cfg.Kind != auth.KindConfigured || !cfg.User.IsZero() {
+		t.Fatalf("configured principal %+v, %v", cfg, err)
+	}
+	if !auth.Anonymous.User.IsZero() {
+		t.Fatal("the anonymous principal carries a user")
+	}
+}
+
+// The actor an audit event records for a request: the user for a user token,
+// and the unattributed "api" for everything else — which is what every request
+// recorded before users existed, so history written then still reads the same.
+func TestTheActorOfARequestIsItsUserOrAPI(t *testing.T) {
+	uid := id.New()
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want string
+	}{
+		{"user", auth.NewContext(context.Background(), auth.Principal{Kind: auth.KindUser, User: uid}), "user:" + uid.String()},
+		{"operator", auth.NewContext(context.Background(), auth.Principal{Kind: auth.KindOperator}), "api"},
+		{"configured", auth.NewContext(context.Background(), auth.Principal{Kind: auth.KindConfigured}), "api"},
+		{"no principal", context.Background(), "api"},
+		{"user kind without a user", auth.NewContext(context.Background(), auth.Principal{Kind: auth.KindUser}), "api"},
+	} {
+		if got := auth.ActorOf(tc.ctx); got != tc.want {
+			t.Errorf("%s: actor %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

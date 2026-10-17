@@ -68,7 +68,8 @@ func newServerWithSetup(t *testing.T, setup func(storage.KV, record.Repo, *clock
 
 	clk := clock.NewFake(clock.FakeStart)
 	repo := record.NewRepo(kv,
-		record.WithIndexer(attr.NewIndexer(attr.MustTable())), record.WithIndexer(text.New()))
+		record.WithIndexer(attr.NewIndexer(attr.MustTable())), record.WithIndexer(text.New()),
+		record.WithIndexer(record.NewPassageIndexer()))
 	if setup != nil {
 		setup(kv, repo, clk)
 	}

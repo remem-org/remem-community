@@ -439,6 +439,7 @@ func single(list RankedList, limit int) []Hit {
 	for rank, item := range list.Items {
 		sources := []Contribution{{
 			Source: list.Source, Score: item.Score, Rank: rank, Distance: item.Distance,
+			Passage: item.Passage,
 		}}
 		hits = append(hits, Hit{
 			ID:         item.ID,
@@ -446,6 +447,8 @@ func single(list RankedList, limit int) []Hit {
 			FusedScore: item.Ordering,
 			Distance:   item.Distance,
 			Sources:    sources,
+			Vector:     list.Source == SourceVector,
+			Passage:    item.Passage,
 		})
 	}
 	return hits

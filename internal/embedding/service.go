@@ -52,13 +52,13 @@ type Service struct {
 	batchSize  int
 	fillWindow time.Duration
 
-	reqs    chan *item
-	workers chan struct{}
-
-	// lastArrival is when the collector last took an item off reqs; its zero
-	// value is long enough ago to count as idle. It is touched only by the
-	// collector goroutine, so it needs no lock.
-	lastArrival time.Time
+	// Queries and documents travel in separate lanes, each with its own
+	// collector and its own worker slots. A memory can be a megabyte of content
+	// and many minutes of model time; in one shared pool, two such writes would
+	// hold every worker slot and every search would wait behind them. With a
+	// lane each, writes can only ever occupy their own slots, and the model's
+	// pass gate admits a waiting query before the next document pass.
+	queries, documents *lane
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -98,12 +98,13 @@ func NewService(inner Embedder, cfg ServiceConfig) *Service {
 		cache:      newCache(cfg.CacheSize),
 		batchSize:  cfg.BatchSize,
 		fillWindow: cfg.FillWindow,
-		reqs:       make(chan *item),
-		workers:    make(chan struct{}, cfg.Workers),
+		queries:    newLane(cfg.Workers),
+		documents:  newLane(cfg.Workers),
 		closed:     make(chan struct{}),
 	}
-	s.wg.Add(1)
-	go s.collect()
+	s.wg.Add(2)
+	go s.collect(s.queries)
+	go s.collect(s.documents)
 	return s
 }
 
@@ -164,13 +165,13 @@ func (s *Service) Close() error {
 	return err
 }
 
-// Embed returns one vector per text, in order.
+// EmbedQueries returns one vector per text, in order.
 //
 // Cached texts are served without touching the model. Duplicates within one
-// request are embedded once — an agent storing the same fact twice in a batch
-// is common, and it should not cost two model runs.
-func (s *Service) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	const op = "embedding.Service.Embed"
+// request are embedded once — an agent asking the same question twice in a
+// batch is common, and it should not cost two model runs.
+func (s *Service) EmbedQueries(ctx context.Context, texts []string) ([][]float32, error) {
+	const op = "embedding.Service.EmbedQueries"
 
 	if len(texts) == 0 {
 		return nil, errs.E(errs.Invalid, op, ErrNoTexts)
@@ -195,8 +196,13 @@ func (s *Service) Embed(ctx context.Context, texts []string) ([][]float32, error
 	}
 
 	if len(wanted) > 0 {
-		if err := s.submit(ctx, texts, wanted, out); err != nil {
+		results, err := s.submit(ctx, op, texts, wanted, false)
+		if err != nil {
 			return nil, err
+		}
+		for n, i := range wanted {
+			out[i] = results[n].vec
+			s.cache.put(texts[i], results[n].vec)
 		}
 		for i, text := range texts {
 			if out[i] == nil {
@@ -211,10 +217,50 @@ func (s *Service) Embed(ctx context.Context, texts []string) ([][]float32, error
 	return out, nil
 }
 
-// item is one text awaiting a vector.
+// EmbedDocuments embeds each text as a memory's content, in order.
+//
+// Documents are batched with everyone else's, as queries are, but not cached.
+// A memory's content is embedded when it is written and rarely again, and a
+// cache of passage sets would hold a second copy of the corpus's vectors for
+// the benefit of a write that repeats itself. Duplicates within one request
+// are still embedded once.
+func (s *Service) EmbedDocuments(ctx context.Context, texts []string) ([]Document, error) {
+	const op = "embedding.Service.EmbedDocuments"
+
+	if len(texts) == 0 {
+		return nil, errs.E(errs.Invalid, op, ErrNoTexts)
+	}
+	first := make(map[string]int, len(texts))
+	var wanted []int
+	for i, text := range texts {
+		if _, seen := first[text]; !seen {
+			first[text] = i
+			wanted = append(wanted, i)
+		}
+	}
+	results, err := s.submit(ctx, op, texts, wanted, true)
+	if err != nil {
+		return nil, err
+	}
+	byFirst := make(map[int]Document, len(wanted))
+	for n, i := range wanted {
+		byFirst[i] = results[n].doc
+	}
+	out := make([]Document, len(texts))
+	for i, text := range texts {
+		out[i] = byFirst[first[text]]
+	}
+	if err := checkDocuments(op, texts, out, s.Dim()); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// item is one text awaiting a vector, or a document's vectors.
 type item struct {
-	text string
-	done chan itemResult
+	text     string
+	document bool
+	done     chan itemResult
 	// more says that the same request has further texts still to send, so the
 	// collector does not mistake the first text of a twenty-text request for
 	// a request that arrived alone.
@@ -223,49 +269,50 @@ type item struct {
 
 type itemResult struct {
 	vec []float32
+	doc Document
 	err error
 }
 
-// submit hands the wanted texts to the collector and waits for all of them.
-func (s *Service) submit(ctx context.Context, texts []string, wanted []int, out [][]float32) error {
-	const op = "embedding.Service.Embed"
-
+// submit hands the wanted texts to the collector and waits for all of them,
+// returning their results in the order of wanted.
+func (s *Service) submit(ctx context.Context, op string, texts []string, wanted []int, document bool) ([]itemResult, error) {
+	l := s.queries
+	if document {
+		l = s.documents
+	}
 	items := make([]*item, len(wanted))
 	for n, i := range wanted {
 		items[n] = &item{
-			text: texts[i],
-			done: make(chan itemResult, 1),
-			more: n < len(wanted)-1,
+			text:     texts[i],
+			document: document,
+			done:     make(chan itemResult, 1),
+			more:     n < len(wanted)-1,
 		}
 	}
 
 	for _, it := range items {
 		select {
-		case s.reqs <- it:
+		case l.reqs <- it:
 		case <-ctx.Done():
-			return errs.E(errs.Unavailable, op, ctx.Err())
+			return nil, errs.E(errs.Unavailable, op, ctx.Err())
 		case <-s.closed:
-			return errs.E(errs.Unavailable, op, errClosedService)
+			return nil, errs.E(errs.Unavailable, op, errClosedService)
 		}
 	}
 
-	var firstErr error
+	results := make([]itemResult, len(items))
 	for n, it := range items {
 		select {
 		case r := <-it.done:
 			if r.err != nil {
-				if firstErr == nil {
-					firstErr = r.err
-				}
-				continue
+				return nil, r.err
 			}
-			out[wanted[n]] = r.vec
-			s.cache.put(it.text, r.vec)
+			results[n] = r
 		case <-ctx.Done():
-			return errs.E(errs.Unavailable, op, ctx.Err())
+			return nil, errs.E(errs.Unavailable, op, ctx.Err())
 		}
 	}
-	return firstErr
+	return results, nil
 }
 
 var errClosedService = errors.New("the embedding service is shutting down")
@@ -284,7 +331,7 @@ var errClosedService = errors.New("the embedding service is shutting down")
 // company or when another item arrived within the last window — the evidence
 // that traffic is bursty right now. An isolated request goes straight to the
 // model.
-func (s *Service) collect() {
+func (s *Service) collect(l *lane) {
 	defer s.wg.Done()
 
 	for {
@@ -293,9 +340,9 @@ func (s *Service) collect() {
 			bursty  bool
 		)
 		select {
-		case it := <-s.reqs:
-			bursty = time.Since(s.lastArrival) < s.fillWindow
-			pending = s.take(pending, it)
+		case it := <-l.reqs:
+			bursty = time.Since(l.lastArrival) < s.fillWindow
+			pending = l.take(pending, it)
 		case <-s.closed:
 			return
 		}
@@ -303,15 +350,15 @@ func (s *Service) collect() {
 	drain:
 		for len(pending) < s.batchSize {
 			select {
-			case it := <-s.reqs:
-				pending = s.take(pending, it)
+			case it := <-l.reqs:
+				pending = l.take(pending, it)
 			default:
 				break drain
 			}
 		}
 
 		if len(pending) == 1 && !pending[0].more && !bursty {
-			s.dispatch(pending)
+			s.dispatch(l, pending)
 			continue
 		}
 
@@ -319,8 +366,8 @@ func (s *Service) collect() {
 	fill:
 		for len(pending) < s.batchSize {
 			select {
-			case it := <-s.reqs:
-				pending = s.take(pending, it)
+			case it := <-l.reqs:
+				pending = l.take(pending, it)
 			case <-timer.C:
 				break fill
 			case <-s.closed:
@@ -328,21 +375,37 @@ func (s *Service) collect() {
 			}
 		}
 		timer.Stop()
-		s.dispatch(pending)
+		s.dispatch(l, pending)
 	}
 }
 
+// lane is one kind of work's path to the model: its own queue, collector and
+// worker slots.
+type lane struct {
+	reqs    chan *item
+	workers chan struct{}
+
+	// lastArrival is when the collector last took an item off reqs; its zero
+	// value is long enough ago to count as idle. It is touched only by the
+	// lane's collector goroutine, so it needs no lock.
+	lastArrival time.Time
+}
+
+func newLane(workers int) *lane {
+	return &lane{reqs: make(chan *item), workers: make(chan struct{}, workers)}
+}
+
 // take adds it to the batch and notes when it arrived.
-func (s *Service) take(pending []*item, it *item) []*item {
-	s.lastArrival = time.Now()
+func (l *lane) take(pending []*item, it *item) []*item {
+	l.lastArrival = time.Now()
 	return append(pending, it)
 }
 
 // dispatch runs one batch, bounded by the worker semaphore.
-func (s *Service) dispatch(batch []*item) {
+func (s *Service) dispatch(l *lane, batch []*item) {
 	held := false
 	select {
-	case s.workers <- struct{}{}:
+	case l.workers <- struct{}{}:
 		held = true
 	case <-s.closed:
 		// Still serve them: a request already accepted is answered, not
@@ -354,30 +417,58 @@ func (s *Service) dispatch(batch []*item) {
 		defer s.wg.Done()
 		defer func() {
 			if held {
-				<-s.workers
+				<-l.workers
 			}
 		}()
 
-		texts := make([]string, len(batch))
-		for i, it := range batch {
-			texts[i] = it.text
-		}
-
-		vecs, err := s.inner.Embed(context.Background(), texts)
-		if err == nil && len(vecs) != len(batch) {
-			// Checked here as well as in checkOutput, because this loop
-			// indexes the result: an embedder that returned fewer vectors than
-			// it was given texts would panic in a goroutine that has no
-			// recovery, taking the process down instead of failing a request.
-			err = errs.E(errs.Storage, "embedding.Service.Embed", errors.New(
-				"the embedder returned a different number of vectors than it was given texts"))
-		}
-		for i, it := range batch {
-			if err != nil {
-				it.done <- itemResult{err: err}
-				continue
+		var queries, documents []*item
+		for _, it := range batch {
+			if it.document {
+				documents = append(documents, it)
+			} else {
+				queries = append(queries, it)
 			}
-			it.done <- itemResult{vec: vecs[i]}
+		}
+		if len(queries) > 0 {
+			vecs, err := s.inner.EmbedQueries(context.Background(), textsOf(queries))
+			if err == nil && len(vecs) != len(queries) {
+				err = errCount
+			}
+			for i, it := range queries {
+				if err != nil {
+					it.done <- itemResult{err: err}
+					continue
+				}
+				it.done <- itemResult{vec: vecs[i]}
+			}
+		}
+		if len(documents) > 0 {
+			docs, err := s.inner.EmbedDocuments(context.Background(), textsOf(documents))
+			if err == nil && len(docs) != len(documents) {
+				err = errCount
+			}
+			for i, it := range documents {
+				if err != nil {
+					it.done <- itemResult{err: err}
+					continue
+				}
+				it.done <- itemResult{doc: docs[i]}
+			}
 		}
 	}()
 }
+
+func textsOf(items []*item) []string {
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.text
+	}
+	return out
+}
+
+// errCount is checked here as well as in checkOutput, because the dispatch loop
+// indexes the result: an embedder that returned fewer results than it was given
+// texts would panic in a goroutine that has no recovery, taking the process
+// down instead of failing a request.
+var errCount = errs.E(errs.Storage, "embedding.Service", errors.New(
+	"the embedder returned a different number of results than it was given texts"))

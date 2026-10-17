@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
@@ -24,15 +25,15 @@ func TestANeighbourListOverflowsHalfItsBoundBeforeItIsPruned(t *testing.T) {
 	g := newGraph(Params{M: 4, M0: 8, EfConstruction: 16, EfSearch: 16}, distance.L2)
 	const bound, limit = 8, 12
 
-	hub := g.alloc(id.New(), []float32{0, 0})
+	hub := g.alloc(vector.Key{ID: id.New()}, []float32{0, 0})
 	// A second node linking to every neighbour, so none of them is the hub's
 	// last in-edge and the reachability rescue keeps nothing back.
-	other := g.alloc(id.New(), []float32{100, 100})
+	other := g.alloc(vector.Key{ID: id.New()}, []float32{100, 100})
 
 	for i := range limit + 1 {
 		angle := 2 * math.Pi * float64(i) / float64(limit+1)
 		r := 1 + float64(i)/10
-		e := g.alloc(id.New(), []float32{float32(r * math.Cos(angle)), float32(r * math.Sin(angle))})
+		e := g.alloc(vector.Key{ID: id.New()}, []float32{float32(r * math.Cos(angle)), float32(r * math.Sin(angle))})
 		g.nodes[other].links[0] = append(g.nodes[other].links[0], e)
 		g.addBack(e, other, 0)
 

@@ -30,6 +30,7 @@ type exported struct {
 	edgeExts []*pbext.EdgeExt
 	tenExts  []*pbext.TenantExt
 	events   []*pbext.Event
+	users    []*pbext.User
 	sections []snapshot.Section
 }
 
@@ -80,6 +81,10 @@ func decode(t *testing.T, raw []byte) *exported {
 			case snapshot.SectionGoEvents:
 				m := &pbext.Event{}
 				out.events = append(out.events, m)
+				return proto.Unmarshal(b, m)
+			case snapshot.SectionGoUsers:
+				m := &pbext.User{}
+				out.users = append(out.users, m)
 				return proto.Unmarshal(b, m)
 			default:
 				return errors.New("unexpected section " + blk.Section.String())

@@ -6,6 +6,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/vector"
@@ -17,9 +18,7 @@ import (
 // The shared contract. flat is the definition of correct, so it runs the same
 // suite Phase 7's HNSW will be held to.
 func TestFlatSatisfiesTheIndexContract(t *testing.T) {
-	vectortest.Run(t, func(t *testing.T) vector.Index {
-		kv := memkv.New()
-		t.Cleanup(func() { _ = kv.Close() })
+	vectortest.Run(t, func(t *testing.T, kv storage.KV) vector.Index {
 		return flat.New(vector.NewStore(kv), distance.L2)
 	})
 }
@@ -27,9 +26,7 @@ func TestFlatSatisfiesTheIndexContract(t *testing.T) {
 func TestFlatSatisfiesTheContractUnderEveryMetric(t *testing.T) {
 	for _, m := range []distance.Metric{distance.Cosine, distance.DotProduct} {
 		t.Run(m.String(), func(t *testing.T) {
-			vectortest.Run(t, func(t *testing.T) vector.Index {
-				kv := memkv.New()
-				t.Cleanup(func() { _ = kv.Close() })
+			vectortest.Run(t, func(t *testing.T, kv storage.KV) vector.Index {
 				return flat.New(vector.NewStore(kv), m)
 			})
 		})
@@ -50,7 +47,7 @@ func TestInsertStampsTheRunningModel(t *testing.T) {
 	idx, store := newIndex(t)
 	ctx := flat.WithModel(context.Background(), "all-MiniLM-L6-v2")
 	rid := id.New()
-	if err := idx.Insert(ctx, "acme", rid, []float32{1, 0, 0, 0}); err != nil {
+	if err := idx.Insert(ctx, "acme", rid, vector.Single([]float32{1, 0, 0, 0})); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.Get(ctx, "acme", tenant.DefaultNamespace, rid)
@@ -69,7 +66,7 @@ func TestInsertStampsTheRunningModel(t *testing.T) {
 func TestInsertWithoutAModelStampsUnknownRatherThanNothing(t *testing.T) {
 	idx, store := newIndex(t)
 	rid := id.New()
-	if err := idx.Insert(context.Background(), "acme", rid, []float32{1, 0, 0, 0}); err != nil {
+	if err := idx.Insert(context.Background(), "acme", rid, vector.Single([]float32{1, 0, 0, 0})); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.Get(context.Background(), "acme", tenant.DefaultNamespace, rid)
@@ -96,7 +93,7 @@ func TestSearchIsExact(t *testing.T) {
 		v := []float32{float32(i%13) / 13, float32(i%7) / 7, float32(i%5) / 5, float32(i%3) / 3}
 		normalise(v)
 		rid := id.New()
-		if err := idx.Insert(ctx, "acme", rid, v); err != nil {
+		if err := idx.Insert(ctx, "acme", rid, vector.Single(v)); err != nil {
 			t.Fatal(err)
 		}
 		all = append(all, entry{rid, v})
@@ -144,13 +141,13 @@ func TestTheNearestIsKeptWhenTheHeapIsFull(t *testing.T) {
 
 	q := []float32{1, 0, 0, 0}
 	for range 20 {
-		if err := idx.Insert(ctx, "acme", id.New(), []float32{0, 1, 0, 0}); err != nil {
+		if err := idx.Insert(ctx, "acme", id.New(), vector.Single([]float32{0, 1, 0, 0})); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Inserted last, so it is scanned last and must displace something.
 	near := id.New()
-	if err := idx.Insert(ctx, "acme", near, q); err != nil {
+	if err := idx.Insert(ctx, "acme", near, vector.Single(q)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -169,7 +166,7 @@ func TestTheNearestIsKeptWhenTheHeapIsFull(t *testing.T) {
 func TestAStoredVectorOfTheWrongWidthFailsTheSearch(t *testing.T) {
 	idx, store := newIndex(t)
 	ctx := context.Background()
-	if err := idx.Insert(ctx, "acme", id.New(), []float32{1, 0, 0, 0}); err != nil {
+	if err := idx.Insert(ctx, "acme", id.New(), vector.Single([]float32{1, 0, 0, 0})); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Put(ctx, "acme", tenant.DefaultNamespace, id.New(), &vector.Vector{
@@ -192,7 +189,7 @@ func TestRebuildNeedsASource(t *testing.T) {
 func TestUnscopedOperationsAreRefused(t *testing.T) {
 	idx, _ := newIndex(t)
 	ctx := context.Background()
-	if err := idx.Insert(ctx, "", id.New(), []float32{1}); !errs.Is(err, errs.Invalid) {
+	if err := idx.Insert(ctx, "", id.New(), vector.Single([]float32{1})); !errs.Is(err, errs.Invalid) {
 		t.Fatalf("Insert = %v", err)
 	}
 	if err := idx.Delete(ctx, "", id.New()); !errs.Is(err, errs.Invalid) {
@@ -208,7 +205,7 @@ func TestUnscopedOperationsAreRefused(t *testing.T) {
 
 type emptySource struct{}
 
-func (emptySource) Scan(context.Context, tenant.ID, func(id.ID, []float32) error) error {
+func (emptySource) Scan(context.Context, tenant.ID, func(vector.Key, []float32) error) error {
 	return nil
 }
 

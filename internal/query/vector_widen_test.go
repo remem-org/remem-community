@@ -88,7 +88,7 @@ func newWidenCorpus(t testing.TB, seed uint64, size, dim, ef, passEvery int) wid
 		for j := range v {
 			v[j] = rng.Float32()
 		}
-		if err := ix.Insert(ctx, widenTenant, rid, v); err != nil {
+		if err := ix.Insert(ctx, widenTenant, rid, vector.Single(v)); err != nil {
 			t.Fatalf("inserting record %d: %v", i, err)
 		}
 		policy := "short_term"

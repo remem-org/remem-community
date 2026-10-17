@@ -100,10 +100,26 @@ The `business` tag does **not** imply identity tenancy, and
 `TestTheBusinessTagDoesNotImplyIdentityTenancy` fails if it ever does. A release
 target is mapped to a capability only when the build actually contains what that
 capability requires; mapping it by product tier would advertise tenant isolation
-the binary has no way to enforce. The Enterprise / Cloud identity provider,
-account lifecycle and role model are not in this repository, so
+the binary has no way to enforce. What is in this repository, and in every
+edition, is users: one per agent or person, each holding its own tokens,
+stored in Remem and administered with the operator credential (see "Users are
+in every edition" below). The Enterprise / Cloud identity provider and role
+model are not in this repository, so
 `server.WithTenantCapability` is how a composition root that has them states its
 policy, and the default remains the one a build with none can honour.
+
+### Users are in every edition
+
+The editions differ in **how many tenants they serve**, and in nothing about
+who may call them. Community and Business serve one implicit tenant with any
+number of users. An identity-scoped build serves users in as many tenants as
+are provisioned. Every edition has the same user and token routes, the same
+`remem-admin users` and `remem-admin tokens` verbs, and the same attribution of
+an action to the user who took it. A user feature that one edition lacked would
+make "single-tenant" mean "single-user" by accident, and evidence grouping in
+maintained memory depends on telling two users of one tenant apart.
+
+The architecture is in `docs/architecture/tenancy.md`, under "Users and tokens".
 
 The edition switch is a supported-build boundary, not a cryptographic access
 control. Community is Apache 2.0, which permits recipients to modify and

@@ -107,7 +107,7 @@ func BenchmarkWritePath(b *testing.B) {
 // .benchmark-data/, synced commits, the HNSW index, and the real model.
 func writeServer(b *testing.B) http.Handler {
 	b.Helper()
-	model := envOr("REMEM_EMBEDDING_MODEL_PATH", filepath.Join("..", ".models", "all-MiniLM-L6-v2"))
+	model := envOr("REMEM_EMBEDDING_MODEL_PATH", filepath.Join("..", ".models", "pplx-embed-context-v1-0.6b"))
 	library := envOr("REMEM_ONNX_LIBRARY_PATH", filepath.Join("..", ".tools", "onnxruntime", "lib", "libonnxruntime.so"))
 	for _, p := range []string{model, library} {
 		if _, err := os.Stat(p); err != nil {

@@ -98,6 +98,7 @@ func (e *Executor) runVector(ctx context.Context, r attr.Reader, q *Query, plan 
 				// (behaviour baseline §1.4).
 				Ordering: distance.Score(h.Distance),
 				Distance: h.Distance,
+				Passage:  h.Passage,
 			})
 			if len(out.items) == plan.Target {
 				break

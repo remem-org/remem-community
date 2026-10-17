@@ -11,6 +11,7 @@ import (
 	"github.com/remem-org/remem-go/internal/config"
 	"github.com/remem-org/remem-go/internal/discovery"
 	"github.com/remem-org/remem-go/internal/embedding"
+	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/events"
 	"github.com/remem-org/remem-go/internal/graph"
 	"github.com/remem-org/remem-go/internal/jobs"
@@ -26,6 +27,7 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/tenant/tenantkv"
 	"github.com/remem-org/remem-go/internal/text"
+	"github.com/remem-org/remem-go/internal/users"
 	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"github.com/remem-org/remem-go/internal/vector/indexes"
@@ -105,6 +107,9 @@ type deps struct {
 	allTenants *tenantkv.Directory
 	sessions   *session.Registry
 	keyring    *auth.Keyring
+	// users is the stored users and their tokens. Requests are verified by
+	// verifier, which composes it with the keyring.
+	users *users.Service
 }
 
 // abandon closes whatever build has opened so far and reports err.
@@ -205,21 +210,10 @@ func build(cfg config.Config, opts options) (*deps, error) {
 		d.texts = text.New()
 	}
 
-	// The format gate and the migrations, before a byte of user data is read or
-	// written. A directory this binary cannot interpret is refused here rather
-	// than discovered by a read that returns something plausible.
-	if err := d.migrate(context.Background()); err != nil {
-		return d.abandon(err)
-	}
-
-	// The slot table is validated against the one on disk and persisted, after
-	// the migrations rather than before: a migration may be what makes the
-	// registered table legal to install, and stamping it first would record a
-	// table the data has not been brought up to.
-	if err := schema.OpenSlots(context.Background(), kv, slots); err != nil {
-		return d.abandon(err)
-	}
-
+	// The embedder, before the migrations: re-embedding a corpus written under
+	// an earlier model is a migration (schema.PassageReembedID), and it embeds
+	// through this. Opening it touches no data.
+	//
 	// memoryEmbedder is what the memory service embeds through: the batching
 	// service around a model, or — when vectors come from the caller — the bare
 	// declaration of their model, with no service, no cache and no goroutine,
@@ -244,6 +238,30 @@ func build(cfg config.Config, opts options) (*deps, error) {
 			CacheSize:  cfg.Embedding.CacheSize,
 		})
 		memoryEmbedder = d.embedding
+	}
+
+	// The format gate and the migrations, before a byte of user data is read or
+	// written. A directory this binary cannot interpret is refused here rather
+	// than discovered by a read that returns something plausible.
+	if err := d.migrate(context.Background()); err != nil {
+		return d.abandon(err)
+	}
+
+	// Passages an import owed: a Go snapshot of this model restored without the
+	// model leaves its tenants marked, and they are computed here, after the
+	// migrations and before the listener binds, for the reason the re-embedding
+	// migration blocks: a memory indexed by its canonical vector alone answers
+	// fewer questions than it should, and nothing could say so.
+	if err := d.finishPendingPassages(context.Background()); err != nil {
+		return d.abandon(err)
+	}
+
+	// The slot table is validated against the one on disk and persisted, after
+	// the migrations rather than before: a migration may be what makes the
+	// registered table legal to install, and stamping it first would record a
+	// table the data has not been brought up to.
+	if err := schema.OpenSlots(context.Background(), kv, slots); err != nil {
+		return d.abandon(err)
 	}
 
 	metric, err := distance.Parse(cfg.Vector.Metric)
@@ -309,6 +327,12 @@ func build(cfg config.Config, opts options) (*deps, error) {
 	if d.texts != nil {
 		repoOpts = append(repoOpts, record.WithIndexer(d.texts))
 	}
+	// Passage rows, on the same hook and in the same transaction: a memory's
+	// passages commit with its content and cannot describe content it no
+	// longer has. Registered in every mode, because an external server's
+	// content writes stage an empty set, which keeps the rule "a content write
+	// says what its passages are" free of a mode branch.
+	repoOpts = append(repoOpts, record.WithIndexer(record.NewPassageIndexer()))
 
 	d.edges = graph.NewService(kv, d.clk)
 
@@ -366,10 +390,14 @@ func build(cfg config.Config, opts options) (*deps, error) {
 		for j, a := range c.Authorized {
 			authorized[j] = tenant.ID(a)
 		}
+		kind := auth.KindConfigured
+		if c.Operator {
+			kind = auth.KindOperator
+		}
 		converted[i] = auth.Credential{
 			ID: c.ID, Secret: c.Secret,
 			Tenant: tenant.ID(c.Tenant), CrossTenant: c.CrossTenant,
-			Authorized: authorized,
+			Authorized: authorized, Kind: kind,
 		}
 	}
 	keyring, err := auth.NewKeyring(converted)
@@ -377,6 +405,7 @@ func build(cfg config.Config, opts options) (*deps, error) {
 		return d.abandon(err)
 	}
 	d.keyring = keyring
+	d.users = users.New(kv, d.clk)
 
 	// The lifecycle handler, built here rather than in registerBuiltinJobs
 	// because it closes over the repository the memory service was given — and
@@ -475,7 +504,8 @@ func (d *deps) migrate(ctx context.Context) error {
 		return err
 	}
 
-	registry, err := schema.Builtin(want, d.indexer, textReindexer{queue: d.queue})
+	registry, err := schema.Builtin(want, d.indexer, textReindexer{queue: d.queue},
+		schema.WithPassages(d.embedder, vectorReindexer{queue: d.queue}))
 	if err != nil {
 		return err
 	}
@@ -533,3 +563,23 @@ func (d *deps) close() error {
 }
 
 var errNotReady = errors.New("the server is still starting")
+
+// finishPendingPassages computes the passages of every tenant an import marked
+// as owing them, and clears each mark as it finishes.
+func (d *deps) finishPendingPassages(ctx context.Context) error {
+	pending, err := record.PassagesPending(ctx, d.kv)
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+	for _, t := range pending {
+		started := d.clk.Now()
+		n, err := record.RebuildPassages(ctx, d.kv, t, tenant.DefaultNamespace, d.embedder, nil, nil)
+		if err != nil {
+			return errs.E(errs.KindOf(err), "server.finishPendingPassages",
+				errors.Join(errors.New("computing the passages an import left owing for tenant "+t.String()), err))
+		}
+		obs.Logger(ctx).Info("computed the passages an import left owing",
+			"tenant", t.String(), "memories", n, "took", d.clk.Now().Sub(started).String())
+	}
+	return nil
+}

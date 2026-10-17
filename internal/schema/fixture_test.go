@@ -144,12 +144,16 @@ func TestLegacyFixtureMigratesForward(t *testing.T) {
 	dir := t.TempDir()
 	c := tenant.NewContext(ctx(), legacyTenant)
 
-	// The fixture predates the text index's format version, and this test is
-	// about one step on attr_schema. Holding text_index where the fixture is
-	// keeps the plan to that step; TestAnUpgradeQueuesOneKeywordRebuildPerTenant
-	// is the text index's.
+	// The fixture predates the text index's, the passage index's and the user
+	// format's versions, and this test is about one step on attr_schema. Holding
+	// all three where the fixture is keeps the plan to that step;
+	// TestAnUpgradeQueuesOneKeywordRebuildPerTenant is the text index's,
+	// TestTheReembeddingMigrationRewritesEveryMemory the passage index's and
+	// TestADirectoryFromBeforeUsersIsStampedWithoutRewriting the user format's.
 	target := migratedTo(2)
 	target.TextIndex = 0
+	target.PassageIndex = 0
+	target.UserFormat = 0
 
 	// It opens before it is migrated — older is accepted, and moving it forward
 	// is the runner's job.

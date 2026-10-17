@@ -149,6 +149,9 @@ func everyKindOfKey(rt *rapid.T, tid tenant.ID) [][]byte {
 		keys.Session(tid, ns, a),
 		keys.JobPause(tid, ns, "vector.rebuild"),
 		keys.JobRun(tid, ns, 1, a),
+		keys.User(tid, ns, a),
+		keys.UserToken(tid, ns, b),
+		keys.UserName(tid, ns, "planner"),
 	}
 }
 
@@ -275,4 +278,49 @@ func compareTriple(sa byte, da uint64, ia id.ID, sb byte, db uint64, ib id.ID) i
 	default:
 		return sign(bytes.Compare(ia[:], ib[:]))
 	}
+}
+
+// Passage keys order by record, then passage number, at every value both can
+// take, so one memory's passages are one contiguous range in passage order:
+// the indexer replaces a memory's passages by deleting that range, and a span
+// lookup for a search result is a point read.
+func TestPassageKeysSortByRecordThenPassage(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		tid := tenant.ID(idGen().Draw(rt, "tenant"))
+		ns := tenant.Namespace(idGen().Draw(rt, "namespace"))
+		ra, rb := drawID(rt, "record_a"), drawID(rt, "record_b")
+		pa := rapid.Uint32().Draw(rt, "passage_a")
+		pb := rapid.Uint32().Draw(rt, "passage_b")
+
+		ka, kb := keys.Passage(tid, ns, ra, pa), keys.Passage(tid, ns, rb, pb)
+		want := bytes.Compare(ra[:], rb[:])
+		if want == 0 {
+			want = sign(int(int64(pa) - int64(pb)))
+		}
+		if got := sign(bytes.Compare(ka, kb)); got != want {
+			rt.Fatalf("byte order %d, want %d for (%x,%d) vs (%x,%d)", got, want, ra, pa, rb, pb)
+		}
+
+		gotT, gotNS, gotID, gotP, err := keys.ParsePassage(ka)
+		if err != nil {
+			rt.Fatalf("ParsePassage: %v", err)
+		}
+		if gotT != tid || gotNS != ns || gotID != ra || gotP != pa {
+			rt.Fatalf("round trip lost something: %q %q %x %d", gotT, gotNS, gotID, gotP)
+		}
+
+		// One record's range holds every one of its passages and nothing of
+		// any other record's.
+		lo, hi := keys.PassagesOfRange(tid, ns, ra)
+		inside := func(k []byte) bool { return bytes.Compare(k, lo) >= 0 && bytes.Compare(k, hi) < 0 }
+		if !inside(ka) {
+			rt.Fatalf("passage %d of %x is outside its record's range", pa, ra)
+		}
+		if ra != rb && inside(kb) {
+			rt.Fatalf("passage %d of %x is inside %x's range", pb, rb, ra)
+		}
+		if inside(keys.Vector(tid, ns, ra)) {
+			rt.Fatal("a canonical vector key is inside a passage range")
+		}
+	})
 }

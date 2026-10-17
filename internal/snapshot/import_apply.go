@@ -67,6 +67,10 @@ type pendingRecord struct {
 	// hasVector distinguishes "the snapshot carried none" from "it carried an
 	// empty one", which are different facts about the corpus.
 	hasVector bool
+	// passagesPending says the record's vector was kept and its passages
+	// could not be computed, because the import has no model. Its tenant is
+	// marked, and the server computes them before it serves.
+	passagesPending bool
 }
 
 func (im *importer) now() time.Time {
@@ -134,6 +138,11 @@ func (im *importer) block(ctx context.Context, blk *Block) error {
 			return err
 		}
 		return im.applyEvents(ctx, blk)
+	case SectionGoUsers:
+		if err := im.flushAndMark(ctx, blk); err != nil {
+			return err
+		}
+		return im.applyUsers(ctx, blk)
 	case SectionSchema, SectionEvents:
 		// Declared in the shared schema and written by no released binary. A
 		// file that carries one was written by something this build does not

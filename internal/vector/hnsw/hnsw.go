@@ -103,29 +103,29 @@ func New(kv storage.KV, opts Options) (*Index, error) {
 // write path does not come through here — a memory and its vector commit
 // together in one transaction, and [Index.Indexed] is what tells the graph
 // afterwards.
-func (x *Index) Insert(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error {
+func (x *Index) Insert(ctx context.Context, t tenant.ID, rid id.ID, entries []vector.Entry) error {
 	const op = "hnsw.Insert"
 	if err := checkScope(t, op); err != nil {
 		return err
 	}
-	if len(v) == 0 {
-		return errs.E(errs.Invalid, op, errors.New("an empty vector cannot be indexed"))
+	if err := vector.CheckEntries(entries); err != nil {
+		return errs.E(errs.Invalid, op, err)
 	}
-	if err := x.store.Put(ctx, t, tenant.DefaultNamespace, rid, &vector.Vector{
-		ModelID: x.stampedModel(),
-		Dim:     len(v),
-		Values:  v,
-	}); err != nil {
+	if err := x.store.PutEntries(ctx, t, tenant.DefaultNamespace, rid, x.stampedModel(), entries); err != nil {
 		return err
 	}
-	return x.Indexed(ctx, t, rid, v)
+	return x.Indexed(ctx, t, rid, entries)
 }
 
-// Indexed makes an already-committed canonical vector searchable.
-func (x *Index) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error {
+// Indexed makes a memory's already-committed entry set searchable, replacing
+// whatever entries the graph held for it.
+func (x *Index) Indexed(ctx context.Context, t tenant.ID, rid id.ID, entries []vector.Entry) error {
 	const op = "hnsw.Indexed"
 	if err := checkScope(t, op); err != nil {
 		return err
+	}
+	if err := vector.CheckEntries(entries); err != nil {
+		return errs.E(errs.Invalid, op, err)
 	}
 	r, err := x.acquire(ctx, t)
 	if err != nil {
@@ -136,10 +136,10 @@ func (x *Index) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32
 	r.mu.Lock()
 	// No defensive copy: allocSlot copies the vector into the graph's arena,
 	// so the caller's slice is never retained.
-	dirty, err := r.g.insert(rid, v)
+	dirty, err := r.g.setEntries(rid, entries)
 	if err != nil {
 		// A failed insert may still have changed the graph — a replacement
-		// removes the old node first — and the budget bounds memory, not
+		// removes the old nodes first — and the budget bounds memory, not
 		// success.
 		sz := r.measure()
 		r.mu.Unlock()
@@ -171,13 +171,13 @@ func (x *Index) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32
 	return nil
 }
 
-// Delete removes a vector: the canonical row and the node together.
+// Delete removes a memory: its canonical rows and every node of it together.
 func (x *Index) Delete(ctx context.Context, t tenant.ID, rid id.ID) error {
 	const op = "hnsw.Delete"
 	if err := checkScope(t, op); err != nil {
 		return err
 	}
-	if err := x.store.Delete(ctx, t, tenant.DefaultNamespace, rid); err != nil {
+	if err := x.store.DeleteEntries(ctx, t, tenant.DefaultNamespace, rid); err != nil {
 		return err
 	}
 	return x.Removed(ctx, t, rid)
@@ -202,12 +202,11 @@ func (x *Index) Removed(ctx context.Context, t tenant.ID, rid id.ID) error {
 	defer x.release(r)
 
 	r.mu.Lock()
-	num, ok := r.g.byID[rid]
-	if !ok {
+	dirty := r.g.removeRecord(rid)
+	if len(dirty) == 0 {
 		r.mu.Unlock()
 		return nil // the post-condition already holds
 	}
-	dirty := append(r.g.remove(num), num)
 	tx := txn.New(x.kv, txn.Sync(false))
 	x.stage(tx, t, r.g, dirty)
 	sz := r.measure()
@@ -219,14 +218,17 @@ func (x *Index) Removed(ctx context.Context, t tenant.ID, rid id.ID) error {
 	return tx.Commit(ctx)
 }
 
-// Search returns up to k nearest vectors, nearest first.
+// Search returns up to k distinct memories, nearest first, each at the distance
+// of its nearest entry.
 //
-// The filter is applied before a candidate may occupy a slot, and the candidate
-// list widens until k results survive it or the whole graph has been examined.
-// That is what makes k count results rather than candidates on an approximate
-// index: a search that took the first ef candidates and filtered afterwards
-// would return three results out of ten and give no sign that seven were
-// discarded rather than absent.
+// The walk groups by memory (see [graph.searchGrouped]), so ef bounds memories
+// rather than passages and one memory with a thousand passages cannot crowd the
+// rest out of the candidate list. The filter is applied before a candidate may
+// occupy a slot, and the candidate list widens until k results survive it or
+// the whole graph has been examined. That is what makes k count results rather
+// than candidates on an approximate index: a search that took the first ef
+// candidates and filtered afterwards would return three results out of ten and
+// give no sign that seven were discarded rather than absent.
 func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
 	const op = "hnsw.Search"
 
@@ -258,17 +260,17 @@ func (x *Index) Search(ctx context.Context, t tenant.ID, q []float32, k int, fil
 	// another k allocated.
 	hits := make([]vector.Hit, 0, k)
 	for {
-		found, err := r.g.nearest(q, ef)
+		found, err := r.g.nearestMemories(q, ef)
 		if err != nil {
 			return nil, errs.E(errs.KindOf(err), op, err)
 		}
 		hits = hits[:0]
 		for _, c := range found {
 			n := r.g.nodes[c.node]
-			if n == nil || !filter.Allows(n.id) {
+			if n == nil || !filter.Allows(n.key.ID) {
 				continue
 			}
-			hits = append(hits, vector.Hit{ID: n.id, Distance: c.dist})
+			hits = append(hits, vector.Hit{ID: n.key.ID, Passage: n.key.Passage, Distance: c.dist})
 			if len(hits) == k {
 				return hits, nil
 			}

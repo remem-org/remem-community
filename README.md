@@ -17,27 +17,22 @@ documented in `docs/EDITION_BOUNDARY.md`.
 ## Run it
 
 ```bash
-mkdir -p ./remem-data && sudo chown 10001:10001 ./remem-data
-
 REMEM_SERVER_API_KEY='replace-with-a-long-random-secret' \
   docker compose up --build -d
 ```
 
-The first line matters on Linux: the corpus is a host directory, and Compose
-creates a missing one as root, which the container's unprivileged user cannot
-write to. Docker Desktop on macOS and Windows does not need it.
+The corpus is a host directory, and Compose creates a missing one as root,
+which the container's unprivileged user (uid 10001) cannot write to. A one-shot
+`remem-init` service therefore hands the directory to that uid before the server
+starts, so there is nothing to create by hand.
 
 The API is at `http://localhost:4545/api/v1` and MCP at `http://localhost:4545/mcp`,
 both behind the API key as a bearer token.
 
 The corpus lives on the host, in the directory `REMEM_DATA_DIR` names --
 `./remem-data` beside the compose file by default. Set it to an absolute path
-in `.env` for a managed server, and create the directory owned by uid 10001
-first, which is the unprivileged user the container runs as:
-
-```bash
-mkdir -p /srv/remem/data && sudo chown 10001:10001 /srv/remem/data
-```
+in `.env` for a managed server; `remem-init` prepares that directory the same
+way.
 
 Because it is a bind mount rather than a Docker-managed volume, the corpus is
 backed up with ordinary host tools and `docker compose down -v` does not reach

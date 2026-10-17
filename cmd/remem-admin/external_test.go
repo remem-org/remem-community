@@ -10,6 +10,7 @@ import (
 
 	"github.com/remem-org/remem-go/internal/attr"
 	"github.com/remem-org/remem-go/internal/clock"
+	"github.com/remem-org/remem-go/internal/embedding"
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/record"
 	"github.com/remem-org/remem-go/internal/storage/pebble"
@@ -87,11 +88,11 @@ func TestAnExternalImportOfTheSameModelRoundTrips(t *testing.T) {
 }
 
 func TestAnExternalImportOfAnotherModelLeavesNoDatabase(t *testing.T) {
-	src, _ := seedCorpus(t) // all-MiniLM-L6-v2, 384 wide
+	src, _ := seedCorpus(t) // embedding.Model, embedding.Dim wide
 	out := exportTo(t, src)
 	dst := filepath.Join(t.TempDir(), "restored")
 	_, err := run(externalImport(dst, out, "cohere-embed-english-v3.0", "384"))
-	if err == nil || !strings.Contains(err.Error(), "all-MiniLM-L6-v2") || !strings.Contains(err.Error(), "cohere-embed-english-v3.0") {
+	if err == nil || !strings.Contains(err.Error(), embedding.Model) || !strings.Contains(err.Error(), "cohere-embed-english-v3.0") {
 		t.Fatalf("want a refusal naming both models, got %v", err)
 	}
 	wantNoDatabase(t, dst)

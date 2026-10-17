@@ -183,6 +183,10 @@ const (
 	// message: v1's Event flattens an event into a kind and free text, where
 	// Go's records what moved, who moved it and why. One id, one message.
 	SectionGoEvents Section = 10
+	// SectionGoUsers is a tenant's users: identity that audit events name as
+	// their actor. It never carries a token. 41 rather than 11, because 11 to 40
+	// are reserved for maintained memory (docs/architecture/belief.md).
+	SectionGoUsers Section = 41
 )
 
 var sectionNames = map[Section]string{
@@ -196,6 +200,7 @@ var sectionNames = map[Section]string{
 	SectionGoEdgeExt:   "go.edge_ext",
 	SectionGoTenantExt: "go.tenant_ext",
 	SectionGoEvents:    "go.events",
+	SectionGoUsers:     "go.users",
 }
 
 // Shared reports whether a section belongs to the byte-shared migration
@@ -230,7 +235,7 @@ func (s Section) String() string {
 func Sections() []Section {
 	return []Section{
 		SectionTenants, SectionSchema, SectionRecords, SectionVectors, SectionEdges, SectionEvents,
-		SectionGoRecordExt, SectionGoEdgeExt, SectionGoTenantExt, SectionGoEvents,
+		SectionGoRecordExt, SectionGoEdgeExt, SectionGoTenantExt, SectionGoEvents, SectionGoUsers,
 	}
 }
 

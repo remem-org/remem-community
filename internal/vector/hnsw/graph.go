@@ -7,15 +7,17 @@ import (
 
 	"github.com/remem-org/remem-go/internal/errs"
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 )
 
-// node is one record's place in the graph.
+// node is one index entry's place in the graph: a memory's passage, or the
+// canonical vector of a memory with none.
 //
 // The vector is held in memory and never written to a node record. It came
 // from the canonical row and it goes back there — see the package comment.
 type node struct {
-	id id.ID
+	key vector.Key
 	// slot is where this node's vector sits in the graph's arena, not a slice
 	// of its own. See [graph.chunks]: one allocation per node was both a
 	// pointer to chase on every distance call and the largest single source of
@@ -53,7 +55,10 @@ type graph struct {
 	dim    int
 
 	nodes []*node // indexed by node number; nodes[0] is always nil
-	byID  map[id.ID]uint32
+	// byID finds an entry's node. A memory's entries are numbered 0…n-1 with
+	// no gaps, so every node of one memory is found by asking for passage 0,
+	// 1, … until one is missing — see [graph.removeRecord].
+	byID map[vector.Key]uint32
 
 	entry      uint32 // 0 when the graph is empty
 	entryLevel int
@@ -116,7 +121,7 @@ func newGraph(p Params, m distance.Metric) *graph {
 		params: p.withDefaults(),
 		metric: m,
 		nodes:  []*node{nil}, // node number zero is the meta slot
-		byID:   map[id.ID]uint32{},
+		byID:   map[vector.Key]uint32{},
 	}
 }
 
@@ -156,7 +161,7 @@ func (g *graph) between(a []float32, an float64, b []float32, bn float64) (float
 // A replacement is a removal followed by an insert rather than an in-place
 // edit: the vector moved, so every neighbour decision made about the old
 // position is now about the wrong point in the space.
-func (g *graph) insert(rid id.ID, v []float32) ([]uint32, error) {
+func (g *graph) insert(rid vector.Key, v []float32) ([]uint32, error) {
 	const op = "hnsw.insert"
 
 	if len(v) == 0 {
@@ -250,8 +255,8 @@ func (g *graph) insert(rid id.ID, v []float32) ([]uint32, error) {
 // Reuse matters because node numbers address rows: a graph that only ever
 // counted upwards would leave the key space sparse after a churn of deletes,
 // and a rebuild would be the only way to get it back.
-func (g *graph) alloc(rid id.ID, v []float32) uint32 {
-	n := &node{id: rid, slot: g.allocSlot(v), norm: distance.Norm(v), level: levelOf(rid, g.params.M)}
+func (g *graph) alloc(rid vector.Key, v []float32) uint32 {
+	n := &node{key: rid, slot: g.allocSlot(v), norm: distance.Norm(v), level: levelOf(rid, g.params.M)}
 	n.links = make([][]uint32, n.level+1)
 	n.back = make([][]uint32, n.level+1)
 
@@ -456,7 +461,7 @@ func (g *graph) remove(n uint32) []uint32 {
 	for l := range victim.back {
 		g.linkEntries -= int64(len(victim.back[l]))
 	}
-	delete(g.byID, victim.id)
+	delete(g.byID, victim.key)
 	g.nodes[n] = nil
 	g.free = append(g.free, n)
 	g.freeSlot(victim.slot)
@@ -549,8 +554,10 @@ func (g *graph) residentBytes() int64 {
 // perNodeOverhead is the node struct, the two link slice headers, the pointer
 // in g.nodes and the byID entry. It was 96 while a node also carried a vector's
 // slice header and its own allocation; the vectors are now counted once, as the
-// arena they actually sit in.
-const perNodeOverhead = 72
+// arena they actually sit in. It was 72 until a node was keyed by passage as
+// well as record: the node struct did not grow (the 4-byte passage number fills
+// what was padding beside the slot), and the byID entry's key did, by 4.
+const perNodeOverhead = 76
 
 // recountResidentBytes computes [graph.residentBytes] by walking every node.
 // It is O(N) and production code never calls it: it is the oracle the running
@@ -569,4 +576,42 @@ func (g *graph) recountResidentBytes() int64 {
 		}
 	}
 	return int64(g.live)*perNodeOverhead + g.arenaBytes() + links
+}
+
+// setEntries makes entries the complete entry set of rid, returning the node
+// numbers whose links changed. Entries the memory no longer has — a passage
+// numbered at or above len(entries) — are removed first, and each entry is then
+// inserted, which replaces it if it was present.
+func (g *graph) setEntries(rid id.ID, entries []vector.Entry) ([]uint32, error) {
+	dirty := map[uint32]bool{}
+	for _, n := range g.removeRecordFrom(rid, uint32(len(entries))) {
+		dirty[n] = true
+	}
+	for _, e := range entries {
+		nums, err := g.insert(vector.Key{ID: rid, Passage: e.Passage}, e.Vector)
+		for _, n := range nums {
+			dirty[n] = true
+		}
+		if err != nil {
+			return keys32(dirty), err
+		}
+	}
+	return keys32(dirty), nil
+}
+
+// removeRecord removes every entry of rid, returning the node numbers whose
+// links changed, the removed ones included.
+func (g *graph) removeRecord(rid id.ID) []uint32 { return g.removeRecordFrom(rid, 0) }
+
+// removeRecordFrom removes rid's entries numbered from onwards.
+func (g *graph) removeRecordFrom(rid id.ID, from uint32) []uint32 {
+	var dirty []uint32
+	for p := from; ; p++ {
+		num, ok := g.byID[vector.Key{ID: rid, Passage: p}]
+		if !ok {
+			return dirty
+		}
+		dirty = append(dirty, g.remove(num)...)
+		dirty = append(dirty, num)
+	}
 }

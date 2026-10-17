@@ -155,17 +155,32 @@ func (im *importer) settleVectors(ctx context.Context, page []*pendingRecord) er
 	const op = "snapshot.Import"
 
 	all := im.reEmbedsEverything()
-	var need []*pendingRecord
+	var need, passagesOnly []*pendingRecord
 	var texts []string
+	canEmbed := im.dst.Embedder != nil && !embedding.CallerSupplied(im.dst.Embedder)
 	for _, p := range page {
-		switch {
-		case !all && im.keepVector(p):
-			p.rec.Vectors[record.VectorContent] = p.vector
-			im.report.VectorsVerbatim++
-			continue
-		case !all && !p.hasVector:
-			im.report.Stats.MissingVectors++
-			continue
+		if !all {
+			keep, err := im.keepVector(p)
+			if err != nil {
+				return err
+			}
+			if keep {
+				p.rec.Vectors[record.VectorContent] = p.vector
+				im.report.VectorsVerbatim++
+				// The vector is this model's, and the passages are derived from
+				// the content by the same model: computed now when it is here,
+				// and owed to the server's start-up when it is not.
+				if canEmbed {
+					passagesOnly = append(passagesOnly, p)
+				} else if !embedding.CallerSupplied(im.dst.Embedder) {
+					p.passagesPending = true
+				}
+				continue
+			}
+			if !p.hasVector {
+				im.report.Stats.MissingVectors++
+				continue
+			}
 		}
 		if p.hasVector && embedding.CallerSupplied(im.dst.Embedder) {
 			// Usable only verbatim, and this one is another model's. There is
@@ -189,28 +204,39 @@ func (im *importer) settleVectors(ctx context.Context, page []*pendingRecord) er
 		need = append(need, p)
 		texts = append(texts, p.rec.Content)
 	}
-	if len(need) == 0 {
+	for _, p := range passagesOnly {
+		texts = append(texts, p.rec.Content)
+	}
+	if len(texts) == 0 {
 		return nil
 	}
 	if im.dst.Embedder == nil {
 		return errs.E(errs.Unavailable, op, errors.New(
 			"this import has to recompute embeddings and this binary has no embedder"))
 	}
-	vecs, err := im.dst.Embedder.Embed(ctx, texts)
+	docs, err := im.dst.Embedder.EmbedDocuments(ctx, texts)
 	if err != nil {
 		return err
 	}
-	if len(vecs) != len(need) {
+	if len(docs) != len(texts) {
 		return errs.E(errs.Storage, op, fmt.Errorf(
-			"the embedder returned %d vectors for %d texts", len(vecs), len(need)))
+			"the embedder returned %d documents for %d texts", len(docs), len(texts)))
 	}
+	// A re-embedded record takes its canonical vector — the document vector —
+	// and its passages from the same embedding, so the two cannot be of two
+	// models. A record whose vector was kept takes only its passages.
+	model := im.dst.Embedder.ModelID()
 	for i, p := range need {
 		p.rec.Vectors[record.VectorContent] = &vector.Vector{
-			ModelID: im.dst.Embedder.ModelID(),
-			Dim:     len(vecs[i]),
-			Values:  vecs[i],
+			ModelID: model,
+			Dim:     len(docs[i].Vector),
+			Values:  docs[i].Vector,
 		}
+		p.rec.Passages = record.PassageSetOf(model, docs[i])
 		im.report.ReEmbedded++
+	}
+	for i, p := range passagesOnly {
+		p.rec.Passages = record.PassageSetOf(model, docs[len(need)+i])
 	}
 	return nil
 }
@@ -236,21 +262,41 @@ func (im *importer) reEmbedsEverything() bool {
 // alone — Rust stamps all-MiniLM-L6-v2 on its vectors and so does Go,
 // truthfully, and they are different spaces — which is why the source
 // implementation is settled first, in reEmbedsEverything.
-func (im *importer) keepVector(p *pendingRecord) bool {
+//
+// The model it is compared against is the destination's: its embedder's, or,
+// on a build without one, the model this binary is built for. Before passages
+// a build without a model kept any Go vector, which was right while Go had one
+// model. It has had two since, and a 384-wide MiniLM vector kept in a 1,024-wide
+// directory would put two spaces in one ranking — so a vector of another model
+// is refused when nothing can recompute it, and under --vectors=verbatim
+// always, by name.
+func (im *importer) keepVector(p *pendingRecord) (bool, error) {
+	const op = "snapshot.Import"
 	if !p.hasVector || p.vector == nil || len(p.vector.Values) == 0 {
-		return false
+		return false, nil
 	}
-	if im.opts.Vectors == VectorsVerbatim {
-		return true
+	model, dim := embedding.Model, embedding.Dim
+	if im.dst.Embedder != nil {
+		model, dim = im.dst.Embedder.ModelID(), im.dst.Embedder.Dim()
 	}
-	if im.dst.Embedder == nil {
-		// A Go snapshot, auto, and no model to compare against or recompute
-		// with. Keeping it is the only option that is not "lose the corpus",
-		// and checkVectorPlan has already established the snapshot is Go's.
-		return true
+	matches := p.vector.ModelID == model && p.vector.Dim == dim
+	switch {
+	case matches:
+		return true, nil
+	case im.opts.Vectors == VectorsVerbatim:
+		return false, errs.E(errs.Invalid, op, fmt.Errorf(
+			"record %s carries a vector from %q (%d dimensions) and this directory serves %q (%d): "+
+				"--vectors=verbatim keeps a vector only of the model the directory serves. Import "+
+				"without it, on a binary built with the embedder, to re-embed",
+			p.rec.ID, p.vector.ModelID, p.vector.Dim, model, dim))
+	case im.dst.Embedder == nil:
+		return false, errs.E(errs.Invalid, op, fmt.Errorf(
+			"record %s carries a vector from %q (%d dimensions) and this directory serves %q (%d); "+
+				"it has to be re-embedded and this binary has no model. Build with -tags onnx and "+
+				"CGO_ENABLED=1 after running scripts/fetch-model.sh",
+			p.rec.ID, p.vector.ModelID, p.vector.Dim, model, dim))
 	}
-	return p.vector.ModelID == im.dst.Embedder.ModelID() &&
-		p.vector.Dim == im.dst.Embedder.Dim()
+	return false, nil
 }
 
 // writeRecords commits one batch of records through the repository.
@@ -284,6 +330,11 @@ func (im *importer) writeRecords(ctx context.Context, batch []*pendingRecord) er
 				for _, p := range write {
 					if err := im.dst.Records.Put(tctx, tx, p.rec); err != nil {
 						return err
+					}
+					if p.passagesPending {
+						// In the record's own transaction, so a memory that
+						// landed without its passages is never one nothing owes.
+						record.MarkPassagesPending(tx, t)
 					}
 				}
 				return nil
@@ -458,6 +509,13 @@ func recordFrom(m *pb.Record, now time.Time) (*record.Record, error) {
 		Content:   m.GetContent(),
 		Fields:    fields,
 		Vectors:   map[string]*vector.Vector{},
+		// Empty, not nil. Nil would mean "the content did not change" and leave
+		// whatever passage rows the destination holds for this id, which an
+		// --on-conflict overwrite would then serve for content the memory no
+		// longer has. Until passages are computed on import
+		// (openspec/changes/passage-vectors task 6.4), an imported memory has
+		// none and is indexed by its canonical vector.
+		Passages:  &record.PassageSet{},
 		CreatedAt: created,
 		UpdatedAt: updated,
 		// The version in force here, not zero. A shared-schema snapshot carries

@@ -71,11 +71,11 @@ func TestGCPercentOfMinusOneTurnsTheCollectorOff(t *testing.T) {
 
 func TestFixedConstantsAreTheDefaults(t *testing.T) {
 	c := config.Default()
-	if c.Embedding.Model != "all-MiniLM-L6-v2" {
+	if c.Embedding.Model != "pplx-embed-context-v1-0.6b" {
 		t.Errorf("embedding model = %q", c.Embedding.Model)
 	}
-	if c.Vector.Dimension != 384 {
-		t.Errorf("vector dimension = %d, want 384", c.Vector.Dimension)
+	if c.Vector.Dimension != 1024 {
+		t.Errorf("vector dimension = %d, want 1024", c.Vector.Dimension)
 	}
 	if c.Search.RRFK != 60 {
 		t.Errorf("rrf k = %d, want 60", c.Search.RRFK)

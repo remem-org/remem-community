@@ -52,8 +52,9 @@ func NewStore(kv storage.KV) *Store { return &Store{kv: kv} }
 
 var _ Source = (*Store)(nil)
 
-// Key is the storage key of one canonical vector.
-func Key(t tenant.ID, ns tenant.Namespace, rid id.ID) []byte { return keys.Vector(t, ns, rid) }
+// CanonicalKey is the storage key of one canonical vector. Passage rows are
+// addressed by keys.Passage.
+func CanonicalKey(t tenant.ID, ns tenant.Namespace, rid id.ID) []byte { return keys.Vector(t, ns, rid) }
 
 // Encode frames a vector for storage.
 func Encode(v *Vector) ([]byte, error) {
@@ -83,13 +84,13 @@ func (s *Store) Stage(tx txn.Tx, t tenant.ID, ns tenant.Namespace, rid id.ID, v 
 	if err != nil {
 		return err
 	}
-	tx.Set(Key(t, ns, rid), value)
+	tx.Set(CanonicalKey(t, ns, rid), value)
 	return nil
 }
 
 // StageDelete removes a vector as part of tx.
 func (s *Store) StageDelete(tx txn.Tx, t tenant.ID, ns tenant.Namespace, rid id.ID) {
-	tx.Delete(Key(t, ns, rid))
+	tx.Delete(CanonicalKey(t, ns, rid))
 }
 
 // Put writes a vector outside any transaction. It is the rebuild path; a write
@@ -99,12 +100,12 @@ func (s *Store) Put(ctx context.Context, t tenant.ID, ns tenant.Namespace, rid i
 	if err != nil {
 		return err
 	}
-	return s.kv.Set(ctx, Key(t, ns, rid), value)
+	return s.kv.Set(ctx, CanonicalKey(t, ns, rid), value)
 }
 
 // Delete removes a vector outside any transaction.
 func (s *Store) Delete(ctx context.Context, t tenant.ID, ns tenant.Namespace, rid id.ID) error {
-	return s.kv.Delete(ctx, Key(t, ns, rid))
+	return s.kv.Delete(ctx, CanonicalKey(t, ns, rid))
 }
 
 // Replace atomically makes vectors the complete canonical vector set for one
@@ -175,7 +176,7 @@ const UnknownModel = "unknown"
 // Get returns one canonical vector, or errs.NotFound.
 func (s *Store) Get(ctx context.Context, t tenant.ID, ns tenant.Namespace, rid id.ID) (*Vector, error) {
 	const op = "vector.Store.Get"
-	b, err := s.kv.Get(ctx, Key(t, ns, rid))
+	b, err := s.kv.Get(ctx, CanonicalKey(t, ns, rid))
 	if err != nil {
 		if errs.Is(err, errs.NotFound) {
 			return nil, errs.E(errs.NotFound, op, fmt.Errorf("no vector for record %s", rid))
@@ -187,32 +188,6 @@ func (s *Store) Get(ctx context.Context, t tenant.ID, ns tenant.Namespace, rid i
 		return nil, errs.E(errs.KindOf(err), op, fmt.Errorf("the vector of record %s: %w", rid, err))
 	}
 	return v, nil
-}
-
-// Scan walks every canonical vector of a tenant's default namespace, in key
-// order. It is deliberately not called ForEach — see [Source].
-//
-// The values handed to fn are borrowed from the iterator and are valid only for
-// the duration of the call, which is what lets a scan of a hundred thousand
-// vectors allocate nothing per row. A callback that keeps one copies it.
-func (s *Store) Scan(ctx context.Context, t tenant.ID, fn func(id.ID, []float32) error) error {
-	return s.scan(ctx, t, tenant.DefaultNamespace, func(rid id.ID, v *Vector) error {
-		return fn(rid, v.Values)
-	})
-}
-
-// ScanVectors walks every canonical vector of a tenant's default namespace with
-// the model identity attached, in key order.
-//
-// [Store.Scan] drops the model id because vector.Source exists to feed an index
-// plain coordinates. An index that materialises a whole tenant needs more than
-// that: a corpus holding vectors from two different models is not a space, and
-// the only place that can be noticed is where every vector is read at once.
-//
-// The Vector handed to fn is borrowed from the iterator. A callback that keeps
-// one calls Clone.
-func (s *Store) ScanVectors(ctx context.Context, t tenant.ID, fn func(id.ID, *Vector) error) error {
-	return s.scan(ctx, t, tenant.DefaultNamespace, fn)
 }
 
 func (s *Store) scan(ctx context.Context, t tenant.ID, ns tenant.Namespace, fn func(id.ID, *Vector) error) error {

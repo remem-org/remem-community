@@ -25,9 +25,33 @@ import (
 	"github.com/remem-org/remem-go/internal/tenant"
 )
 
-// Hit is one search result.
+// Key is one index entry: a memory and one of its passages.
+//
+// A memory's entries are its passage rows when it has any, and otherwise its
+// canonical vector, as passage 0 (openspec/changes/passage-vectors, design
+// decision 4). They are always numbered 0…n-1 with no gaps, because a memory's
+// entry set is only ever replaced whole.
+type Key struct {
+	ID      id.ID
+	Passage uint32
+}
+
+// Entry is one vector of a memory's entry set.
+type Entry struct {
+	Passage uint32
+	Vector  []float32
+}
+
+// Single is the entry set of a memory indexed by one vector: its canonical
+// vector, as passage 0.
+func Single(v []float32) []Entry { return []Entry{{Passage: 0, Vector: v}} }
+
+// Hit is one search result: a memory, at the distance of its nearest entry.
 type Hit struct {
 	ID id.ID
+	// Passage is the entry that was nearest, and so the one whose distance
+	// ranked the memory. It is 0 for a memory indexed by its canonical vector.
+	Passage uint32
 	// Distance is in the index's metric, smallest first. It is not a score:
 	// internal/vector/distance converts, and the conversion depends on the
 	// metric.
@@ -48,7 +72,8 @@ type Filter func(id.ID) bool
 // Allows reports whether f accepts rid, treating a nil filter as "accept".
 func (f Filter) Allows(rid id.ID) bool { return f == nil || f(rid) }
 
-// Source yields one tenant's canonical vectors, for [Index.Rebuild].
+// Source yields one tenant's index entries, for [Index.Rebuild]: every memory's
+// passage rows, or its canonical vector as passage 0 when it has none.
 //
 // The method is Scan rather than ForEach on purpose. ForEach is reserved for
 // tenant.Directory.ForEach, the single cross-tenant path in Remem, and the
@@ -56,7 +81,7 @@ func (f Filter) Allows(rid id.ID) bool { return f == nil || f(rid) }
 // the name for a tenant-scoped walk would mean either a false failure or an
 // allowlist entry that quietly excuses the package from the real rule.
 type Source interface {
-	Scan(ctx context.Context, t tenant.ID, fn func(id.ID, []float32) error) error
+	Scan(ctx context.Context, t tenant.ID, fn func(Key, []float32) error) error
 }
 
 // Health says whether an index can currently answer completely for one tenant.
@@ -97,9 +122,12 @@ type Health struct {
 // the vector index is the one asynchronously maintained index, so a failure
 // here degrades search and never fails a write.
 type Maintainer interface {
-	// Indexed makes an already-committed canonical vector searchable.
-	Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error
-	// Removed drops a record whose canonical vector has already been deleted.
+	// Indexed makes a memory's already-committed entry set searchable,
+	// replacing whatever set the index held for it: a memory rewritten from
+	// four passages to two must lose its last two entries.
+	Indexed(ctx context.Context, t tenant.ID, rid id.ID, entries []Entry) error
+	// Removed drops every entry of a record whose canonical rows have already
+	// been deleted.
 	Removed(ctx context.Context, t tenant.ID, rid id.ID) error
 }
 
@@ -190,7 +218,8 @@ func (f RebuilderFunc) ScheduleRebuild(t tenant.ID, reason string) { f(t, reason
 
 // Stats describes an index's state for one tenant.
 type Stats struct {
-	// Vectors is how many vectors the index holds.
+	// Vectors is how many index entries the index holds: one per passage of a
+	// multi-passage memory, one for every other memory.
 	Vectors int
 	// Dim is the width of those vectors, or zero when the index is empty.
 	Dim int
@@ -208,14 +237,19 @@ type Stats struct {
 // approximate index that does not agree with it on the small cases has a bug
 // rather than an approximation.
 type Index interface {
-	// Insert adds or replaces a vector.
-	Insert(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error
+	// Insert writes a memory's entry set as canonical rows and indexes it,
+	// replacing whatever the memory had. It is the maintenance and test path;
+	// the production write path commits rows with their record and tells the
+	// index through [Maintainer].
+	Insert(ctx context.Context, t tenant.ID, rid id.ID, entries []Entry) error
 
-	// Delete removes a vector. Removing an absent one is not an error: the
-	// post-condition already holds.
+	// Delete removes a memory's rows and every entry of it. Removing an absent
+	// one is not an error: the post-condition already holds.
 	Delete(ctx context.Context, t tenant.ID, rid id.ID) error
 
-	// Search returns up to k nearest vectors, nearest first, subject to filter.
+	// Search returns up to k distinct memories, nearest first, subject to
+	// filter. Each is ranked by its nearest entry, which the hit names, so
+	// k counts memories however many passages one of them has.
 	Search(ctx context.Context, t tenant.ID, q []float32, k int, filter Filter) ([]Hit, error)
 
 	// Rebuild replaces the tenant's index from src. It is how a derived index

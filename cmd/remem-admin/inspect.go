@@ -310,5 +310,13 @@ func describeRemainder(b *strings.Builder, space keys.Space, raw []byte) {
 		} else {
 			fmt.Fprintf(b, "event key does not parse: %v\n", err)
 		}
+	case keys.SpacePassage:
+		// The span is in the value, and the text it bounds is a memory's
+		// content, so neither is shown.
+		if _, _, rid, p, err := keys.ParsePassage(raw); err == nil {
+			fmt.Fprintf(b, "passage    %d of record %s\n", p, rid)
+		} else {
+			fmt.Fprintf(b, "passage key does not parse: %v\n", err)
+		}
 	}
 }

@@ -226,16 +226,7 @@ func (d Deps) policyTenant(w http.ResponseWriter, r *http.Request) (tenant.ID, b
 			"this process does not store retention overrides; the built-in policies are in force")))
 		return "", false
 	}
-	t, err := tenant.Parse(r.PathValue("id"))
-	if err != nil {
-		WriteError(w, r, err)
-		return "", false
-	}
-	if _, err := d.Tenants.Get(r.Context(), t); err != nil {
-		WriteError(w, r, err)
-		return "", false
-	}
-	return t, true
+	return d.pathTenant(w, r, "http.policies")
 }
 
 func (d Deps) resolvePolicies(r *http.Request, t tenant.ID) (*lifecycle.Policies, error) {

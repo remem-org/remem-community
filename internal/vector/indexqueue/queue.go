@@ -195,7 +195,7 @@ type op struct {
 	ctx      context.Context
 	tenant   tenant.ID
 	rid      id.ID
-	vec      []float32
+	entries  []vector.Entry
 	enqueued time.Time
 	// done is closed by the worker, for opBarrier only.
 	done chan struct{}
@@ -259,12 +259,15 @@ func New(inner Maintained, opts ...Option) *Queue {
 // and internal/memory drops it for the reason it has always dropped this
 // call's error — the memory is stored, and an unindexed canonical vector is one
 // the next materialisation indexes.
-func (q *Queue) Indexed(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error {
-	// Copied, because the caller's slice is the embedding it is about to reuse
-	// or release. hnsw.Indexed copies for the same reason; this one has to
+func (q *Queue) Indexed(ctx context.Context, t tenant.ID, rid id.ID, entries []vector.Entry) error {
+	// Copied, because the caller's slices are the embeddings it is about to
+	// reuse or release. hnsw.Indexed copies for the same reason; this one has to
 	// outlive the request rather than the call.
-	return q.enqueue(ctx, op{kind: opIndexed, tenant: t, rid: rid,
-		vec: append([]float32(nil), v...)})
+	own := make([]vector.Entry, len(entries))
+	for i, e := range entries {
+		own[i] = vector.Entry{Passage: e.Passage, Vector: append([]float32(nil), e.Vector...)}
+	}
+	return q.enqueue(ctx, op{kind: opIndexed, tenant: t, rid: rid, entries: own})
 }
 
 // Removed enqueues the removal of a record whose canonical vector has already
@@ -426,7 +429,7 @@ func (q *Queue) apply(o op) error {
 	if o.kind == opRemoved {
 		return q.inner.Removed(o.ctx, o.tenant, o.rid)
 	}
-	return q.inner.Indexed(o.ctx, o.tenant, o.rid, o.vec)
+	return q.inner.Indexed(o.ctx, o.tenant, o.rid, o.entries)
 }
 
 // --- passed straight through -------------------------------------------------
@@ -442,8 +445,8 @@ func (q *Queue) apply(o op) error {
 // against queued work for the same record, where [Queue.Rebuild] does. Nothing
 // in the write path calls them, and they address one record where a rebuild
 // replaces every one of them.
-func (q *Queue) Insert(ctx context.Context, t tenant.ID, rid id.ID, v []float32) error {
-	return q.inner.Insert(ctx, t, rid, v)
+func (q *Queue) Insert(ctx context.Context, t tenant.ID, rid id.ID, entries []vector.Entry) error {
+	return q.inner.Insert(ctx, t, rid, entries)
 }
 
 // Delete removes a vector, synchronously. See [Queue.Insert].

@@ -57,6 +57,21 @@ const (
 	// golang.org/x/text v0.25.0. Version 1 is v0.39.0, which normalises with
 	// Unicode 17 tables on Go 1.27 and fixes GO-2026-5970.
 	TextIndex uint32 = 1
+	// PassageIndex is the version of the rules that turn a memory's content
+	// into vectors: the model and its export, the int8 output rule, 256-token
+	// passages in segments of 16 overlapping by 2, document-vector pooling and
+	// byte spans (openspec/changes/passage-vectors, design decision 9). The
+	// canonical vectors and the passage rows are written by those rules, so a
+	// change to any of them is a re-embedding of the corpus. Absent, in a
+	// directory written before passages existed, is all-MiniLM-L6-v2, 384
+	// wide, one vector per memory from its first 128 tokens.
+	PassageIndex uint32 = 1
+	// UserFormat is the version of the user space: users, their tokens and the
+	// name index (docs/architecture/tenancy.md). Absent, in a directory written
+	// before users existed, means the space holds nothing, which is what version
+	// 1 with no users holds too — so the step that moves such a directory
+	// forward writes nothing but the manifest.
+	UserFormat uint32 = 1
 )
 
 // Versions is a set of durable format versions — either the ones this binary
@@ -71,6 +86,8 @@ type Versions struct {
 	AttrSchema     uint32
 	ClusterCompat  uint32
 	TextIndex      uint32
+	PassageIndex   uint32
+	UserFormat     uint32
 }
 
 // Current returns the versions this binary writes.
@@ -82,6 +99,8 @@ func Current() Versions {
 		AttrSchema:     AttrSchema,
 		ClusterCompat:  ClusterCompat,
 		TextIndex:      TextIndex,
+		PassageIndex:   PassageIndex,
+		UserFormat:     UserFormat,
 	}
 }
 
@@ -101,6 +120,8 @@ var formats = []format{
 	{"attribute slot schema", "attr_schema", AttrSchema, func(v Versions) uint32 { return v.AttrSchema }},
 	{"cluster compatibility", "cluster_compat", ClusterCompat, func(v Versions) uint32 { return v.ClusterCompat }},
 	{"text index", "text_index", TextIndex, func(v Versions) uint32 { return v.TextIndex }},
+	{"passage index", "passage_index", PassageIndex, func(v Versions) uint32 { return v.PassageIndex }},
+	{"user format", "user_format", UserFormat, func(v Versions) uint32 { return v.UserFormat }},
 }
 
 // FormatNames returns the machine-readable name of every versioned durable

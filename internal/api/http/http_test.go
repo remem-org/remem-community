@@ -62,7 +62,8 @@ func newServerWith(t *testing.T, adjust func(*remhttp.Deps)) http.Handler {
 
 	clk := clock.NewFake(clock.FakeStart)
 	svc := memory.New(kv, record.NewRepo(kv,
-		record.WithIndexer(attr.NewIndexer(attr.MustTable())), record.WithIndexer(text.New())),
+		record.WithIndexer(attr.NewIndexer(attr.MustTable())), record.WithIndexer(text.New()),
+		record.WithIndexer(record.NewPassageIndexer())),
 		flat.New(vector.NewStore(kv), distance.L2),
 		embeddingtest.New(), clk, attr.MustTable(), graph.NewService(kv, clk), memory.Config{},
 		memory.WithTextIndex(text.New()))

@@ -145,6 +145,9 @@ type Destination struct {
 	Records record.Repo
 	Edges   *graph.Store
 	Events  *events.Store
+	// Users restores a snapshot's users. Nil is allowed, and an import that
+	// then meets a users block refuses rather than dropping it.
+	Users UserRestorer
 	// Embedder re-embeds records whose vectors this binary cannot use. Nil is
 	// allowed, and an import that then needs one refuses by name rather than
 	// writing a corpus with no vectors.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/remem-org/remem-go/internal/auth"
 	"github.com/remem-org/remem-go/internal/events"
 	"github.com/remem-org/remem-go/internal/record"
 	"github.com/remem-org/remem-go/internal/storage"
@@ -86,7 +87,7 @@ func Record(ctx context.Context, store *events.Store, kv storage.KV, scope event
 		Subject:   scope.Subject,
 		At:        now,
 		Kind:      events.Recalled,
-		Actor:     "api",
+		Actor:     auth.ActorOf(ctx),
 		Reason:    "the memory was fetched by id",
 	}); err != nil {
 		return false, err

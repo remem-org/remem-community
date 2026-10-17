@@ -28,10 +28,17 @@ func NewExternal(modelID string, dim int) *External {
 	return &External{modelID: modelID, dim: dim}
 }
 
-// Embed refuses: this server takes every vector from its caller.
-func (e *External) Embed(context.Context, []string) ([][]float32, error) {
-	return nil, errs.E(errs.Invalid, "embedding.External", fmt.Errorf(
-		"embedding.provider is external: this server computes no vectors, so every write that sets content must carry `embedding` and every semantic or hybrid search `query_vector`"))
+// EmbedQueries refuses: this server takes every query vector from its caller.
+func (e *External) EmbedQueries(context.Context, []string) ([][]float32, error) {
+	return nil, errs.E(errs.Invalid, "embedding.External.EmbedQueries", fmt.Errorf(
+		"embedding.provider is external: this server computes no vectors, so every semantic or hybrid search must carry `query_vector`"))
+}
+
+// EmbedDocuments refuses: this server takes every memory's vector from its
+// caller, one per memory, and so has no passages to give either.
+func (e *External) EmbedDocuments(context.Context, []string) ([]Document, error) {
+	return nil, errs.E(errs.Invalid, "embedding.External.EmbedDocuments", fmt.Errorf(
+		"embedding.provider is external: this server computes no vectors, so every write that sets content must carry `embedding`"))
 }
 
 func (e *External) Dim() int        { return e.dim }

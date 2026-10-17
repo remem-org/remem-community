@@ -36,7 +36,7 @@ func TestDeletedVectorsStayDeletedAcrossRestart(t *testing.T) {
 	ids := make([]id.ID, 200)
 	for i := range ids {
 		ids[i] = id.New()
-		if err := idx.Insert(ctx, "acme", ids[i], rng.unit(8)); err != nil {
+		if err := idx.Insert(ctx, "acme", ids[i], vector.Single(rng.unit(8))); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -99,7 +99,7 @@ func TestACrashBetweenCommitAndIndexWriteStillDeletes(t *testing.T) {
 	ids := make([]id.ID, 60)
 	for i := range ids {
 		ids[i] = id.New()
-		if err := idx.Insert(ctx, "acme", ids[i], rng.unit(8)); err != nil {
+		if err := idx.Insert(ctx, "acme", ids[i], vector.Single(rng.unit(8))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -247,7 +247,7 @@ func TestUnhealthyIndexReportsTruncated(t *testing.T) {
 	idx := newIndex(t, kv, hnsw.Options{})
 	rng := newTestRNG(17)
 	for range 100 {
-		if err := idx.Insert(ctx, "acme", id.New(), rng.unit(8)); err != nil {
+		if err := idx.Insert(ctx, "acme", id.New(), vector.Single(rng.unit(8))); err != nil {
 			t.Fatal(err)
 		}
 	}

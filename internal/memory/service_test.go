@@ -17,6 +17,7 @@ import (
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/memory"
 	"github.com/remem-org/remem-go/internal/record"
+	"github.com/remem-org/remem-go/internal/storage"
 	"github.com/remem-org/remem-go/internal/storage/memkv"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"github.com/remem-org/remem-go/internal/text"
@@ -45,7 +46,11 @@ type setup struct {
 	cfg      memory.Config
 	// extra are service options beyond the ones newService always wires.
 	extra []memory.Option
+	// kv, when set, receives the store, for a test that reads derived rows.
+	kv *storage.KV
 }
+
+func withStore(kv *storage.KV) option { return func(s *setup) { s.kv = kv } }
 
 func withEmbedder(e embedding.Embedder) option { return func(s *setup) { s.embedder = e } }
 func withConfig(c memory.Config) option        { return func(s *setup) { s.cfg = c } }
@@ -61,12 +66,16 @@ func newService(t *testing.T, opts ...option) *memory.Service {
 	}
 	kv := memkv.New()
 	t.Cleanup(func() { _ = kv.Close() })
-	// Both derived indexes, as the server wires them: a test service that
+	if s.kv != nil {
+		*s.kv = kv
+	}
+	// Every derived index, as the server wires them: a test service that
 	// indexed only attributes would let a keyword search pass here and fail in
 	// production.
 	texts := text.New()
 	repo := record.NewRepo(kv,
-		record.WithIndexer(attr.NewIndexer(attr.MustTable())), record.WithIndexer(texts))
+		record.WithIndexer(attr.NewIndexer(attr.MustTable())), record.WithIndexer(texts),
+		record.WithIndexer(record.NewPassageIndexer()))
 	index := flat.New(vector.NewStore(kv), distance.L2)
 	svc := memory.New(kv, repo, index, s.embedder, s.clk, attr.MustTable(),
 		graph.NewService(kv, s.clk), s.cfg, append([]memory.Option{memory.WithTextIndex(texts)}, s.extra...)...)

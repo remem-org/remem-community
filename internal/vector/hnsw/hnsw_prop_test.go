@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/remem-org/remem-go/internal/id"
+	"github.com/remem-org/remem-go/internal/vector"
 	"github.com/remem-org/remem-go/internal/vector/distance"
 	"pgregory.net/rapid"
 )
@@ -26,7 +27,13 @@ import (
 func TestANodeRecordRoundTripsForAnyLinks(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		level := rapid.IntRange(0, maxLevel).Draw(rt, "level")
-		want := &node{id: id.New(), level: level, links: make([][]uint32, level+1)}
+		// Drawn rather than id.New(): rapid replays draws and nothing else.
+		var rid id.ID
+		copy(rid[:], rapid.SliceOfN(rapid.Byte(), 16, 16).Draw(rt, "id"))
+		// Passage 0 is written in format 1 and every other in format 2, so
+		// both are drawn often.
+		passage := rapid.OneOf(rapid.Just(uint32(0)), rapid.Uint32()).Draw(rt, "passage")
+		want := &node{key: vector.Key{ID: rid, Passage: passage}, level: level, links: make([][]uint32, level+1)}
 		for l := range want.links {
 			want.links[l] = rapid.SliceOfN(
 				rapid.Uint32Range(1, 1<<20), 0, 64).Draw(rt, "links")
@@ -36,8 +43,11 @@ func TestANodeRecordRoundTripsForAnyLinks(t *testing.T) {
 		if err != nil {
 			rt.Fatalf("decode: %v", err)
 		}
-		if got.id != want.id {
-			rt.Fatalf("record id %s, want %s", got.id, want.id)
+		if got.key != want.key {
+			rt.Fatalf("key %v, want %v", got.key, want.key)
+		}
+		if format := encodeNode(want)[0]; (want.key.Passage == 0) != (format == nodeFormatCanonical) {
+			rt.Fatalf("passage %d written in format %d", want.key.Passage, format)
 		}
 		if got.level != want.level {
 			rt.Fatalf("level %d, want %d", got.level, want.level)
@@ -64,7 +74,7 @@ func TestANodeRecordRoundTripsForAnyLinks(t *testing.T) {
 func TestATruncatedNodeRecordIsRefused(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		level := rapid.IntRange(0, 6).Draw(rt, "level")
-		n := &node{id: id.New(), level: level, links: make([][]uint32, level+1)}
+		n := &node{key: vector.Key{ID: id.New()}, level: level, links: make([][]uint32, level+1)}
 		for l := range n.links {
 			n.links[l] = rapid.SliceOfN(rapid.Uint32Range(1, 1<<16), 1, 16).Draw(rt, "links")
 		}
@@ -122,7 +132,7 @@ func TestEveryStoredVectorStaysReachable(t *testing.T) {
 		insert := func(rid id.ID, axis int) {
 			v := make([]float32, dim)
 			v[axis] = 1
-			if _, err := g.insert(rid, v); err != nil {
+			if _, err := g.insert(vector.Key{ID: rid}, v); err != nil {
 				rt.Fatalf("insert: %v", err)
 			}
 			live[rid] = v
@@ -147,7 +157,7 @@ func TestEveryStoredVectorStaysReachable(t *testing.T) {
 			}
 			reached := false
 			for _, c := range found {
-				if g.nodes[c.node] != nil && g.nodes[c.node].id == rid {
+				if g.nodes[c.node] != nil && g.nodes[c.node].key.ID == rid {
 					reached = true
 					break
 				}

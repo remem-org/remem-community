@@ -56,7 +56,15 @@ The container runs as the unprivileged user `remem`, **uid 10001**
 server cannot open its database.
 
 Compose creates a missing bind-mount source itself, as root, which the server
-then cannot write to. Create it first:
+then cannot write to — it exits on `open /var/lib/remem/LOCK: permission
+denied` and restarts forever. Every shipped compose file therefore runs a
+one-shot `remem-init` service first: the server's own image, as root, running
+`chown 10001:10001` on the directory and nothing else, and the server waits for
+it to exit successfully. It changes the directory, not its contents, so a corpus
+whose files belong to another uid still needs the migration below.
+
+Running the image without Compose, or tightening the mode as well, create the
+directory yourself:
 
 ```bash
 mkdir -p /srv/remem/data
@@ -69,6 +77,12 @@ uid that needs it is the only one that should have it.
 
 On an SELinux host the mount carries `:z` in every compose file, which relabels
 the directory so the container may use it. Hosts without SELinux ignore it.
+
+A directory inside the checkout is part of the image's build context unless
+`.dockerignore` excludes it. The default `./remem-data` is excluded; any other
+path under the checkout would fail `docker compose build` on the server's
+unreadable files or, worse, copy the corpus into the builder's layers. Put a
+custom `REMEM_DATA_DIR` outside the checkout.
 
 Point `REMEM_DATA_DIR` only at a directory that is empty or that holds *this*
 deployment's corpus. It is opened as a Pebble database; another database, or a

@@ -98,7 +98,8 @@ func New(cfg config.Config, opt ...Option) (*Server, error) {
 		Tenants:     d.requestTenants,
 		Resolver:    tenant.Resolver{Capability: capability, Default: tenant.ID(cfg.Tenant.Default)},
 		Capability:  capability,
-		Auth:        d.keyring,
+		Auth:        verifier{keyring: d.keyring, users: d.users},
+		Users:       d.users,
 		Metrics:     s.metrics,
 		MetricsPath: cfg.Metrics.Path,
 		// Metrics are always collected, and served only when metrics.enabled
@@ -305,6 +306,12 @@ func (s *Server) Run(ctx context.Context) error {
 		"tenancy", s.deps.capability.String(), "tenant_default", s.deps.cfg.Tenant.Default}
 	if metricsListener != nil {
 		serving = append(serving, "metrics_addr", metricsListener.Addr().String())
+	}
+	if len(s.deps.cfg.Server.APIKeys) > 0 {
+		log.Warn("server.api_keys is deprecated: its keys carry no user, so every one acting in a tenant "+
+			"is the same unattributed caller. Give each agent its own user and token with "+
+			"`remem-admin users create` and `remem-admin tokens issue`, then remove server.api_keys",
+			"keys", len(s.deps.cfg.Server.APIKeys))
 	}
 	log.Info("remem is serving", serving...)
 

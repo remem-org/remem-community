@@ -17,6 +17,7 @@ import (
 	"github.com/remem-org/remem-go/internal/id"
 	"github.com/remem-org/remem-go/internal/record"
 	"github.com/remem-org/remem-go/internal/snapshot/pb"
+	"github.com/remem-org/remem-go/internal/snapshot/pbext"
 	"github.com/remem-org/remem-go/internal/tenant"
 	"google.golang.org/protobuf/proto"
 )
@@ -143,6 +144,7 @@ func Verify(ctx context.Context, src Sources, r io.Reader) (VerifyReport, error)
 		vectors:   map[scopedID]float64{},
 		edges:     map[string]struct{}{},
 		events:    map[string]struct{}{},
+		users:     map[scopedID]*pbext.User{},
 		hasVector: map[scopedID]bool{},
 	}
 	for {
@@ -181,6 +183,7 @@ type verifier struct {
 	hasVector map[scopedID]bool
 	edges     map[string]struct{}
 	events    map[string]struct{}
+	users     map[scopedID]*pbext.User
 }
 
 func (v *verifier) block(blk *Block) error {
@@ -237,6 +240,8 @@ func (v *verifier) block(blk *Block) error {
 			v.report.Snapshot.Events++
 			return nil
 		})
+	case SectionGoUsers:
+		return v.readUsers(blk)
 	case SectionGoRecordExt, SectionGoEdgeExt, SectionGoTenantExt:
 		// The companions carry fields the shared messages have no room for.
 		// They are restored and they are not what a verification is about: a
@@ -320,6 +325,10 @@ func (v *verifier) compare(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
+	}
+
+	if err := v.compareUsers(ctx, metas); err != nil {
+		return err
 	}
 
 	// Whatever is left in the maps is in the snapshot and not in the store.

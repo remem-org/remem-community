@@ -60,7 +60,7 @@ func (s *Service) CreateBatch(ctx context.Context, reqs []CreateReq) ([]*Memory,
 		}
 	}
 
-	vectors, err := s.vectorsFor(ctx, reqs, op)
+	docs, err := s.documentsFor(ctx, reqs, op)
 	if err != nil {
 		return nil, err
 	}
@@ -128,10 +128,11 @@ func (s *Service) CreateBatch(ctx context.Context, reqs []CreateReq) ([]*Memory,
 			Vectors: map[string]*vector.Vector{
 				record.VectorContent: {
 					ModelID: modelID,
-					Dim:     len(vectors[i]),
-					Values:  vectors[i],
+					Dim:     len(docs[i].Vector),
+					Values:  docs[i].Vector,
 				},
 			},
+			Passages:  record.PassageSetOf(modelID, docs[i]),
 			CreatedAt: now,
 			UpdatedAt: now,
 		}
@@ -175,15 +176,17 @@ func (s *Service) CreateBatch(ctx context.Context, reqs []CreateReq) ([]*Memory,
 	// insert that fails leaves a canonical vector with no entry, which the next
 	// materialisation repairs — see internal/vector/hnsw.
 	for i, m := range out {
-		s.indexed(ctx, t, m.ID, vectors[i])
+		s.indexed(ctx, t, m.ID, indexEntries(docs[i].Vector, records[i].Passages))
 	}
 	return out, nil
 }
 
-// vectorsFor returns one vector per request, from wherever this server's
-// vectors come from, and refuses the batch whole if any request disagrees with
-// that. It runs before the transaction exists, so a refusal writes nothing.
-func (s *Service) vectorsFor(ctx context.Context, reqs []CreateReq, op string) ([][]float32, error) {
+// documentsFor returns one embedded document per request, from wherever this
+// server's vectors come from, and refuses the batch whole if any request
+// disagrees with that. It runs before the transaction exists, so a refusal
+// writes nothing. A caller's supplied vector is a one-passage document: an
+// external server keeps one vector per memory and has no passages.
+func (s *Service) documentsFor(ctx context.Context, reqs []CreateReq, op string) ([]embedding.Document, error) {
 	if !embedding.CallerSupplied(s.embedder) {
 		texts := make([]string, len(reqs))
 		for i, r := range reqs {
@@ -197,15 +200,15 @@ func (s *Service) vectorsFor(ctx context.Context, reqs []CreateReq, op string) (
 		// One embedding call for the whole batch. The service below chunks to
 		// its own batch size and coalesces with other callers; asking it once
 		// per memory would defeat both.
-		vectors, err := s.embedder.Embed(ctx, texts)
+		docs, err := s.embedder.EmbedDocuments(ctx, texts)
 		if err != nil {
 			return nil, err
 		}
-		if len(vectors) != len(reqs) {
+		if len(docs) != len(reqs) {
 			return nil, errs.E(errs.Storage, op, fmt.Errorf(
-				"the embedder returned %d vectors for %d memories", len(vectors), len(reqs)))
+				"the embedder returned %d documents for %d memories", len(docs), len(reqs)))
 		}
-		return vectors, nil
+		return docs, nil
 	}
 
 	vectors := make([][]float32, len(reqs))
@@ -216,7 +219,7 @@ func (s *Service) vectorsFor(ctx context.Context, reqs []CreateReq, op string) (
 		}
 		vectors[i] = v
 	}
-	return vectors, nil
+	return embedding.WholeDocuments(vectors), nil
 }
 
 // suppliedVector checks one caller's vector against this server's declared
